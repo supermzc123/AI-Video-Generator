@@ -1,0 +1,25 @@
+MiniMax H3 Motion Director
+Copyright (C) 2026 MiniMax H3 Motion Director contributors
+
+The derivative work as a whole is licensed under GNU GPL version 3.0.
+
+It is a derivative work containing and modifying code from:
+
+1. ComfyUI_MiniMaxH3_Director
+   Copyright AIMixer and contributors
+   https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director
+   Originally licensed under Apache License 2.0. Modified portions are included
+   in this GPL-3.0 derivative, and the original notice and license text are
+   retained at LICENSES/Apache-2.0-AIMixer.txt.
+
+2. ComfyUI-H3-Motion-Context
+   Copyright (C) 2026 NikoDemon80 and contributors
+   https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context
+   Originally licensed under GNU GPL version 3.0. Code used and modified
+   beginning 2026-08-09. The original copyright notice and license text are
+   preserved at LICENSES/GPL-3.0.txt.
+
+This project substantially modifies and integrates both upstream projects into
+a standalone MiniMax H3 multi-segment Director with Motion/Audio Context
+continuity. It is not the original ComfyUI-H3-Motion-Context or AIMixer Director
+distribution.

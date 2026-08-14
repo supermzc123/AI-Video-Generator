@@ -24,6 +24,8 @@ class GenerationMode(StrEnum):
     L2VA = "l2va"
     REF2VA = "ref2va"
     HYBRID = "hybrid"
+    V2VA = "v2va"
+    RV2VA = "rv2va"
 
 
 class ContextMode(StrEnum):

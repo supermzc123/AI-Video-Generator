@@ -42,7 +42,7 @@
 
 ## 本地开发
 
-当前 P0 Foundation 只包含控制平面、Schema、条件缓存指纹和只读 ComfyUI 探测，不会提交视频生成任务。
+当前 P0 dry-run 阶段包含控制平面、Schema、条件缓存指纹、只读 ComfyUI 探测和不可提交的两阶段执行计划，不会提交视频生成任务。Motion Director 固定源码位于 `vendor/motion-director`，但尚未安装到本机 ComfyUI。
 
 ```powershell
 .\scripts\setup.ps1

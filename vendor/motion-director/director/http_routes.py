@@ -1,0 +1,253 @@
+# Portions derived from ComfyUI_MiniMaxH3_Director
+# Copyright AIMixer and contributors
+# Originally licensed under Apache License 2.0
+# Modified for MiniMax H3 Motion Director, 2026-08-09
+# This derivative project is distributed under GPL-3.0.
+# See NOTICE and LICENSES/Apache-2.0-AIMixer.txt.
+
+"""HTTP routes for MiniMax H3 Motion Director."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+
+import folder_paths
+from aiohttp import web
+from server import PromptServer
+
+from .material_library_routes import register_material_library_routes
+
+log = logging.getLogger("ComfyUI-MiniMax-H3-Motion-Director.director")
+
+CHUNK_ROOT = os.path.join(folder_paths.get_temp_directory(), "minimax_upload_chunks")
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._\-()\u4e00-\u9fff]+")
+_ROUTES_REGISTERED = False
+
+
+def _safe_basename(name: str) -> str:
+    base = os.path.basename(str(name or "video.mp4").replace("\\", "/"))
+    base = _SAFE_NAME.sub("_", base).strip("._")
+    return base or "video.mp4"
+
+
+async def minimax_upload_video_chunk(request):
+    try:
+        post = await request.post()
+    except Exception as exc:
+        return web.Response(status=400, text=f"Invalid upload: {exc}")
+
+    upload_id = str(post.get("upload_id") or "").strip()
+    filename = _safe_basename(post.get("filename"))
+    chunk_field = post.get("chunk")
+    if not upload_id or chunk_field is None:
+        return web.Response(status=400, text="Missing upload_id or chunk.")
+
+    if ".." in upload_id or "/" in upload_id or "\\" in upload_id:
+        return web.Response(status=400, text="Invalid upload_id.")
+
+    try:
+        chunk_index = int(post.get("chunk_index", 0))
+        total_chunks = int(post.get("total_chunks", 1))
+    except (TypeError, ValueError):
+        return web.Response(status=400, text="Invalid chunk index.")
+
+    if total_chunks < 1 or chunk_index < 0 or chunk_index >= total_chunks:
+        return web.Response(status=400, text="Chunk index out of range.")
+
+    session_dir = os.path.join(CHUNK_ROOT, upload_id)
+    os.makedirs(session_dir, exist_ok=True)
+    part_path = os.path.join(session_dir, f"{chunk_index:06d}.part")
+
+    with open(part_path, "wb") as out:
+        while True:
+            block = chunk_field.file.read(1024 * 1024)
+            if not block:
+                break
+            out.write(block)
+
+    if chunk_index + 1 < total_chunks:
+        return web.json_response({"status": "ok", "chunk_index": chunk_index})
+
+    input_dir = folder_paths.get_input_directory()
+    out_path = os.path.join(input_dir, filename)
+    if os.path.exists(out_path):
+        stem, ext = os.path.splitext(filename)
+        for n in range(1, 1000):
+            candidate = f"{stem}_{n}{ext}"
+            candidate_path = os.path.join(input_dir, candidate)
+            if not os.path.exists(candidate_path):
+                out_path = candidate_path
+                filename = candidate
+                break
+
+    with open(out_path, "wb") as out:
+        for i in range(total_chunks):
+            part = os.path.join(session_dir, f"{i:06d}.part")
+            if not os.path.isfile(part):
+                shutil.rmtree(session_dir, ignore_errors=True)
+                return web.Response(status=400, text=f"Missing chunk {i}.")
+            with open(part, "rb") as src:
+                shutil.copyfileobj(src, out)
+
+    shutil.rmtree(session_dir, ignore_errors=True)
+    log.info("MiniMax H3 Motion Director uploaded video to input/: %s", filename)
+    return web.json_response({"name": filename, "subfolder": "", "type": "input"})
+
+
+async def minimax_probe_video(request):
+    try:
+        if request.can_read_body and request.content_type == "application/json":
+            body = await request.json()
+        else:
+            body = dict(request.query)
+    except Exception as exc:
+        return web.Response(status=400, text=f"Invalid request: {exc}")
+
+    video_file = str(body.get("videoFile") or body.get("video_file") or "").strip()
+    if not video_file:
+        return web.Response(status=400, text="Missing videoFile.")
+
+    from ..lib.video_io import probe_video_clip
+
+    clip = {
+        "videoFile": video_file,
+        "fileName": os.path.basename(video_file),
+        "subfolder": str(body.get("subfolder") or "").strip(),
+        "type": str(body.get("type") or "input").strip() or "input",
+    }
+    try:
+        info = probe_video_clip(clip)
+    except Exception as exc:
+        log.warning("MiniMax H3 Motion Director video probe failed: %s", exc)
+        return web.Response(status=400, text=str(exc))
+    return web.json_response(info)
+
+
+async def minimax_detect_shots(request):
+    """Detect shot boundaries with PySceneDetect; return logical cut frames."""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return web.Response(status=400, text=f"Invalid JSON: {exc}")
+
+    from ..lib.shot_detect import (
+        detect_timeline_shot_cuts,
+        scenedetect_available,
+        scenedetect_install_hint,
+    )
+
+    if not scenedetect_available():
+        return web.Response(
+            status=400,
+            text=(
+                "PySceneDetect is not installed in ComfyUI's Python "
+                f"({__import__('sys').executable}). "
+                f"Run: {scenedetect_install_hint()}"
+            ),
+        )
+
+    try:
+        frame_rate = float(body.get("frameRate") or body.get("frame_rate") or 24)
+    except (TypeError, ValueError):
+        frame_rate = 24.0
+    try:
+        total_frames = int(body.get("totalFrames") or body.get("total_frames") or 0)
+    except (TypeError, ValueError):
+        return web.Response(status=400, text="Invalid totalFrames.")
+
+    sensitivity = str(body.get("sensitivity") or "medium").strip().lower()
+    try:
+        min_shot_frames = int(body.get("minShotFrames") or body.get("min_shot_frames") or 12)
+    except (TypeError, ValueError):
+        min_shot_frames = 12
+
+    clips_in = body.get("clips")
+    clips: list[dict] = []
+    if isinstance(clips_in, list) and clips_in:
+        for item in clips_in:
+            if not isinstance(item, dict):
+                continue
+            video_file = str(item.get("videoFile") or item.get("video_file") or "").strip()
+            if not video_file:
+                continue
+            clips.append(
+                {
+                    "videoFile": video_file,
+                    "fileName": os.path.basename(video_file),
+                    "subfolder": str(item.get("subfolder") or "").strip(),
+                    "type": str(item.get("type") or "input").strip() or "input",
+                    "logicalStart": item.get("logicalStart", item.get("logical_start", 0)),
+                    "logicalEnd": item.get("logicalEnd", item.get("logical_end", total_frames)),
+                    "nativeFps": item.get("nativeFps", item.get("native_fps")),
+                }
+            )
+    else:
+        video_file = str(body.get("videoFile") or body.get("video_file") or "").strip()
+        if not video_file:
+            return web.Response(status=400, text="Missing clips[] or videoFile.")
+        clips.append(
+            {
+                "videoFile": video_file,
+                "fileName": os.path.basename(video_file),
+                "subfolder": str(body.get("subfolder") or "").strip(),
+                "type": str(body.get("type") or "input").strip() or "input",
+                "logicalStart": 0,
+                "logicalEnd": total_frames,
+                "nativeFps": body.get("nativeFps", body.get("native_fps")),
+            }
+        )
+
+    if total_frames <= 0:
+        return web.Response(status=400, text="totalFrames must be > 0.")
+
+    try:
+        result = detect_timeline_shot_cuts(
+            clips,
+            frame_rate=frame_rate,
+            total_frames=total_frames,
+            sensitivity=sensitivity,
+            min_shot_frames=min_shot_frames,
+        )
+    except ImportError as exc:
+        return web.Response(status=400, text=str(exc))
+    except Exception as exc:
+        log.warning("MiniMax H3 Motion Director shot detect failed: %s", exc)
+        return web.Response(status=400, text=str(exc))
+
+    return web.json_response(result)
+
+
+def _register_route(routes, method: str, path: str, handler) -> None:
+    if hasattr(routes, "add_route"):
+        routes.add_route(method, path, handler)
+    elif method == "POST" and hasattr(routes, "post"):
+        routes.post(path)(handler)
+    elif method == "GET" and hasattr(routes, "get"):
+        routes.get(path)(handler)
+    else:
+        raise AttributeError("Unsupported ComfyUI route table API")
+
+
+def register_routes() -> bool:
+    """Register MiniMax H3 Motion Director HTTP routes on the ComfyUI PromptServer."""
+    global _ROUTES_REGISTERED
+    if _ROUTES_REGISTERED:
+        return True
+
+    server = PromptServer.instance
+    if server is None:
+        log.warning("MiniMax H3 Motion Director: PromptServer not ready, HTTP routes not registered")
+        return False
+
+    routes = server.routes
+    _register_route(routes, "POST", "/minimax/motion-director/upload_chunk", minimax_upload_video_chunk)
+    _register_route(routes, "POST", "/minimax/motion-director/probe_video", minimax_probe_video)
+    _register_route(routes, "GET", "/minimax/motion-director/probe_video", minimax_probe_video)
+    _register_route(routes, "POST", "/minimax/motion-director/detect_shots", minimax_detect_shots)
+    register_material_library_routes(routes)
+    _ROUTES_REGISTERED = True
+    log.info("MiniMax H3 Motion Director HTTP routes registered")
+    return True
