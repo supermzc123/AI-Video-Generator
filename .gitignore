@@ -1,0 +1,19 @@
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local project data and generated media
+*.db
+*.db-shm
+*.db-wal
+artifacts/
+work/
+logs/

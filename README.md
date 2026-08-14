@@ -25,6 +25,7 @@
 - [项目计划](docs/PROJECT_PLAN.md)
 - [系统架构](docs/ARCHITECTURE.md)
 - [职责与协作](docs/RESPONSIBILITIES.md)
+- [当前构建状态](docs/BUILD_STATUS.md)
 
 ## MVP 技术方向
 
@@ -37,4 +38,22 @@
 - OpenAI-compatible LLM 接口，首版只验证一个实际模型
 - FFmpeg 完成基础拼接、转码和 MP4 导出
 
-具体依赖和启动方式将在 P0 技术验证后补充。
+真实 H3 Worker 的依赖和启动方式将在 P0 执行层验证后补充。
+
+## 本地开发
+
+当前 P0 Foundation 只包含控制平面、Schema、条件缓存指纹和只读 ComfyUI 探测，不会提交视频生成任务。
+
+```powershell
+.\scripts\setup.ps1
+.\scripts\run-api.ps1
+```
+
+启动后访问 `http://127.0.0.1:8000/docs`。本机配置放在被 Git 忽略的 `.env`，可从 `.env.example` 创建。
+
+检查：
+
+```powershell
+uv run ruff check .
+uv run pytest
+```
