@@ -105,7 +105,40 @@ POST /v1/assets/materialize
 
 `POST /v1/jobs` 接受幂等键。事件携带 `shot_id`、`segment_id`、stage 和 progress，而不是只暴露 ComfyUI node ID。
 
-## 6. 任务与恢复
+## 6. 条件预编码与模型驻留
+
+条件编码是首版核心性能路径，而不是后续优化。对已批准且不可变的生成批次，Worker 按以下阶段执行：
+
+```text
+冻结批次计划
+-> 加载文本/多模态条件编码器
+-> 批量编码所有可提前计算的 segment conditioning
+-> 校验并持久化编码产物
+-> 卸载编码器并释放显存
+-> 加载 H3 扩散模型
+-> 按依赖链生成片段
+```
+
+文本 prompt、公共参考和片段局部参考只要不依赖前一段动态输出，就应在扩散阶段前统一编码。Motion Context/AV latent 依赖前一段结果，不能假装预计算，但它不妨碍提前编码整条链的静态条件。
+
+每个 `ConditioningArtifact` 必须是正式的内容寻址产物。缓存指纹至少包含：
+
+```text
+normalized prompt
++ all reference asset SHA-256 values and binding order
++ resolution, fps, sample frames and generation mode
++ text/image encoder model hashes
++ H3 model, VAE, LoRA and relevant node versions
++ conditioning schema version
+```
+
+prompt、素材、尺寸、时长或编码栈变化时，只把受影响的 conditioning 及其下游 generation 标为 `STALE`。未命中的条件可以增量补编码，不要求因一个镜头变化而重编码全项目。
+
+调度器维护显式模型驻留状态，例如 `ENCODING_RESIDENT`、`DIFFUSION_RESIDENT` 和 `UNLOADED`，并把模型切换作为批次级操作。默认先完成当前已批准批次的全部可用编码，再切换到扩散阶段；交互式紧急重试可以开启新批次，不破坏原批次缓存。
+
+缓存文件仅允许加载本 Worker 生成并通过哈希、schema 和版本校验的内容。不得直接信任外部 `.pt`，也不得使用 `torch.load(weights_only=False)` 加载不可信文件。
+
+## 7. 任务与恢复
 
 ```text
 BLOCKED -> READY -> QUEUED -> RUNNING
@@ -122,7 +155,7 @@ BLOCKED -> READY -> QUEUED -> RUNNING
 
 任务指纹包含任务类型、标准化输入、上游产物哈希、模型/节点/workflow 版本和生成参数。
 
-## 7. 产物存储
+## 8. 产物存储
 
 ```text
 project.db
@@ -135,7 +168,7 @@ logs/
 
 产物先写临时文件，完成媒体探测和 SHA-256 后原子移动，再在事务中登记。manifest 保存 conditioning、AV latent tail、视频和音频的 URI/哈希，以及上游 revision、prompt、参考素材、模型、VAE、LoRA、采样配置、trim 帧数、cache schema version 和审核状态。
 
-## 8. 许可证与备选路径
+## 9. 许可证与备选路径
 
 Motion Director、Contex Loop 和独立 Motion Context 均为 GPL-3.0；Conditioning Cache 为 MIT。fork 和分发时保留原版权、NOTICE 与第三方许可证。模型许可独立于节点代码许可，发布前另行核对地域与商用条款。
 

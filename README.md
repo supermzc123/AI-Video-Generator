@@ -33,6 +33,7 @@
 - SQLite WAL 保存结构化状态，媒体产物保存为文件
 - 通过稳定的 Worker Adapter 接入本地 ComfyUI
 - fork Motion Director 作为唯一 H3 执行引擎候选，先经 P0 实测
+- 生成批次先统一完成条件编码并落盘，再卸载编码器、加载扩散模型执行生成
 - OpenAI-compatible LLM 接口，首版只验证一个实际模型
 - FFmpeg 完成基础拼接、转码和 MP4 导出
 
