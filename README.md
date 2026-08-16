@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-项目处于规划与技术验证阶段，采用 [GPL-3.0](LICENSE) 协议。
+项目已具备MVP工程基础，采用 [GPL-3.0](LICENSE) 协议。当前仍禁止未经用户逐批批准的真实GPU测试。
 
 首版目标是跑通以下闭环：
 
@@ -25,24 +25,26 @@
 - [项目计划](docs/PROJECT_PLAN.md)
 - [系统架构](docs/ARCHITECTURE.md)
 - [职责与协作](docs/RESPONSIBILITIES.md)
+- [H3受控工作流与加速策略](docs/H3_WORKFLOWS.md)
+- [后处理模型与执行策略](docs/POST_PROCESSING.md)
 - [当前构建状态](docs/BUILD_STATUS.md)
 
-## MVP 技术方向
+## 已实现架构
 
-- 本地 Web UI，后续再评估 Tauri 桌面封装
-- Python、FastAPI、Pydantic、SQLAlchemy、Alembic
-- SQLite WAL 保存结构化状态，媒体产物保存为文件
+- Tauri 2 + React/TypeScript/Vite桌面工作台
+- Python、FastAPI、Pydantic和SQLite WAL控制平面
 - 通过稳定的 Worker Adapter 接入本地 ComfyUI
-- fork Motion Director 作为唯一 H3 执行引擎候选，先经 P0 实测
+- 随软件发布的版本化H3受控工作流，GUI只暴露模型与受支持的运行参数
 - 生成批次先统一完成条件编码并落盘，再卸载编码器、加载扩散模型执行生成
-- OpenAI-compatible LLM 接口，首版只验证一个实际模型
-- FFmpeg 完成基础拼接、转码和 MP4 导出
+- 用户导入、节点标定并批准的 ComfyUI API 图片工作流；不内置依赖特定模型文件名的工作流
+- OpenAI-compatible LLM Harness、持久任务DAG、远程Worker协议和FFmpeg导出
+- 九阶段门控制作台，以及基于Profile和本机模型选择的SeedVR2、RIFE/GIMM、Whisper后处理配置
 
-真实 H3 Worker 的依赖和启动方式将在 P0 执行层验证后补充。
+真实 H3 Worker 的完整启动方式将在 P0 执行层验证后补充。
 
 ## 本地开发
 
-当前 P0 dry-run 阶段包含控制平面、Schema、条件缓存指纹、只读 ComfyUI 探测和不可提交的两阶段执行计划，不会提交视频生成任务。Motion Director 固定源码位于 `vendor/motion-director`，但尚未安装到本机 ComfyUI。
+项目ComfyUI节点位于`comfyui_nodes/ai_video_generator_nodes`。H3图作为受控资源随软件发布，用户无需准备或导入；全局设置从当前Worker的`/object_info`模型清单中选择扩散模型、文本编码器、VAE和Turbo LoRA。图片生成工作流仍由用户按需导入。
 
 ```powershell
 .\scripts\setup.ps1
@@ -51,9 +53,31 @@
 
 启动后访问 `http://127.0.0.1:8000/docs`。本机配置放在被 Git 忽略的 `.env`，可从 `.env.example` 创建。
 
+Windows 开发环境可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\restart-api.ps1` 重启后端；脚本会校验端口占用者并等待健康检查通过。
+也可以直接双击项目根目录的 `restart-backend.bat`。该脚本只重启 API；要同时确保前后端在线并打开网页，请双击 `start-app.bat`。
+
+桌面前端开发：
+
+```powershell
+Set-Location desktop
+npm install
+npm run dev
+```
+
+访问`http://127.0.0.1:1420`。构建Tauri安装包需要Rust/Cargo、固定版本FFmpeg和PyInstaller：
+
+```powershell
+Set-Location desktop
+npx tauri build --bundles msi nsis
+```
+
+没有配置可信Authenticode证书时，产物只能作为unsigned内部测试包。
+
 检查：
 
 ```powershell
 uv run ruff check .
 uv run pytest
 ```
+
+API和节点安装说明见[API契约](docs/API.md)与[ComfyUI节点安装](docs/COMFYUI_NODES.md)。当前完成度和未执行验收门见[构建状态](docs/BUILD_STATUS.md)。

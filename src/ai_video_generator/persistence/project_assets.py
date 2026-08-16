@@ -1,0 +1,853 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import sqlite3
+import unicodedata
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from PIL import Image, UnidentifiedImageError
+
+from ai_video_generator.domain import (
+    AssetGenerationCandidate,
+    AssetGenerationCandidateState,
+    AssetScope,
+    ProjectAsset,
+    ProjectAssetPurpose,
+    ProjectAssetSource,
+    ProjectAssetState,
+)
+
+MAX_PROJECT_ASSET_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 32_768
+MAX_IMAGE_PIXELS = 100_000_000
+PREVIEW_MAX_SIZE = (768, 768)
+SUPPORTED_IMAGE_FORMATS = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
+
+
+class ProjectAssetStoreError(RuntimeError):
+    pass
+
+
+class ProjectAssetNotFoundError(ProjectAssetStoreError):
+    pass
+
+
+class ProjectNotFoundError(ProjectAssetStoreError):
+    pass
+
+
+class DuplicateProjectAssetNameError(ProjectAssetStoreError):
+    pass
+
+
+class InvalidProjectImageError(ProjectAssetStoreError):
+    pass
+
+
+class ProjectAssetTooLargeError(ProjectAssetStoreError):
+    pass
+
+
+class ProjectAssetDependencyError(ProjectAssetStoreError):
+    def __init__(self, references: tuple[str, ...]) -> None:
+        self.references = references
+        super().__init__("project asset is still referenced")
+
+
+def _normalized_name(name: str) -> str:
+    return unicodedata.normalize("NFKC", name.strip()).casefold()
+
+
+def _canonical_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _payload_references_asset(value: Any, asset_id: str) -> bool:
+    if isinstance(value, dict):
+        if (value.get("kind") == "asset_mention" and value.get("asset_id") == asset_id) or (
+            value.get("type") == "asset_mention" and value.get("assetId") == asset_id
+        ):
+            return True
+        for key, child in value.items():
+            if key in {"asset_id", "assetId"}:
+                continue
+            if (key.endswith("_asset_id") or key.endswith("AssetId")) and child == asset_id:
+                return True
+            if (
+                key
+                in {
+                    "reference_asset_ids",
+                    "referenced_asset_ids",
+                    "referenceAssetIds",
+                    "assetIds",
+                }
+                and isinstance(child, list)
+                and asset_id in child
+            ):
+                return True
+            if _payload_references_asset(child, asset_id):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_payload_references_asset(item, asset_id) for item in value)
+    return False
+
+
+class ProjectAssetStore:
+    """Immutable project-asset metadata plus content-addressed image blobs."""
+
+    def __init__(self, database_path: str | Path, storage_root: str | Path) -> None:
+        self.database_path = Path(database_path)
+        self.storage_root = Path(storage_root)
+        self.blob_root = self.storage_root / "blobs"
+        self.preview_root = self.storage_root / "previews"
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.blob_root.mkdir(parents=True, exist_ok=True)
+        self.preview_root.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    @contextmanager
+    def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS project_asset_revisions (
+                    asset_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    blob_sha256 TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(asset_id, revision)
+                );
+                CREATE INDEX IF NOT EXISTS idx_project_assets_project_revision
+                    ON project_asset_revisions(project_id, asset_id, revision DESC);
+                CREATE INDEX IF NOT EXISTS idx_project_assets_blob
+                    ON project_asset_revisions(blob_sha256);
+                CREATE TABLE IF NOT EXISTS asset_generation_candidates (
+                    candidate_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    asset_plan_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_asset_candidates_plan
+                    ON asset_generation_candidates(project_id, asset_plan_id, created_at);
+                CREATE TABLE IF NOT EXISTS asset_candidate_acceptance_claims (
+                    candidate_id TEXT PRIMARY KEY,
+                    claimed_at REAL NOT NULL,
+                    FOREIGN KEY(candidate_id) REFERENCES asset_generation_candidates(candidate_id)
+                        ON DELETE CASCADE
+                );
+                """
+            )
+
+    def project_exists(self, project_id: str) -> bool:
+        with self._connect() as connection:
+            for table in ("project_revisions", "project_workspace_revisions"):
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone()
+                if (
+                    exists
+                    and connection.execute(
+                        f"SELECT 1 FROM {table} WHERE project_id = ? LIMIT 1", (project_id,)
+                    ).fetchone()
+                ):
+                    return True
+        return False
+
+    def add_upload(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        original_name: str,
+        content: bytes,
+        kind: ProjectAssetPurpose = ProjectAssetPurpose.REFERENCE,
+        scope: AssetScope = AssetScope.COMMON,
+        shot_id: str | None = None,
+    ) -> ProjectAsset:
+        if not self.project_exists(project_id):
+            raise ProjectNotFoundError(project_id)
+        if len(content) > MAX_PROJECT_ASSET_BYTES:
+            raise ProjectAssetTooLargeError(
+                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+            )
+        image, mime_type, width, height = self._validate_image(content)
+        blob_sha256 = hashlib.sha256(content).hexdigest()
+        preview_content = self._make_preview(image)
+        preview_sha256 = hashlib.sha256(preview_content).hexdigest()
+        asset = ProjectAsset(
+            asset_id=str(uuid.uuid4()),
+            project_id=project_id,
+            revision=1,
+            name=name,
+            original_name=original_name or "upload",
+            state=ProjectAssetState.AVAILABLE,
+            sha256=blob_sha256,
+            preview_sha256=preview_sha256,
+            mime_type=mime_type,
+            byte_size=len(content),
+            width=width,
+            height=height,
+            kind=kind,
+            scope=scope,
+            shot_id=shot_id,
+            source=ProjectAssetSource.UPLOAD,
+            created_at=datetime.now(UTC),
+        )
+        with self._transaction(immediate=True) as connection:
+            self._ensure_unique_name(connection, project_id, asset.name)
+            self._write_blob_once(self.blob_path(blob_sha256), content)
+            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            self._insert(connection, asset)
+        return asset
+
+    def add_generated(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        content: bytes,
+        source_task_id: str,
+        kind: ProjectAssetPurpose = ProjectAssetPurpose.REFERENCE,
+        scope: AssetScope = AssetScope.COMMON,
+        shot_id: str | None = None,
+        replace_asset_id: str | None = None,
+    ) -> ProjectAsset:
+        """Register a generated image, optionally revising an existing project asset."""
+        if not self.project_exists(project_id):
+            raise ProjectNotFoundError(project_id)
+        if len(content) > MAX_PROJECT_ASSET_BYTES:
+            raise ProjectAssetTooLargeError(
+                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+            )
+        image, mime_type, width, height = self._validate_image(content)
+        blob_sha256 = hashlib.sha256(content).hexdigest()
+        preview_content = self._make_preview(image)
+        preview_sha256 = hashlib.sha256(preview_content).hexdigest()
+        with self._transaction(immediate=True) as connection:
+            current = (
+                self._get_current(connection, project_id, replace_asset_id)
+                if replace_asset_id
+                else None
+            )
+            asset_id = current.asset_id if current else str(uuid.uuid4())
+            self._ensure_unique_name(
+                connection,
+                project_id,
+                name,
+                excluding_asset_id=asset_id if current else None,
+            )
+            self._write_blob_once(self.blob_path(blob_sha256), content)
+            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            asset = ProjectAsset(
+                asset_id=asset_id,
+                project_id=project_id,
+                revision=current.revision + 1 if current else 1,
+                name=name,
+                original_name=f"generated-{source_task_id}.png",
+                state=ProjectAssetState.AVAILABLE,
+                sha256=blob_sha256,
+                preview_sha256=preview_sha256,
+                mime_type=mime_type,
+                byte_size=len(content),
+                width=width,
+                height=height,
+                kind=kind,
+                scope=scope,
+                shot_id=shot_id,
+                source=ProjectAssetSource.GENERATED,
+                source_task_id=source_task_id,
+                created_at=datetime.now(UTC),
+            )
+            self._insert(connection, asset)
+        return asset
+
+    def add_generation_candidate(
+        self,
+        *,
+        project_id: str,
+        asset_plan_id: str,
+        source_task_id: str,
+        name: str,
+        content: bytes,
+        current_asset_id: str | None,
+        kind: ProjectAssetPurpose = ProjectAssetPurpose.REFERENCE,
+        scope: AssetScope = AssetScope.COMMON,
+        shot_id: str | None = None,
+    ) -> AssetGenerationCandidate:
+        if not self.project_exists(project_id):
+            raise ProjectNotFoundError(project_id)
+        if len(content) > MAX_PROJECT_ASSET_BYTES:
+            raise ProjectAssetTooLargeError(
+                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+            )
+        image, mime_type, width, height = self._validate_image(content)
+        blob_sha256 = hashlib.sha256(content).hexdigest()
+        preview_content = self._make_preview(image)
+        preview_sha256 = hashlib.sha256(preview_content).hexdigest()
+        candidate = AssetGenerationCandidate(
+            candidate_id=str(uuid.uuid4()),
+            project_id=project_id,
+            asset_plan_id=asset_plan_id,
+            source_task_id=source_task_id,
+            current_asset_id=current_asset_id,
+            name=name,
+            kind=kind,
+            scope=scope,
+            shot_id=shot_id,
+            sha256=blob_sha256,
+            preview_sha256=preview_sha256,
+            mime_type=mime_type,
+            byte_size=len(content),
+            width=width,
+            height=height,
+            created_at=datetime.now(UTC),
+        )
+        with self._transaction(immediate=True) as connection:
+            self._write_blob_once(self.blob_path(blob_sha256), content)
+            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            connection.execute(
+                "INSERT INTO asset_generation_candidates("
+                "candidate_id, project_id, asset_plan_id, state, payload_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    candidate.candidate_id,
+                    candidate.project_id,
+                    candidate.asset_plan_id,
+                    candidate.state.value,
+                    _canonical_json(candidate.model_dump(mode="json")),
+                    candidate.created_at.timestamp(),
+                ),
+            )
+        return candidate
+
+    def get_generation_candidate(self, candidate_id: str) -> AssetGenerationCandidate:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM asset_generation_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            raise ProjectAssetNotFoundError(candidate_id)
+        return AssetGenerationCandidate.model_validate_json(row["payload_json"])
+
+    def list_generation_candidates(
+        self, project_id: str, asset_plan_id: str | None = None
+    ) -> tuple[AssetGenerationCandidate, ...]:
+        query = "SELECT payload_json FROM asset_generation_candidates WHERE project_id = ?"
+        parameters: list[object] = [project_id]
+        if asset_plan_id is not None:
+            query += " AND asset_plan_id = ?"
+            parameters.append(asset_plan_id)
+        query += " ORDER BY created_at, candidate_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(
+            AssetGenerationCandidate.model_validate_json(row["payload_json"])
+            for row in rows
+        )
+
+    def generation_candidate_preview(self, candidate_id: str) -> Path:
+        candidate = self.get_generation_candidate(candidate_id)
+        path = self.preview_path(candidate.preview_sha256)
+        if not path.is_file():
+            raise ProjectAssetNotFoundError(candidate_id)
+        return path
+
+    def generation_candidate_content(self, candidate_id: str) -> bytes:
+        candidate = self.get_generation_candidate(candidate_id)
+        path = self.blob_path(candidate.sha256)
+        if not path.is_file():
+            raise ProjectAssetNotFoundError(candidate_id)
+        return path.read_bytes()
+
+    def claim_generation_candidate_acceptance(
+        self,
+        candidate_id: str,
+        *,
+        now: datetime | None = None,
+        stale_after: timedelta = timedelta(minutes=10),
+    ) -> AssetGenerationCandidate:
+        """Serialize candidate acceptance across control-plane processes."""
+        claimed_at = now or datetime.now(UTC)
+        if claimed_at.tzinfo is None:
+            claimed_at = claimed_at.replace(tzinfo=UTC)
+        if stale_after <= timedelta(0):
+            raise ValueError("candidate acceptance claim lifetime must be positive")
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM asset_generation_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectAssetNotFoundError(candidate_id)
+            candidate = AssetGenerationCandidate.model_validate_json(row["payload_json"])
+            if candidate.state != AssetGenerationCandidateState.PENDING:
+                raise ValueError("asset candidate has already been resolved")
+            connection.execute(
+                "DELETE FROM asset_candidate_acceptance_claims "
+                "WHERE candidate_id = ? AND claimed_at <= ?",
+                (candidate_id, (claimed_at - stale_after).timestamp()),
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO asset_candidate_acceptance_claims(candidate_id, claimed_at) "
+                    "VALUES (?, ?)",
+                    (candidate_id, claimed_at.timestamp()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("asset candidate acceptance is already in progress") from exc
+        return candidate
+
+    def release_generation_candidate_acceptance(self, candidate_id: str) -> None:
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                "DELETE FROM asset_candidate_acceptance_claims WHERE candidate_id = ?",
+                (candidate_id,),
+            )
+
+    def resolve_generation_candidate(
+        self, candidate_id: str, *, accepted_asset_id: str | None = None
+    ) -> AssetGenerationCandidate:
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM asset_generation_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectAssetNotFoundError(candidate_id)
+            current = AssetGenerationCandidate.model_validate_json(row["payload_json"])
+            target_state = (
+                AssetGenerationCandidateState.ACCEPTED
+                if accepted_asset_id
+                else AssetGenerationCandidateState.DISCARDED
+            )
+            if current.state != AssetGenerationCandidateState.PENDING:
+                if (
+                    current.state == target_state
+                    and current.accepted_asset_id == accepted_asset_id
+                ):
+                    return current
+                raise ValueError("asset candidate has already been resolved")
+            updated = current.model_copy(
+                update={"state": target_state, "accepted_asset_id": accepted_asset_id}
+            )
+            connection.execute(
+                "UPDATE asset_generation_candidates SET state = ?, payload_json = ? "
+                "WHERE candidate_id = ?",
+                (
+                    updated.state.value,
+                    _canonical_json(updated.model_dump(mode="json")),
+                    candidate_id,
+                ),
+            )
+        return updated
+
+    def list_assets(self, project_id: str) -> tuple[ProjectAsset, ...]:
+        if not self.project_exists(project_id):
+            raise ProjectNotFoundError(project_id)
+        self._migrate_legacy_workspace_assets(project_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT current.payload_json
+                FROM project_asset_revisions current
+                WHERE current.project_id = ?
+                  AND current.revision = (
+                    SELECT MAX(candidate.revision)
+                    FROM project_asset_revisions candidate
+                    WHERE candidate.asset_id = current.asset_id
+                  )
+                  AND current.state != ?
+                ORDER BY current.created_at, current.asset_id
+                """,
+                (project_id, ProjectAssetState.RETIRED.value),
+            ).fetchall()
+        return tuple(ProjectAsset.model_validate_json(row["payload_json"]) for row in rows)
+
+    def relink_upload(
+        self,
+        project_id: str,
+        asset_id: str,
+        *,
+        original_name: str,
+        content: bytes,
+    ) -> ProjectAsset:
+        if len(content) > MAX_PROJECT_ASSET_BYTES:
+            raise ProjectAssetTooLargeError(
+                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+            )
+        image, mime_type, width, height = self._validate_image(content)
+        blob_sha256 = hashlib.sha256(content).hexdigest()
+        preview_content = self._make_preview(image)
+        preview_sha256 = hashlib.sha256(preview_content).hexdigest()
+        with self._transaction(immediate=True) as connection:
+            current = self._get_current(connection, project_id, asset_id)
+            if current.state != ProjectAssetState.MISSING_BLOB:
+                raise ValueError("only missing_blob assets can be relinked")
+            self._write_blob_once(self.blob_path(blob_sha256), content)
+            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            updated = ProjectAsset.model_validate(
+                current.model_copy(
+                    update={
+                        "revision": current.revision + 1,
+                        "original_name": original_name or current.original_name,
+                        "state": ProjectAssetState.AVAILABLE,
+                        "sha256": blob_sha256,
+                        "preview_sha256": preview_sha256,
+                        "mime_type": mime_type,
+                        "byte_size": len(content),
+                        "width": width,
+                        "height": height,
+                        "source": ProjectAssetSource.UPLOAD,
+                        "created_at": datetime.now(UTC),
+                    }
+                ).model_dump(mode="python")
+            )
+            self._insert(connection, updated)
+        return updated
+
+    def _migrate_legacy_workspace_assets(self, project_id: str) -> None:
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM project_workspace_revisions "
+                "WHERE project_id = ? ORDER BY revision DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return
+            payload = json.loads(row["payload_json"])
+            if isinstance(payload.get("payload"), dict):
+                payload = payload["payload"]
+            for index, raw in enumerate(payload.get("assets", [])):
+                if not isinstance(raw, dict):
+                    continue
+                asset_id = str(raw.get("id") or raw.get("asset_id") or "")
+                name = str(raw.get("name") or "").strip()
+                if not asset_id or not name:
+                    continue
+                if connection.execute(
+                    "SELECT 1 FROM project_asset_revisions WHERE asset_id = ? LIMIT 1",
+                    (asset_id,),
+                ).fetchone():
+                    continue
+                kind_value = str(raw.get("kind") or "reference")
+                try:
+                    kind = ProjectAssetPurpose(kind_value)
+                except ValueError:
+                    kind = ProjectAssetPurpose.REFERENCE
+                scope_value = str(raw.get("scope") or "common")
+                if scope_value == "public":
+                    scope_value = "common"
+                try:
+                    scope = AssetScope(scope_value)
+                except ValueError:
+                    scope = AssetScope.COMMON
+                shot_id = str(raw.get("shotId") or raw.get("shot_id") or "") or None
+                if scope == AssetScope.SHOT and shot_id is None:
+                    scope = AssetScope.COMMON
+                created_raw = raw.get("createdAt") or raw.get("created_at")
+                try:
+                    created_at = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    created_at = datetime.now(UTC)
+                asset = ProjectAsset(
+                    asset_id=asset_id,
+                    project_id=project_id,
+                    revision=1,
+                    name=name,
+                    original_name=str(raw.get("fileName") or raw.get("original_name") or name),
+                    state=ProjectAssetState.MISSING_BLOB,
+                    kind=kind,
+                    scope=scope,
+                    shot_id=shot_id if scope == AssetScope.SHOT else None,
+                    source=ProjectAssetSource.LEGACY,
+                    created_at=created_at,
+                )
+                try:
+                    self._ensure_unique_name(connection, project_id, name)
+                    self._insert(connection, asset)
+                except DuplicateProjectAssetNameError:
+                    asset = asset.model_copy(update={"name": f"{name}（旧素材 {index + 1}）"})
+                    self._insert(connection, asset)
+
+    def get_asset(self, project_id: str, asset_id: str) -> ProjectAsset:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM project_asset_revisions
+                WHERE project_id = ? AND asset_id = ?
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (project_id, asset_id),
+            ).fetchone()
+        if row is None:
+            raise ProjectAssetNotFoundError(asset_id)
+        asset = ProjectAsset.model_validate_json(row["payload_json"])
+        if asset.state == ProjectAssetState.RETIRED:
+            raise ProjectAssetNotFoundError(asset_id)
+        return asset
+
+    def update_asset(
+        self,
+        project_id: str,
+        asset_id: str,
+        *,
+        name: str | None = None,
+        kind: ProjectAssetPurpose | None = None,
+        scope: AssetScope | None = None,
+        shot_id: str | None = None,
+        shot_id_was_set: bool = False,
+    ) -> ProjectAsset:
+        with self._transaction(immediate=True) as connection:
+            current = self._get_current(connection, project_id, asset_id)
+            new_name = current.name if name is None else name
+            self._ensure_unique_name(connection, project_id, new_name, excluding_asset_id=asset_id)
+            values: dict[str, Any] = {
+                "revision": current.revision + 1,
+                "name": new_name,
+                "kind": current.kind if kind is None else kind,
+                "scope": current.scope if scope is None else scope,
+                "created_at": datetime.now(UTC),
+            }
+            if shot_id_was_set:
+                values["shot_id"] = shot_id
+            updated = current.model_copy(update=values)
+            # model_copy does not rerun Pydantic validators.
+            updated = ProjectAsset.model_validate(updated.model_dump(mode="python"))
+            self._insert(connection, updated)
+        return updated
+
+    def retire_asset(self, project_id: str, asset_id: str) -> None:
+        with self._transaction(immediate=True) as connection:
+            current = self._get_current(connection, project_id, asset_id)
+            references = self._find_references(connection, project_id, asset_id)
+            if references:
+                raise ProjectAssetDependencyError(references)
+            retired = current.model_copy(
+                update={
+                    "revision": current.revision + 1,
+                    "state": ProjectAssetState.RETIRED,
+                    "created_at": datetime.now(UTC),
+                }
+            )
+            self._insert(connection, retired)
+
+    def preview_for(self, project_id: str, asset_id: str) -> Path:
+        asset = self.get_asset(project_id, asset_id)
+        if asset.preview_sha256 is None:
+            raise ProjectAssetNotFoundError(asset_id)
+        path = self.preview_path(asset.preview_sha256)
+        if not path.is_file():
+            raise ProjectAssetNotFoundError(asset_id)
+        return path
+
+    def blob_path(self, sha256: str) -> Path:
+        return self.blob_root / sha256[:2] / sha256
+
+    def preview_path(self, sha256: str) -> Path:
+        return self.preview_root / sha256[:2] / f"{sha256}.jpg"
+
+    @staticmethod
+    def _validate_image(content: bytes) -> tuple[Image.Image, str, int, int]:
+        if not content:
+            raise InvalidProjectImageError("uploaded image is empty")
+        try:
+            with Image.open(io.BytesIO(content)) as probe:
+                image_format = probe.format
+                width, height = probe.size
+                probe.verify()
+            if image_format not in SUPPORTED_IMAGE_FORMATS:
+                raise InvalidProjectImageError("supported image formats are JPEG, PNG, and WebP")
+            if (
+                width < 1
+                or height < 1
+                or width > MAX_IMAGE_DIMENSION
+                or height > MAX_IMAGE_DIMENSION
+                or width * height > MAX_IMAGE_PIXELS
+            ):
+                raise InvalidProjectImageError("image dimensions exceed the safety limit")
+            image = Image.open(io.BytesIO(content))
+            image.seek(0)
+            image.load()
+        except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+            raise InvalidProjectImageError("file content is not a valid supported image") from exc
+        return image, SUPPORTED_IMAGE_FORMATS[image_format], width, height
+
+    @staticmethod
+    def _make_preview(image: Image.Image) -> bytes:
+        preview = image.convert("RGB")
+        preview.thumbnail(PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS)
+        target = io.BytesIO()
+        preview.save(target, format="JPEG", quality=85, optimize=True)
+        return target.getvalue()
+
+    @staticmethod
+    def _write_blob_once(path: Path, content: bytes) -> None:
+        if path.is_file():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(content)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                pass
+            except OSError:
+                if not path.exists():
+                    temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _insert(connection: sqlite3.Connection, asset: ProjectAsset) -> None:
+        connection.execute(
+            """
+            INSERT INTO project_asset_revisions(
+                asset_id, project_id, revision, normalized_name, state,
+                blob_sha256, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                asset.asset_id,
+                asset.project_id,
+                asset.revision,
+                _normalized_name(asset.name),
+                asset.state.value,
+                asset.sha256,
+                _canonical_json(asset.model_dump(mode="json")),
+                asset.created_at.timestamp(),
+            ),
+        )
+
+    def _get_current(
+        self, connection: sqlite3.Connection, project_id: str, asset_id: str
+    ) -> ProjectAsset:
+        row = connection.execute(
+            """
+            SELECT payload_json FROM project_asset_revisions
+            WHERE project_id = ? AND asset_id = ?
+            ORDER BY revision DESC LIMIT 1
+            """,
+            (project_id, asset_id),
+        ).fetchone()
+        if row is None:
+            raise ProjectAssetNotFoundError(asset_id)
+        asset = ProjectAsset.model_validate_json(row["payload_json"])
+        if asset.state == ProjectAssetState.RETIRED:
+            raise ProjectAssetNotFoundError(asset_id)
+        return asset
+
+    @staticmethod
+    def _ensure_unique_name(
+        connection: sqlite3.Connection,
+        project_id: str,
+        name: str,
+        *,
+        excluding_asset_id: str | None = None,
+    ) -> None:
+        normalized = _normalized_name(name)
+        if not normalized:
+            raise ValueError("asset name must be non-empty")
+        row = connection.execute(
+            """
+            SELECT current.asset_id
+            FROM project_asset_revisions current
+            WHERE current.project_id = ? AND current.normalized_name = ?
+              AND current.state != ?
+              AND current.revision = (
+                SELECT MAX(candidate.revision)
+                FROM project_asset_revisions candidate
+                WHERE candidate.asset_id = current.asset_id
+              )
+              AND (? IS NULL OR current.asset_id != ?)
+            LIMIT 1
+            """,
+            (
+                project_id,
+                normalized,
+                ProjectAssetState.RETIRED.value,
+                excluding_asset_id,
+                excluding_asset_id,
+            ),
+        ).fetchone()
+        if row is not None:
+            raise DuplicateProjectAssetNameError(name)
+
+    @staticmethod
+    def _find_references(
+        connection: sqlite3.Connection, project_id: str, asset_id: str
+    ) -> tuple[str, ...]:
+        references: list[str] = []
+        candidates = (
+            ("project_workspace_revisions", "project_id", "project workspace"),
+            ("asset_plan_revisions", "plan_id", "asset plan"),
+            ("image_prompt_revisions", "prompt_revision_id", "image prompt"),
+            ("h3_prompt_revisions", "prompt_revision_id", "H3 prompt"),
+        )
+        for table, identity_column, label in candidates:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone()
+            if not exists:
+                continue
+            rows = connection.execute(
+                f"""
+                SELECT current.payload_json FROM {table} current
+                WHERE current.project_id = ?
+                  AND current.revision = (
+                    SELECT MAX(candidate.revision) FROM {table} candidate
+                    WHERE candidate.{identity_column} = current.{identity_column}
+                  )
+                """,
+                (project_id,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except json.JSONDecodeError:
+                    continue
+                if _payload_references_asset(payload, asset_id):
+                    references.append(label)
+                    break
+        return tuple(references)

@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Video Generator experimental GPU Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aivideo
+Group=aivideo
+WorkingDirectory=/var/lib/aivideo-worker
+LoadCredential=worker-token:/etc/aivideo-worker/worker-token
+ExecStart=/opt/aivideo-worker/bin/aivideo-worker --control-plane https://controller.example --comfyui-root /opt/ComfyUI
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aivideo-worker /opt/ComfyUI/input /opt/ComfyUI/output
+
+[Install]
+WantedBy=multi-user.target

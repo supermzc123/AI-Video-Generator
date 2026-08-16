@@ -1,0 +1,6 @@
+{
+  "ffmpeg_version": "8.1.1-full_build",
+  "source_url": "https://www.gyan.dev/ffmpeg/builds/",
+  "ffmpeg_sha256": "09948d4cdd0650da6ff5a87577469f2a218dc2615ae379f8f734d24c49de0f73",
+  "ffprobe_sha256": "a6618e99bb58869ded3c6f37b53aa1a8d701c3591dbb7b5b317d47369c112be2"
+}

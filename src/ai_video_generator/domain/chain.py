@@ -93,6 +93,16 @@ class GenerationSegment(FrozenModel):
             raise ValueError("trim_head_frames must leave at least one visible frame")
         if self.visible_frames + self.incoming_context.trim_head_frames > self.sample_frames:
             raise ValueError("visible frames and trimmed head exceed the sample frame budget")
+        if self.incoming_context.mode != ContextMode.MOTION_CONTEXT:
+            if self.incoming_context.trim_head_frames:
+                raise ValueError("only motion_context segments may trim a context head")
+        elif self.incoming_context.trim_head_frames != self.incoming_context.context_frames:
+            raise ValueError("motion_context trim_head_frames must equal context_frames")
+        unused_frames = (
+            self.sample_frames - self.incoming_context.trim_head_frames - self.visible_frames
+        )
+        if unused_frames >= 17:
+            raise ValueError("unused sampled tail must be smaller than one H3 grid interval")
         return self
 
 
@@ -108,9 +118,7 @@ class ChainSpec(FrozenModel):
         ids = [segment.segment_id for segment in self.segments]
         if len(ids) != len(set(ids)):
             raise ValueError("segment IDs must be unique")
-        if [segment.ordinal for segment in self.segments] != list(
-            range(1, len(self.segments) + 1)
-        ):
+        if [segment.ordinal for segment in self.segments] != list(range(1, len(self.segments) + 1)):
             raise ValueError("segment ordinals must be consecutive and ordered")
 
         first = self.segments[0]

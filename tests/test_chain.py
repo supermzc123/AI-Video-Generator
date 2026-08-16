@@ -24,7 +24,7 @@ def segment(
         width=1024,
         height=608,
         sample_frames=277,
-        visible_frames=255 if ordinal > 1 else 277,
+        visible_frames=255 if incoming_context is not None else 277,
         incoming_context=incoming_context or IncomingContext(),
     )
 
@@ -87,4 +87,33 @@ def test_chain_rejects_non_adjacent_context() -> None:
                     ),
                 ),
             ),
+        )
+
+
+def test_segment_rejects_motion_context_trim_that_does_not_match_context() -> None:
+    with pytest.raises(ValidationError, match="must equal context_frames"):
+        segment(
+            "S001.C02",
+            2,
+            IncomingContext(
+                mode=ContextMode.MOTION_CONTEXT,
+                predecessor_segment_id="S001.C01",
+                context_frames=22,
+                trim_head_frames=5,
+            ),
+        )
+
+
+def test_segment_rejects_unexplained_full_h3_grid_of_sampled_tail() -> None:
+    with pytest.raises(ValidationError, match="smaller than one H3 grid interval"):
+        GenerationSegment(
+            segment_id="S001.C01",
+            ordinal=1,
+            prompt_revision_id="prompt-1@1",
+            normalized_prompt="A shot",
+            generation_mode=GenerationMode.T2VA,
+            width=1024,
+            height=608,
+            sample_frames=277,
+            visible_frames=260,
         )

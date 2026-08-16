@@ -1,0 +1,44 @@
+name: Windows release readiness
+
+on:
+  push:
+    branches: [main, codex/release-readiness]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run pytest
+      - working-directory: desktop
+        run: npm ci
+      - working-directory: desktop
+        run: npm run build
+      - working-directory: desktop/src-tauri
+        run: cargo check --locked
+      - shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-full_build.7z -OutFile "$env:RUNNER_TEMP\ffmpeg.7z"
+          7z x "$env:RUNNER_TEMP\ffmpeg.7z" "-o$env:RUNNER_TEMP\ffmpeg" -y
+          $bin = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          ./scripts/build-windows-resources.ps1 -FfmpegSourceDirectory $bin
+      - working-directory: desktop
+        run: npm run tauri build -- --bundles msi,nsis
+      - shell: pwsh
+        run: ./scripts/sign-windows.ps1 -Files (Get-ChildItem desktop/src-tauri/target/release/bundle -Recurse -Include *.msi,*.exe | ForEach-Object FullName)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-internal-windows-${{ github.sha }}
+          path: desktop/src-tauri/target/release/bundle/

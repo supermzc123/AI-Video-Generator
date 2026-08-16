@@ -1,11 +1,15 @@
 import uvicorn
 
+from ai_video_generator.api import app
+from ai_video_generator.config import get_settings
+
 
 def run() -> None:
+    settings = get_settings()
     uvicorn.run(
-        "ai_video_generator.api:app",
+        app,
         host="127.0.0.1",
-        port=8000,
+        port=settings.api_port,
         reload=False,
     )
 
