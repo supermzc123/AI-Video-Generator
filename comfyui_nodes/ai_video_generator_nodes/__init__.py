@@ -6,10 +6,15 @@ from pathlib import Path
 import folder_paths
 from comfy.nested_tensor import NestedTensor
 
-from ai_video_generator.services import (
-    read_conditioning_artifact,
-    write_conditioning_artifact,
-)
+try:
+    from ai_video_generator.services import (
+        read_conditioning_artifact,
+        write_conditioning_artifact,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "ai_video_generator":
+        raise
+    from .conditioning_io import read_conditioning_artifact, write_conditioning_artifact
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 

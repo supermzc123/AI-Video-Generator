@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     h3_audio_vae: str = "minimax_h3_audio_vae_fp32.safetensors"
     h3_turbo_lora: str = "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors"
     h3_turbo_enabled: bool = True
-    h3_sage_attention_enabled: bool = True
+    h3_sage_attention_enabled: bool = False
     h3_low_vram: bool = True
     h3_steps: int = Field(default=6, ge=4, le=50)
 

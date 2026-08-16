@@ -7,13 +7,22 @@
 - `AVG Save H3 Static Bundle`：原子保存H3节点的`CONDITIONING`和初始AV `LATENT`。
 - `AVG Load H3 Static Bundle`：同时恢复两个静态输出，避免扩散阶段因latent连线再次执行H3文本编码节点。
 
-节点代码位于`comfyui_nodes/ai_video_generator_nodes`。使用安装脚本将项目以不修改ComfyUI既有依赖的方式安装，并建立节点目录junction：
+在桌面端“全局设置”中填写ComfyUI文件夹，然后点击“保存路径并安装”。控制平面会依次：
+
+- 验证ComfyUI本体包含官方MiniMax H3节点；
+- 安装项目专属AVG节点；
+- 安装固定提交并校验文件哈希的H3 Motion Context；
+- 安装固定提交并校验文件哈希的官方Turbo节点。
+
+该操作不安装SageAttention。全新配置默认关闭SageAttention，已有配置仍尊重用户原来的选择。所有项目安装器均可重复运行，正确版本已经存在时只校验、不覆盖。
+
+节点代码位于`comfyui_nodes/ai_video_generator_nodes`。命令行脚本仅作为开发和故障排查入口：
 
 ```powershell
 .\scripts\install-avg-comfyui-nodes.ps1 -ComfyUIRoot D:\Comfy_new\ComfyUI
 ```
 
-脚本完成后需正常重启ComfyUI一次以注册节点。脚本不会自行停止或重启ComfyUI。
+安装完成后需正常重启ComfyUI一次以注册节点。应用不会自行停止或重启ComfyUI。
 
 节点缓存固定写入ComfyUI输出目录下的`ai-video-generator/conditioning`，不接受任意文件路径。加载时会验证fingerprint、文件名、大小、SHA-256、tensor数量和JSON结构；不使用pickle或`torch.load`。
 

@@ -36,6 +36,7 @@
     "resources": {
       "resources/control-plane/": "control-plane/",
       "resources/ffmpeg/": "ffmpeg/",
+      "resources/installers/": "installers/",
       "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     },
     "icon": [

@@ -146,8 +146,12 @@ fn start_control_plane(
     if let Ok(resources) = app.path().resource_dir() {
         let ffmpeg = resources.join("ffmpeg").join("ffmpeg.exe");
         let ffprobe = resources.join("ffmpeg").join("ffprobe.exe");
+        let installer_scripts = resources.join("installers").join("scripts");
         if ffmpeg.is_file() { command.env("AIVIDEO_FFMPEG_BINARY", ffmpeg); }
         if ffprobe.is_file() { command.env("AIVIDEO_FFPROBE_BINARY", ffprobe); }
+        if installer_scripts.is_dir() {
+            command.env("AIVIDEO_INSTALLER_SCRIPTS_ROOT", installer_scripts);
+        }
     }
     if let Some(directory) = working_dir { command.current_dir(directory); }
     #[cfg(windows)]

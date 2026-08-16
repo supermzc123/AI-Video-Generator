@@ -1,13 +1,14 @@
-import { Check, CircleAlert, Eye, EyeOff, PlugZap, RefreshCw, Save } from "lucide-react";
+import { Blocks, Check, CircleAlert, Eye, EyeOff, PlugZap, RefreshCw, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import {
   getRuntimeSettings,
   getLocalWorkerCapabilities,
+  installRequiredComfyNodes,
   listComfyuiModels,
   listLlmModels,
   updateRuntimeSettings,
 } from "./api";
-import type { RuntimeSettings } from "./api";
+import type { ComfyNodeInstallResult, RuntimeSettings } from "./api";
 
 const fallback: RuntimeSettings = {
   comfyuiRoot: "",
@@ -25,7 +26,7 @@ const fallback: RuntimeSettings = {
   h3AudioVae: "minimax_h3_audio_vae_fp32.safetensors",
   h3TurboLora: "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
   h3TurboEnabled: true,
-  h3SageAttentionEnabled: true,
+  h3SageAttentionEnabled: false,
   h3LowVram: true,
   h3Steps: 6,
 };
@@ -54,6 +55,7 @@ export function SettingsView() {
   const [comfyModels, setComfyModels] = useState({ diffusion_models: [] as string[], text_encoders: [] as string[], vaes: [] as string[], loras: [] as string[] });
   const [savedSnapshot, setSavedSnapshot] = useState("");
   const [workerBlockers, setWorkerBlockers] = useState<string[]>([]);
+  const [nodeInstallResult, setNodeInstallResult] = useState<ComfyNodeInstallResult | null>(null);
 
   useEffect(() => {
     void getRuntimeSettings()
@@ -82,10 +84,10 @@ export function SettingsView() {
     loras: comfyModels.loras.filter((item) => item.toLowerCase().includes("minimax_h3_turbo")),
   }), [comfyModels]);
 
-  async function save() {
+  async function save(showSuccess = true): Promise<boolean> {
     if (!portValid) {
       setError("ComfyUI 端口必须是 1 到 65535 之间的整数");
-      return;
+      return false;
     }
     let baseUrl: string;
     try {
@@ -97,7 +99,7 @@ export function SettingsView() {
       baseUrl = parsed.toString().replace(/\/$/, "");
     } catch {
       setError("ComfyUI 地址必须包含 http:// 或 https://");
-      return;
+      return false;
     }
     setBusy(true);
     setError(null);
@@ -115,9 +117,39 @@ export function SettingsView() {
       setComfyOrigin(comfy.origin);
       setComfyPort(comfy.port);
       setSavedSnapshot(JSON.stringify({ value: saved, origin: comfy.origin, port: comfy.port }));
-      setMessage("全局设置已保存并立即生效");
+      if (showSuccess) setMessage("全局设置已保存并立即生效");
+      return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "保存失败");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function installNodes() {
+    if (!settings.comfyuiRoot.trim()) {
+      setError("请先填写ComfyUI文件夹");
+      return;
+    }
+    if (!await save(false)) return;
+    setBusy(true);
+    setError(null);
+    setMessage("正在安装并校验项目节点、H3 Motion Context 和 Turbo节点；请勿关闭应用...");
+    setNodeInstallResult(null);
+    try {
+      const result = await installRequiredComfyNodes();
+      setNodeInstallResult(result);
+      if (result.succeeded) {
+        setMessage("所需节点已安装并校验。请重启ComfyUI，然后点击测试连接");
+      } else {
+        const failed = result.steps.filter((step) => !step.succeeded).map((step) => step.label);
+        setMessage(null);
+        setError(`部分节点安装失败：${failed.join("、")}`);
+      }
+    } catch (cause) {
+      setMessage(null);
+      setError(`节点安装失败：${cause instanceof Error ? cause.message : "未知错误"}`);
     } finally {
       setBusy(false);
     }
@@ -170,7 +202,9 @@ export function SettingsView() {
         <label className="field field-wide"><span>地址</span><input value={comfyOrigin} placeholder="http://127.0.0.1" onChange={(event) => setComfyOrigin(event.target.value)} /></label>
         <label className="field"><span>端口</span><input inputMode="numeric" value={comfyPort} onChange={(event) => setComfyPort(event.target.value)} /></label>
         <label className="field"><span>请求超时（秒）</span><input type="number" min="1" max="60" value={settings.requestTimeoutSeconds} onChange={(event) => setSettings({ ...settings, requestTimeoutSeconds: Number(event.target.value) })} /></label>
-        <label className="field field-wide"><span>ComfyUI 文件夹（可选）</span><input value={settings.comfyuiRoot} placeholder="D:\\Comfy_new\\ComfyUI" onChange={(event) => setSettings({ ...settings, comfyuiRoot: event.target.value })} /></label>
+        <label className="field field-wide"><span>ComfyUI 文件夹</span><input value={settings.comfyuiRoot} placeholder="D:\\Comfy_new\\ComfyUI" onChange={(event) => { setSettings({ ...settings, comfyuiRoot: event.target.value }); setNodeInstallResult(null); }} /></label>
+        <div className="node-install-row field-wide"><div><strong>安装视频生成所需节点</strong><span>安装项目专属节点、H3 Motion Context和官方Turbo节点；不安装SageAttention</span></div><button className="secondary-button" disabled={busy || !settings.comfyuiRoot.trim()} onClick={() => void installNodes()}><Blocks size={16} />{busy ? "处理中" : "保存路径并安装"}</button></div>
+        {nodeInstallResult && <div className="node-install-results field-wide">{nodeInstallResult.steps.map((step) => <div className={step.succeeded ? "installed" : "failed"} key={step.component}>{step.succeeded ? <Check size={15} /> : <CircleAlert size={15} />}<span><strong>{step.label}</strong><small>{step.message}</small></span></div>)}</div>}
       </div>
     </div>
 
@@ -189,7 +223,7 @@ export function SettingsView() {
       </div>
       <div className="h3-prerequisite" role="note">
         <CircleAlert size={18} />
-        <div><strong>首次运行前必须安装项目自定义节点</strong><span>内置 H3 工作流依赖 <code>AVGSaveH3StaticConditioning</code> 和 <code>AVGLoadH3StaticConditioning</code>。请先在项目目录运行 <code>powershell -ExecutionPolicy Bypass -File scripts/install-avg-comfyui-nodes.ps1</code>，然后重启 ComfyUI。关闭 Turbo 时不需要 Turbo 插件。</span>{workerBlockers.filter((item) => item.includes("AVG")).map((item) => <small key={item}>{item}</small>)}</div>
+        <div><strong>首次运行前必须安装并重启ComfyUI</strong><span>在上方填写ComfyUI文件夹并点击“保存路径并安装”。安装器只使用固定来源和校验版本，不安装SageAttention；官方H3基础节点由ComfyUI本体提供。</span>{workerBlockers.filter((item) => item.includes("AVG")).map((item) => <small key={item}>{item}</small>)}</div>
       </div>
       <small>为避免误选其他架构，扩散模型、编码器和 VAE 列表会过滤掉文件名中不含 minimax 的项目；Turbo LoRA 只显示 minimax_h3_turbo。列表来自当前 ComfyUI `/object_info`，刷新和保存都不会提交 GPU 任务。</small>
     </div>

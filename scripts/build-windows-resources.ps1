@@ -7,6 +7,7 @@ $projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Pa
 $resourceRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "desktop\src-tauri\resources"))
 $controlPlaneRoot = [IO.Path]::GetFullPath((Join-Path $resourceRoot "control-plane"))
 $ffmpegRoot = [IO.Path]::GetFullPath((Join-Path $resourceRoot "ffmpeg"))
+$installerRoot = [IO.Path]::GetFullPath((Join-Path $resourceRoot "installers"))
 $buildRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "build\pyinstaller"))
 $manifest = Get-Content -Raw (Join-Path $PSScriptRoot "release-assets.json") | ConvertFrom-Json
 
@@ -24,19 +25,37 @@ function Get-Sha256([string]$Path) {
     }
 }
 
-foreach ($target in @($controlPlaneRoot, $ffmpegRoot, $buildRoot)) {
+foreach ($target in @($controlPlaneRoot, $ffmpegRoot, $installerRoot, $buildRoot)) {
     if (-not $target.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to prepare resources outside the project: $target"
     }
 }
 
-New-Item -ItemType Directory -Path $controlPlaneRoot, $ffmpegRoot, $buildRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $controlPlaneRoot, $ffmpegRoot, $installerRoot, $buildRoot -Force | Out-Null
 Get-ChildItem -LiteralPath $controlPlaneRoot -Force |
     Where-Object Name -ne ".gitkeep" |
     Remove-Item -Recurse -Force
 Get-ChildItem -LiteralPath $ffmpegRoot -Force |
     Where-Object Name -ne ".gitkeep" |
     Remove-Item -Recurse -Force
+Get-ChildItem -LiteralPath $installerRoot -Force |
+    Where-Object Name -ne ".gitkeep" |
+    Remove-Item -Recurse -Force
+
+$installerScripts = Join-Path $installerRoot "scripts"
+$installerNodes = Join-Path $installerRoot "comfyui_nodes\ai_video_generator_nodes"
+New-Item -ItemType Directory -Path $installerScripts, $installerNodes -Force | Out-Null
+foreach ($name in @(
+    "install-avg-comfyui-nodes.ps1",
+    "install-h3-motion-context.ps1",
+    "install-h3-turbo-nodes.ps1"
+)) {
+    Copy-Item -LiteralPath (Join-Path $projectRoot "scripts\$name") -Destination $installerScripts
+}
+Copy-Item -LiteralPath (Join-Path $projectRoot "comfyui_nodes\ai_video_generator_nodes\__init__.py") `
+    -Destination $installerNodes
+Copy-Item -LiteralPath (Join-Path $projectRoot "src\ai_video_generator\services\conditioning_io.py") `
+    -Destination (Join-Path $installerNodes "conditioning_io.py")
 
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {

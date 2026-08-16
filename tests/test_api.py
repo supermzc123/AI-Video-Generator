@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from ai_video_generator.api import create_app
+from ai_video_generator.api_models import ComfyNodeInstallResult, ComfyNodeInstallStep
 from ai_video_generator.config import Settings
 from ai_video_generator.domain import (
     ChainSpec,
@@ -154,6 +155,64 @@ async def test_controlled_h3_settings_allow_disabling_optional_turbo(tmp_path: P
 
     assert response.status_code == 200
     assert response.json()["h3_turbo_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_comfy_node_install_endpoint_uses_saved_root_and_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ai_video_generator.api as api_module
+
+    comfyui_root = tmp_path / "ComfyUI"
+    captured: dict[str, object] = {}
+
+    async def install(**kwargs: object) -> ComfyNodeInstallResult:
+        captured.update(kwargs)
+        return ComfyNodeInstallResult(
+            succeeded=True,
+            restart_required=True,
+            comfyui_root=str(comfyui_root),
+            steps=(
+                ComfyNodeInstallStep(
+                    component="h3_core",
+                    label="H3",
+                    succeeded=True,
+                    message="verified",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(api_module, "install_required_comfy_nodes", install)
+    app = create_app(
+        Settings(
+            _env_file=None,
+            data_root=tmp_path / "data",
+            comfyui_root=comfyui_root,
+            network_proxy="mixed:10808",
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/api/v1/settings/comfyui-nodes/install", json={})
+
+    assert response.status_code == 200
+    assert response.json()["restart_required"] is True
+    assert captured["comfyui_root"] == comfyui_root
+    assert captured["proxy"] == "http://127.0.0.1:10808"
+
+
+@pytest.mark.asyncio
+async def test_comfy_node_install_endpoint_requires_saved_root(tmp_path: Path) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path, comfyui_root=None))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/api/v1/settings/comfyui-nodes/install", json={})
+
+    assert response.status_code == 422
+    assert "ComfyUI" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

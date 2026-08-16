@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$ComfyUIRoot
+    [string]$ComfyUIRoot,
+
+    [string]$Proxy = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,20 +29,49 @@ if ($conflicts) {
 }
 
 if (Test-Path -LiteralPath $destination) {
-    throw "Destination already exists: $destination"
+    $actualCommit = (& git -C $destination rev-parse HEAD).Trim()
+    $initPath = Join-Path $destination "__init__.py"
+    if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $PinnedCommit -or
+        -not (Test-Path -LiteralPath $initPath -PathType Leaf) -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $initPath).Hash -ne $PinnedInitSha256) {
+        throw "Existing official Turbo nodes are not the pinned verified version: $destination"
+    }
+    Write-Output "Official MiniMax H3 Turbo nodes are already installed at commit $PinnedCommit (verified)."
+    exit 0
 }
 
-git clone --no-checkout $Repository $destination
-git -C $destination checkout --detach $PinnedCommit
+$staging = Join-Path $customNodes ".h3-turbo-installing-$([guid]::NewGuid().ToString('N'))"
+$installed = $false
+try {
+    $gitArgs = @("clone", "--filter=blob:none", "--no-checkout", $Repository, $staging)
+    if ($Proxy) {
+        $gitArgs = @("-c", "http.proxy=$Proxy") + $gitArgs
+    }
+    & git @gitArgs
+    if ($LASTEXITCODE -ne 0) { throw "Failed to clone official MiniMax H3 Turbo nodes" }
 
-$actualCommit = git -C $destination rev-parse HEAD
-if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $PinnedCommit) {
-    throw "Official Turbo checkout did not resolve to pinned commit $PinnedCommit"
-}
-$actualInitSha256 = (Get-FileHash -Algorithm SHA256 `
-    -LiteralPath (Join-Path $destination "__init__.py")).Hash
-if ($actualInitSha256 -ne $PinnedInitSha256) {
-    throw "Official Turbo node hash mismatch: $actualInitSha256"
+    & git -C $staging checkout --detach $PinnedCommit
+    if ($LASTEXITCODE -ne 0) { throw "Failed to check out pinned Turbo commit" }
+
+    $actualCommit = (& git -C $staging rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $PinnedCommit) {
+        throw "Official Turbo checkout did not resolve to pinned commit $PinnedCommit"
+    }
+    $actualInitSha256 = (Get-FileHash -Algorithm SHA256 `
+        -LiteralPath (Join-Path $staging "__init__.py")).Hash
+    if ($actualInitSha256 -ne $PinnedInitSha256) {
+        throw "Official Turbo node hash mismatch: $actualInitSha256"
+    }
+    Move-Item -LiteralPath $staging -Destination $destination
+    $installed = $true
+} finally {
+    if (-not $installed -and (Test-Path -LiteralPath $staging)) {
+        $resolvedStaging = (Resolve-Path -LiteralPath $staging).Path
+        if ((Split-Path -Parent $resolvedStaging) -ne $customNodes) {
+            throw "Refusing to clean unexpected Turbo staging path: $resolvedStaging"
+        }
+        Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
+    }
 }
 
 Write-Output "Installed official MiniMax H3 Turbo nodes at commit $PinnedCommit (verified)"

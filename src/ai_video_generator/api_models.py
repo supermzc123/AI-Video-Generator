@@ -137,9 +137,27 @@ class RuntimeSettingsUpdateRequest(BaseModel):
         min_length=1,
     )
     h3_turbo_enabled: bool = True
-    h3_sage_attention_enabled: bool = True
+    h3_sage_attention_enabled: bool = False
     h3_low_vram: bool = True
     h3_steps: int = Field(default=6, ge=4, le=50)
+
+
+class ComfyNodeInstallStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    component: str
+    label: str
+    succeeded: bool
+    message: str
+
+
+class ComfyNodeInstallResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    succeeded: bool
+    restart_required: bool
+    comfyui_root: str
+    steps: tuple[ComfyNodeInstallStep, ...]
 
 
 class ReviewModeRequest(BaseModel):

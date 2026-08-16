@@ -24,7 +24,19 @@ if (-not (Test-Path -LiteralPath $customNodes -PathType Container)) {
     throw "ComfyUI custom_nodes directory does not exist: $customNodes"
 }
 if (Test-Path -LiteralPath $destination) {
-    throw "Destination already exists: $destination"
+    $actualCommit = (& git -C $destination rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $PinnedCommit) {
+        throw "Existing H3 Motion Context is not the pinned version: $destination"
+    }
+    foreach ($entry in $ExpectedHashes.GetEnumerator()) {
+        $sourcePath = Join-Path $destination $entry.Key
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash -ne $entry.Value) {
+            throw "Existing H3 Motion Context failed file verification: $($entry.Key)"
+        }
+    }
+    Write-Output "H3 Motion Context is already installed at pinned commit $PinnedCommit (verified)."
+    exit 0
 }
 
 $patchPatterns = @(
@@ -35,7 +47,7 @@ $patchPatterns = @(
 )
 $conflicts = @()
 foreach ($package in Get-ChildItem -LiteralPath $customNodes -Directory) {
-    if ($package.Name.StartsWith(".")) {
+    if ($package.Name.StartsWith(".") -or $package.FullName -eq $destination) {
         continue
     }
     $pythonFiles = Get-ChildItem -LiteralPath $package.FullName -Recurse -File `

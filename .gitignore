@@ -21,6 +21,8 @@ desktop/src-tauri/resources/control-plane/*
 !desktop/src-tauri/resources/control-plane/.gitkeep
 desktop/src-tauri/resources/ffmpeg/*
 !desktop/src-tauri/resources/ffmpeg/.gitkeep
+desktop/src-tauri/resources/installers/*
+!desktop/src-tauri/resources/installers/.gitkeep
 
 # Release packages and large model/runtime payloads
 release/

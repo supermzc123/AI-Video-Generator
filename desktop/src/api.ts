@@ -292,6 +292,18 @@ export type RuntimeSettings = {
   h3Steps: number;
 };
 
+export type ComfyNodeInstallResult = {
+  succeeded: boolean;
+  restart_required: boolean;
+  comfyui_root: string;
+  steps: Array<{
+    component: string;
+    label: string;
+    succeeded: boolean;
+    message: string;
+  }>;
+};
+
 type BackendRuntimeSettings = {
   comfyui_root: string | null;
   comfyui_base_url: string;
@@ -380,6 +392,13 @@ export async function updateRuntimeSettings(
     }),
   });
   return mapRuntimeSettings(response);
+}
+
+export function installRequiredComfyNodes(): Promise<ComfyNodeInstallResult> {
+  return requestJson("/api/v1/settings/comfyui-nodes/install", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export type DesktopControlPlaneStatus = {

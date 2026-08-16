@@ -3,6 +3,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import os
 import secrets
 import shutil
 import tempfile
@@ -26,6 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from ai_video_generator import __version__
 from ai_video_generator.api_models import (
+    ComfyNodeInstallResult,
     DryRunRequest,
     ExportPlanRequest,
     H3WorkflowCompileRequest,
@@ -145,6 +147,10 @@ from ai_video_generator.services.batch_runs import (
     batch_project_tasks,
     reconcile_batch_runs,
     resolve_batch_run,
+)
+from ai_video_generator.services.comfy_node_installer import (
+    ComfyNodeInstallValidationError,
+    install_required_comfy_nodes,
 )
 from ai_video_generator.services.export import (
     ExportInput,
@@ -351,6 +357,7 @@ def create_app(
     local_jobs: set[asyncio.Task[None]] = set()
     local_job_ids: set[str] = set()
     local_dispatcher: asyncio.Task[None] | None = None
+    node_install_lock = asyncio.Lock()
 
     def get_task_store() -> SQLiteTaskStore:
         nonlocal task_store
@@ -1817,6 +1824,31 @@ def create_app(
         except (CredentialStoreError, OSError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return await get_runtime_settings()
+
+    @app.post(
+        "/api/v1/settings/comfyui-nodes/install",
+        response_model=ComfyNodeInstallResult,
+    )
+    async def install_comfyui_nodes() -> ComfyNodeInstallResult:
+        if runtime_settings.comfyui_root is None:
+            raise HTTPException(status_code=422, detail="请先填写并保存ComfyUI文件夹")
+        if node_install_lock.locked():
+            raise HTTPException(status_code=409, detail="节点安装正在进行中")
+        configured_scripts = os.environ.get("AIVIDEO_INSTALLER_SCRIPTS_ROOT")
+        scripts_root = (
+            Path(configured_scripts)
+            if configured_scripts
+            else Path(__file__).resolve().parents[2] / "scripts"
+        )
+        try:
+            async with node_install_lock:
+                return await install_required_comfy_nodes(
+                    comfyui_root=runtime_settings.comfyui_root,
+                    scripts_root=scripts_root,
+                    proxy=runtime_settings.network_proxy,
+                )
+        except ComfyNodeInstallValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/v1/workers/local/capabilities")
     async def local_worker_capabilities() -> ComfyUICapabilities:
