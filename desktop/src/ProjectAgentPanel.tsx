@@ -139,7 +139,7 @@ export function ProjectAgentPanel({ stage, project, prepareProject, applyProject
       const result = await streamProjectAgentProposal(saved.projectId, {
         operationId: crypto.randomUUID(),
         operation: options.operation,
-        instruction: `你是本视频项目的专属负责人。当前阶段是“${stageNames[stage]}”。请结合完整项目记忆，${options.automatic ? "直接生成并返回可应用的完整初稿" : "根据用户消息提出具体修改"}：${text}`,
+        instruction: `你是本视频项目的专属负责人。当前阶段是“${stageNames[stage]}”。请结合完整项目记忆，${options.automatic ? "直接生成并返回将由系统校验后立即应用的完整初稿" : "根据用户消息直接修改对应内容；有效修改会由系统校验后立即应用，无需用户再次审批"}：${text}`,
         allowedPaths: stageScopes[stage],
         lockedPaths,
       }, (delta) => setStreamPreview((current) => (current + delta).slice(-1800)));

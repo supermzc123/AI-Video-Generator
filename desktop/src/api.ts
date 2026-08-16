@@ -52,6 +52,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     const detail = typeof body?.detail === "string" ? body.detail : JSON.stringify(body?.detail);
     throw new ApiError(response.status, detail || `${response.status} ${response.statusText}`, body?.detail);
   }
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 

@@ -240,7 +240,8 @@ def test_storyboard_contract_rejects_aliases_and_incomplete_shots() -> None:
 
 def test_structured_prompt_contains_exact_workspace_contracts() -> None:
     messages = build_structured_operation_messages(patch_request())
-    assert "Never claim in rationale that a change has already been applied" in messages[0].content
+    assert "immediately applies non-empty patches" in messages[0].content
+    assert "Never ask the user to approve" in messages[0].content
     payload = json.loads(messages[1].content)
 
     shot_contract = payload["contract"]["workspace_value_contracts"]["shot_item"]
