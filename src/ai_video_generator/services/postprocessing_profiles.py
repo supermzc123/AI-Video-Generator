@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from typing import Any
 
 from ai_video_generator.domain.postprocessing import (
@@ -86,16 +87,20 @@ def _choices(
 
 
 def inspect_postprocess_profiles(
-    nodes: dict[str, Any], *, server_online: bool
+    nodes: dict[str, Any], *, server_online: bool, whisper_available: bool | None = None
 ) -> tuple[PostProcessProfileCapability, ...]:
+    if whisper_available is None:
+        whisper_available = importlib.util.find_spec("faster_whisper") is not None
     result: list[PostProcessProfileCapability] = []
     for profile in BUILTIN_POSTPROCESS_PROFILES:
         if profile.kind == PostProcessKind.TRANSCRIPTION:
+            blockers = () if whisper_available else ("Whisper执行器未安装",)
             result.append(
                 PostProcessProfileCapability(
                     profile=profile,
-                    available=True,
+                    available=whisper_available,
                     models=WHISPER_MODELS,
+                    blockers=blockers,
                 )
             )
             continue

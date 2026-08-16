@@ -34,8 +34,19 @@ jobs:
           7z x "$env:RUNNER_TEMP\ffmpeg.7z" "-o$env:RUNNER_TEMP\ffmpeg" -y
           $bin = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
           ./scripts/build-windows-resources.ps1 -FfmpegSourceDirectory $bin
+          ./scripts/smoke-packaged-control-plane.ps1
       - working-directory: desktop
-        run: npm run tauri build -- --bundles msi,nsis
+        run: .\node_modules\.bin\tauri.cmd build --bundles "msi,nsis"
+      - shell: pwsh
+        run: |
+          $msi = Get-ChildItem desktop/src-tauri/target/release/bundle/msi -Filter *.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $audit = Join-Path $env:RUNNER_TEMP "aivideo-msi-audit"
+          & msiexec.exe /a $msi.FullName /qn "TARGETDIR=$audit"
+          if ($LASTEXITCODE -ne 0) { throw "MSI administrative extraction failed" }
+          foreach ($name in @("ai-video-generator-desktop.exe", "aivideo-api.exe", "ffmpeg.exe", "ffprobe.exe")) {
+            if (-not (Get-ChildItem $audit -Recurse -File -Filter $name)) { throw "MSI is missing $name" }
+          }
+          if (-not (Get-ChildItem $audit -Recurse -Directory -Filter faster_whisper)) { throw "MSI is missing Faster Whisper" }
       - shell: pwsh
         run: ./scripts/sign-windows.ps1 -Files (Get-ChildItem desktop/src-tauri/target/release/bundle -Recurse -Include *.msi,*.exe | ForEach-Object FullName)
       - uses: actions/upload-artifact@v4

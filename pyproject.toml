@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.13"
 license = "GPL-3.0-only"
 dependencies = [
     "fastapi>=0.116,<1",
+    "faster-whisper>=1.2,<2",
     "httpx>=0.28,<1",
     "pillow>=11.3,<12",
     "platformdirs>=4.3,<5",
@@ -31,10 +32,6 @@ dev = [
     "pytest-asyncio>=1.1,<2",
     "ruff>=0.12,<1",
 ]
-postprocessing = [
-    "faster-whisper>=1.2,<2",
-]
-
 [project.scripts]
 aivideo-api = "ai_video_generator.main:run"
 aivideo-worker = "ai_video_generator.worker_cli:run"

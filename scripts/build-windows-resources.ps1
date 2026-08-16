@@ -51,6 +51,10 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     --distpath (Join-Path $buildRoot "dist") `
     --workpath (Join-Path $buildRoot "work") `
     --specpath (Join-Path $buildRoot "spec") `
+    --collect-all faster_whisper `
+    --collect-all ctranslate2 `
+    --collect-all tokenizers `
+    --collect-all av `
     --collect-data ai_video_generator `
     (Join-Path $PSScriptRoot "pyinstaller-entry.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }

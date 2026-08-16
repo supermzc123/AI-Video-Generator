@@ -34,7 +34,7 @@
 - Windows Credential Manager 保存 LLM API Key，旧明文设置迁移后从 JSON 删除。
 - PyInstaller one-folder 控制平面、固定哈希 FFmpeg/ffprobe、许可证和 H3 资源已进入 MSI/NSIS。
 
-自动验证：214 passed、1 skipped；Ruff、React生产构建和`cargo check --locked`通过。
+自动验证：217 passed、1 skipped；Ruff、React生产构建和`cargo check --locked`通过。打包后的控制平面已在最小PATH、独立空数据目录、随机端口和nonce下启动，并确认Faster Whisper执行器可导入。
 
 ## GPU 验证
 
@@ -87,7 +87,7 @@
 - 尚未生成约 60 秒、至少 6 段的 MVP 成片；当前只验证单段和两段连续链。
 - Ubuntu 主动 HTTPS/WSS Worker 协议已有测试，尚未部署到真实 Ubuntu GPU 主机。
 - SeedVR2官方模板和本机GIMM安装没有可直接登记的API格式工作流，相关Profile保持阻断，不能作为本测试版已完成能力宣传。
-- Ubuntu `aivideo-worker` CLI 与 systemd 示例已提供，但声明式 ComfyUI workload执行器仍需真实Ubuntu GPU验收，因此继续标记为实验性。
+- Ubuntu `aivideo-worker` CLI、systemd示例和声明式ComfyUI workload执行器已提供，但仍需真实Ubuntu GPU端到端验收，因此继续标记为实验性。
 - MSI/NSIS均为unsigned内部测试包；没有可信Authenticode证书前禁止正式公开Release。
 - 32 GB Windows 主机最低只剩约 1.48 GB 空闲 RAM。后续继续串行、低分辨率测试；高分辨率或并发任务很可能触发 OOM。
 
@@ -96,7 +96,7 @@
 - `desktop/src-tauri/target/release/bundle/msi/AI Video Generator_0.2.0-beta.1_x64_en-US.msi`
 - `desktop/src-tauri/target/release/bundle/nsis/AI Video Generator_0.2.0-beta.1_x64-setup.exe`
 
-MSI已做管理提取检查，确认包含桌面EXE、控制平面、FFmpeg/ffprobe、许可证、H3和RIFE资源；打包控制平面已在独立数据目录完成动态端口/nonce健康检查。
+MSI已做管理提取检查，确认包含桌面EXE、控制平面、FFmpeg/ffprobe、许可证、H3、RIFE和Faster Whisper运行时；打包控制平面已在独立数据目录完成动态端口/nonce健康检查。Whisper模型权重不进入安装包，首次选择后写入受控模型缓存。
 
 ## 验证命令
 

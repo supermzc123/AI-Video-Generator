@@ -54,3 +54,22 @@ def test_profiles_without_api_workflow_are_not_reported_as_executable() -> None:
         "API" in blocker and "工作流" in blocker
         for blocker in profiles["seedvr2:official-video"].blockers
     )
+
+
+def test_whisper_profile_reflects_packaged_executor_availability() -> None:
+    unavailable = {
+        item.profile.profile_id: item
+        for item in inspect_postprocess_profiles(
+            {}, server_online=False, whisper_available=False
+        )
+    }
+    available = {
+        item.profile.profile_id: item
+        for item in inspect_postprocess_profiles(
+            {}, server_online=False, whisper_available=True
+        )
+    }
+
+    assert not unavailable["transcription:faster-whisper"].available
+    assert unavailable["transcription:faster-whisper"].blockers
+    assert available["transcription:faster-whisper"].available

@@ -32,9 +32,7 @@ def transcribe_to_srt(
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
-        raise RuntimeError(
-            "Whisper执行器未安装；请安装 ai-video-generator[postprocessing]"
-        ) from exc
+        raise RuntimeError("Whisper执行器未安装；请重新安装完整控制平面") from exc
     resolved_device = "auto" if device == "auto" else device
     compute_type = "default" if precision == "auto" else precision
     model_root.mkdir(parents=True, exist_ok=True)

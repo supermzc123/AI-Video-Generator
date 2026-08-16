@@ -20,7 +20,7 @@
 uv sync --extra worker
 ```
 
-wheel提供实验性命令`aivideo-worker`。systemd示例和安装脚本位于`packaging/linux/`；Token优先从`LoadCredential=worker-token:...`读取。该入口尚未在真实Ubuntu GPU主机完成声明式ComfyUI执行验收，不应描述为生产支持。
+wheel提供实验性命令`aivideo-worker`。systemd示例和安装脚本位于`packaging/linux/`；Token优先从`LoadCredential=worker-token:...`读取。命令行Worker已经实现输入Blob下载、ComfyUI提交与history对账、取消和产物回传，但尚未在真实Ubuntu GPU主机完成端到端验收，不应描述为生产支持。
 
 客户端入口是`ai_video_generator.workers.remote_worker.RemoteWorkerClient`，运行循环是`RemoteWorkerRuntime`。生产地址默认必须是`https://`；明文HTTP只可通过`allow_insecure_http=True`显式用于回环测试。
 
