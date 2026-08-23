@@ -59,6 +59,7 @@ export type AssetDraft = {
   kind: AssetKind;
   scope: AssetScope;
   shotId: string | null;
+  shotIds: string[];
   source: "upload" | "generated";
   status: AssetStatus;
   previewUrl: string | null;

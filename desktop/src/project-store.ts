@@ -160,6 +160,7 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         ? text(asset.kind) as ProjectDraft["assets"][number]["kind"]
         : "character";
       const scope = text(asset.scope) === "shot" ? "shot" : "public";
+      const legacyAssetShotId = text(asset.shotId, asset.shot_id) || null;
       return {
         id: text(asset.id) || `asset-${crypto.randomUUID()}`,
         name: text(asset.name) || `素材 ${index + 1}`,
@@ -179,7 +180,12 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         byteSize: positiveNumber(asset.byteSize, asset.byte_size),
         kind,
         scope,
-        shotId: scope === "shot" ? text(asset.shotId) || null : null,
+        shotId: scope === "shot" ? legacyAssetShotId : null,
+        shotIds: Array.isArray(asset.shotIds)
+          ? asset.shotIds.map((value) => text(value)).filter(Boolean)
+          : Array.isArray(asset.shot_ids)
+            ? asset.shot_ids.map((value) => text(value)).filter(Boolean)
+            : legacyAssetShotId ? [legacyAssetShotId] : [],
         source: text(asset.source) === "generated" ? "generated" : "upload",
         status: ["ready", "missing_blob", "uploading", "failed"].includes(text(asset.status))
           ? text(asset.status) as ProjectDraft["assets"][number]["status"]
@@ -209,7 +215,7 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         kind,
         scope,
         shotId: scope === "shot" ? legacyShotId : null,
-        shotIds: scope === "shot" ? shotIds : [],
+        shotIds,
         fulfilledByAssetId: text(plan.fulfilledByAssetId, plan.fulfilled_by_asset_id) || null,
         state,
         width: imageDimension(plan.width, defaultWidth),

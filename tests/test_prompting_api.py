@@ -2,6 +2,7 @@ import pytest
 from fastapi import HTTPException
 
 from ai_video_generator.prompting_api import (
+    _bound_asset_ids_for_shot,
     _complete_image_prompt,
     _continuation_end_state,
     _creative_brief,
@@ -11,6 +12,20 @@ from ai_video_generator.prompting_api import (
     _segment_constraints,
     _workspace_segments,
 )
+
+
+def test_asset_plan_binding_never_propagates_an_unused_material() -> None:
+    payload = {
+        "assetPlans": [
+            {"fulfilledByAssetId": "unused", "scope": "public", "shotIds": []},
+            {"fulfilledByAssetId": "hero", "scope": "public", "shotIds": ["shot-1"]},
+            {"fulfilledByAssetId": "legacy", "scope": "shot", "shotId": "shot-2"},
+        ]
+    }
+
+    assert _bound_asset_ids_for_shot(payload, "shot-1") == {"hero"}
+    assert _bound_asset_ids_for_shot(payload, "shot-2") == {"legacy"}
+    assert _bound_asset_ids_for_shot(payload, "shot-3") == set()
 
 
 def test_prompt_terminal_context_does_not_duplicate_a_long_execution_prompt() -> None:

@@ -33,7 +33,7 @@ const stageNames: Record<AgentStage, string> = {
 const automaticDraftInstructions: Partial<Record<AgentStage, string>> = {
   outline: "根据已批准的创意和项目时长，直接生成完整故事大纲。段落时长总和应接近项目目标时长。",
   storyboard: "根据当前项目内容直接生成完整电影分镜。每个分镜要包含标题、画面摘要、运镜和时长。需要 Motion Context 连续生成时，在同一分镜的 motionSegments 中明确列出每段 durationSeconds 和 summary；分段时长之和必须等于分镜时长，每段至少4秒，首段最多15秒，续段最多12秒。不要机械规划15+15；30秒可以是10+10+10。接缝优先放在密集信息或关键动作完成之后、人物运动与机位相对稳定处，并在 summary 中写清本段内容及交给下一段继承的结束状态。",
-  assets: "根据已批准的创意、大纲和电影分镜，生成完整素材需求计划。先查看 project_assets 清单和随请求提供的图片：这些是已经上传并命名的真实素材，不要为已满足的职责重复创建需求；只规划仍缺少的角色、场景、道具和风格素材，不虚构素材文件。每项需求必须通过 shotIds 明确列出实际使用它的所有镜头（单镜头也使用长度为1的 shotIds）；同一素材被多个镜头引用时只创建一个集中素材需求，不要复制需求。scope=shot 仅作为旧数据兼容字段，新的多镜头引用统一使用 scope=public + shotIds；真正全片复用时 scope=public、shotIds=[]。不得填写不存在的 shotId。每项需求必须独立决定图片 width、height 和构图方向，不得照搬视频分辨率；宽高使用8的倍数，总像素建议控制在1280×1280（1,638,400像素）左右，并将 resolutionSource 设为 ai。",
+  assets: "根据已批准的创意、大纲和电影分镜，生成完整素材需求计划。先查看 project_assets 清单和随请求提供的图片：这些是已经上传并命名的真实素材，不要为已满足的职责重复创建需求；只规划仍缺少的角色、场景、道具和风格素材，不虚构素材文件。shotIds 只列出叙事、身份、场景、物体或风格上确实需要该素材的镜头；允许为空，绝对不要为了覆盖全部素材而把不需要该素材的镜头加入 shotIds。scope=public 只表示素材可复用，不代表所有镜头自动引用；实际使用始终以 shotIds 为准。同一素材被多个镜头引用时只创建一个集中素材需求，不要复制需求。不得填写不存在的 shotId。每项需求必须独立决定图片 width、height 和构图方向，不得照搬视频分辨率；宽高使用8的倍数，总像素建议控制在1280×1280（1,638,400像素）左右，并将 resolutionSource 设为 ai。",
 };
 
 function needsAutomaticDraft(stage: AgentStage, project: ProjectDraft) {

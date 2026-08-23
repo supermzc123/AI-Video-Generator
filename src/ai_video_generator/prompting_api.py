@@ -304,6 +304,7 @@ async def _generate_image_prompt_and_commit(
             "kind": asset.kind.value,
             "scope": asset.scope.value,
             "shot_id": asset.shot_id,
+            "shot_ids": list(asset.shot_ids),
         }
         for asset in assets
     ]
@@ -470,6 +471,27 @@ async def _complete_image_prompt(
     return (await client.complete_text(messages)).strip()  # type: ignore[attr-defined]
 
 
+def _bound_asset_ids_for_shot(payload: dict[str, Any], shot_id: str) -> set[str]:
+    return {
+        str(plan["fulfilledByAssetId"])
+        for plan in (payload.get("assetPlans") or [])
+        if isinstance(plan, dict)
+        and plan.get("fulfilledByAssetId")
+        and (
+            shot_id in {str(value) for value in plan.get("shotIds", [])}
+            or (not plan.get("shotIds") and str(plan.get("shotId") or "") == shot_id)
+        )
+    }
+
+
+def _asset_is_bound_to_shot(asset: Any, shot_id: str, planned_asset_ids: set[str]) -> bool:
+    return (
+        asset.asset_id in planned_asset_ids
+        or shot_id in asset.shot_ids
+        or (not asset.shot_ids and asset.shot_id == shot_id)
+    )
+
+
 async def _generate_and_commit(
     settings: Settings,
     store: SQLiteTaskStore,
@@ -573,35 +595,13 @@ async def _generate_and_commit(
             if segment_id in locked_by_segment:
                 generated[segment_id] = locked_by_segment[segment_id]
                 continue
-            # Asset plans are the authoritative binding for uploaded references.
-            # Include those assets even when their scope is common/shot metadata
-            # is incomplete, which is common for manually uploaded files.
-            bound_asset_ids = {
-                str(plan.get("fulfilledByAssetId"))
-                for plan in (payload.get("assetPlans") or [])
-                if isinstance(plan, dict)
-                and plan.get("fulfilledByAssetId")
-                and (
-                    not plan.get("shotId")
-                    and str(segment["shotId"]) in {
-                        str(value) for value in plan.get("shotIds", [])
-                    }
-                    or (
-                        not plan.get("shotIds")
-                        and str(plan.get("shotId")) == str(segment["shotId"])
-                    )
-                    or (not plan.get("shotId") and not plan.get("shotIds"))
-                )
-            }
+            # Explicit shot bindings are the only source of truth for reference use.
+            bound_asset_ids = _bound_asset_ids_for_shot(payload, str(segment["shotId"]))
             relevant_candidates = [
                 asset
                 for asset in assets
                 if asset.state.value == "available"
-                and (
-                    asset.asset_id in bound_asset_ids
-                    or asset.scope.value == "common"
-                    or asset.shot_id == segment["shotId"]
-                )
+                and _asset_is_bound_to_shot(asset, str(segment["shotId"]), bound_asset_ids)
             ]
             relevant: list[Any] = []
             media_urls_list: list[str | None] = []

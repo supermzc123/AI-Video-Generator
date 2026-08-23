@@ -13,7 +13,6 @@ from ai_video_generator.persistence.project_assets import (
     MAX_PROJECT_ASSET_BYTES,
     DuplicateProjectAssetNameError,
     InvalidProjectImageError,
-    ProjectAssetDependencyError,
     ProjectAssetNotFoundError,
     ProjectAssetStore,
     ProjectAssetTooLargeError,
@@ -28,6 +27,7 @@ class ProjectAssetUpdateRequest(BaseModel):
     kind: ProjectAssetPurpose | None = None
     scope: AssetScope | None = None
     shot_id: str | None = Field(default=None, min_length=1, max_length=200)
+    shot_ids: tuple[str, ...] | None = None
 
 
 async def _read_upload(upload: UploadFile) -> bytes:
@@ -155,6 +155,7 @@ def create_project_assets_router(settings: Settings) -> APIRouter:
                 scope=request.scope,
                 shot_id=request.shot_id,
                 shot_id_was_set="shot_id" in request.model_fields_set,
+                shot_ids=request.shot_ids,
             )
         except ProjectAssetNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project asset not found") from exc
@@ -171,14 +172,6 @@ def create_project_assets_router(settings: Settings) -> APIRouter:
             get_store().retire_asset(project_id, asset_id)
         except ProjectAssetNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project asset not found") from exc
-        except ProjectAssetDependencyError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "project asset is still referenced",
-                    "references": exc.references,
-                },
-            ) from exc
         return Response(status_code=204)
 
     return router

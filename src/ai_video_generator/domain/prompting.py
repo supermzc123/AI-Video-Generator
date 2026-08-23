@@ -103,6 +103,7 @@ class ProjectAsset(FrozenModel):
     kind: ProjectAssetPurpose = ProjectAssetPurpose.REFERENCE
     scope: AssetScope = AssetScope.COMMON
     shot_id: str | None = Field(default=None, min_length=1)
+    shot_ids: tuple[str, ...] = ()
     segment_id: str | None = Field(default=None, min_length=1)
     source: ProjectAssetSource = ProjectAssetSource.UPLOAD
     source_task_id: str | None = Field(default=None, min_length=1)
@@ -142,6 +143,10 @@ class ProjectAsset(FrozenModel):
                 raise ValueError("available audio references require duration")
         if self.state == ProjectAssetState.MISSING_BLOB and self.sha256 is not None:
             raise ValueError("missing_blob assets cannot reference a blob")
+        if any(not shot_id.strip() for shot_id in self.shot_ids):
+            raise ValueError("asset shot_ids must contain non-empty strings")
+        if len(set(self.shot_ids)) != len(self.shot_ids):
+            raise ValueError("asset shot_ids must be unique")
         if self.scope == AssetScope.SHOT:
             if self.shot_id is None or self.segment_id is not None:
                 raise ValueError("shot-scoped assets require only shot_id")

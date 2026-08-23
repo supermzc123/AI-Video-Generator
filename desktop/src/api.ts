@@ -163,6 +163,7 @@ type BackendProjectAsset = {
   purpose?: "reference" | "character" | "scene" | "prop" | "style" | "keyframe";
   scope: AssetDraft["scope"] | "common";
   shot_id: string | null;
+  shot_ids?: string[];
   source: AssetDraft["source"];
   status?: AssetDraft["status"];
   state?: "available" | "missing_blob" | "retired";
@@ -186,6 +187,7 @@ function mapProjectAsset(asset: BackendProjectAsset): AssetDraft {
     kind: asset.kind ?? (asset.purpose === "reference" || asset.purpose === "keyframe" ? "character" : asset.purpose ?? "character"),
     scope: asset.scope === "common" ? "public" : asset.scope,
     shotId: asset.shot_id,
+    shotIds: asset.shot_ids ?? (asset.shot_id ? [asset.shot_id] : []),
     source: asset.source,
     status: asset.status ?? (asset.state === "available" ? "ready" : asset.state === "retired" ? "failed" : "missing_blob"),
     previewUrl: asset.preview_url ?? null,
@@ -242,11 +244,11 @@ export async function relinkProjectAsset(
 export async function updateProjectAsset(
   projectId: string,
   assetId: string,
-  changes: Pick<AssetDraft, "name" | "kind" | "scope" | "shotId">,
+  changes: Pick<AssetDraft, "name" | "kind" | "scope" | "shotId" | "shotIds">,
 ): Promise<AssetDraft> {
   const result = await requestJson<BackendProjectAsset>(`/api/v1/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, {
     method: "PATCH",
-    body: JSON.stringify({ name: changes.name, kind: changes.kind, scope: changes.scope === "public" ? "common" : changes.scope, shot_id: changes.shotId }),
+    body: JSON.stringify({ name: changes.name, kind: changes.kind, scope: changes.scope === "public" ? "common" : changes.scope, shot_id: changes.shotId, shot_ids: changes.shotIds }),
   });
   return mapProjectAsset(result);
 }

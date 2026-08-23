@@ -229,6 +229,23 @@ async def test_common_asset_switches_to_shot_scope_atomically(tmp_path: Path) ->
     assert switched.json()["shot_id"] == "shot-1"
 
 
+@pytest.mark.asyncio
+async def test_asset_shot_bindings_allow_multiple_or_no_shots(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        uploaded = await _upload(client, name="Hero")
+        asset_url = f"/api/v1/projects/project-1/assets/{uploaded.json()['asset_id']}"
+        assigned = await client.patch(asset_url, json={"shot_ids": ["shot-1", "shot-2"]})
+        unassigned = await client.patch(asset_url, json={"shot_ids": []})
+
+    assert assigned.status_code == 200
+    assert assigned.json()["shot_ids"] == ["shot-1", "shot-2"]
+    assert unassigned.status_code == 200
+    assert unassigned.json()["shot_ids"] == []
+
+
 def test_missing_blob_is_text_context_without_multimodal_preview(tmp_path: Path) -> None:
     _app(tmp_path)
     task_store = SQLiteTaskStore(tmp_path / "control-plane.db")
@@ -266,6 +283,7 @@ def test_generated_asset_can_be_replaced_as_an_immutable_revision(tmp_path: Path
         content=_png_bytes((10, 20, 30)),
         source_task_id="image-task-1",
         kind=ProjectAssetPurpose.CHARACTER,
+        shot_ids=("shot-1", "shot-2"),
     )
     second = store.add_generated(
         project_id="project-1",
@@ -281,6 +299,7 @@ def test_generated_asset_can_be_replaced_as_an_immutable_revision(tmp_path: Path
     assert second.sha256 != first.sha256
     assert second.source == ProjectAssetSource.GENERATED
     assert second.source_task_id == "image-task-2"
+    assert second.shot_ids == ("shot-1", "shot-2")
 
 
 def test_generated_candidate_can_revise_an_uploaded_asset(tmp_path: Path) -> None:
@@ -373,7 +392,7 @@ def test_candidate_acceptance_claim_is_exclusive_and_recovers_when_stale(
 
 
 @pytest.mark.asyncio
-async def test_delete_is_guarded_by_current_stable_asset_mentions(tmp_path: Path) -> None:
+async def test_delete_allows_historical_asset_mentions(tmp_path: Path) -> None:
     app = _app(tmp_path)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -392,10 +411,11 @@ async def test_delete_is_guarded_by_current_stable_asset_mentions(tmp_path: Path
                 ") VALUES (?, 1, ?, ?, 0)",
                 ("project-1", "a" * 64, payload),
             )
-        blocked = await client.delete(f"/api/v1/projects/project-1/assets/{asset_id}")
+        deleted = await client.delete(f"/api/v1/projects/project-1/assets/{asset_id}")
+        listed = await client.get("/api/v1/projects/project-1/assets")
 
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["references"] == ["project workspace"]
+    assert deleted.status_code == 204
+    assert listed.json() == []
 
 
 @pytest.mark.asyncio

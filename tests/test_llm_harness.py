@@ -258,6 +258,10 @@ def test_structured_prompt_contains_exact_workspace_contracts() -> None:
     assert "motionSegments" not in shot_contract["required"]
     assert "motionSegments" in shot_contract["properties"]
     assert motion["optional_when"] == "ordinary single-segment shots"
+    assert "shotIds may be empty" in messages[0].content
+    assert "absolutely never add" in messages[0].content
+    assert "scope=public means reusable, not automatically used" in messages[0].content
+    assert "an empty array is valid" in asset_contract["properties"]["shotIds"]
 
 
 def test_storyboard_contract_allows_single_segment_shot_without_motion_context() -> None:

@@ -258,6 +258,7 @@ def _project_asset_llm_context(
             "kind": asset.kind.value,
             "scope": asset.scope.value,
             "shot_id": asset.shot_id,
+            "shot_ids": list(asset.shot_ids),
             "state": asset.state.value,
             "multimodal_preview_available": asset.asset_id in image_indexes,
             "instruction_boundary": (
@@ -635,6 +636,7 @@ def create_app(
             kind=kind,
             scope=scope,
             shot_id=str(plan.get("shotId") or "") or None,
+            shot_ids=tuple(str(value) for value in plan.get("shotIds", []) if value),
             replace_asset_id=replace_id,
         )
         # A task submitted before the user selected no-reference mode may still
@@ -661,6 +663,7 @@ def create_app(
             "kind": asset.kind.value,
             "scope": "public" if asset.scope == AssetScope.COMMON else asset.scope.value,
             "shotId": asset.shot_id,
+            "shotIds": list(asset.shot_ids),
             "source": "generated",
             "status": "ready",
             "previewUrl": None,
@@ -676,11 +679,12 @@ def create_app(
             payload["assets"].append(frontend_asset)
         prompts = payload.get("prompts") if isinstance(payload.get("prompts"), dict) else {}
         previous_h3 = prompts.get("h3Prompts") if isinstance(prompts.get("h3Prompts"), list) else []
+        affected_shot_ids = set(asset.shot_ids) or ({asset.shot_id} if asset.shot_id else set())
         invalidated_h3 = [
             item
             for item in previous_h3
             if isinstance(item, dict)
-            and (scope == AssetScope.COMMON or item.get("shotId") == asset.shot_id)
+            and str(item.get("shotId") or "") in affected_shot_ids
         ]
         if invalidated_h3:
             invalidated_ids = {str(item.get("segmentId") or "") for item in invalidated_h3}
@@ -2419,14 +2423,18 @@ def create_app(
                 ] if isinstance(shots, list) else [],
                     "rules": [
                         "scope=shot requires an existing shotId from shot_catalog",
-                    "shotIds must list every shot that uses the material; one plan may serve many shots",
-                    "use scope=public with shotIds for a shared material used by a selected set of shots",
-                    "use scope=public with an empty shotIds only for genuinely project-wide reusable material",
-                    "do not duplicate a plan when the same material is reused by multiple shots",
+                    "shotIds lists only shots that genuinely need the material and may be empty",
+                    "use scope=public with shotIds for a reusable material used by selected shots",
+                    "scope=public never implies automatic use; shotIds is always authoritative",
                     (
-                        "never leave shotId null merely because the binding is uncertain; "
-                        "infer it from shot summary"
+                        "never bind a material to a shot merely to make every material used "
+                        "at least once"
                     ),
+                    (
+                        "if a scene does not need a material, absolutely do not include that "
+                        "scene in shotIds"
+                    ),
+                    "do not duplicate a plan when the same material is reused by multiple shots",
                 ],
                 "existing_asset_plans": workspace.payload.get("assetPlans", []),
             }

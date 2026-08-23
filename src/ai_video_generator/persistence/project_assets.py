@@ -67,49 +67,12 @@ class ProjectAssetTooLargeError(ProjectAssetStoreError):
     pass
 
 
-class ProjectAssetDependencyError(ProjectAssetStoreError):
-    def __init__(self, references: tuple[str, ...]) -> None:
-        self.references = references
-        super().__init__("project asset is still referenced")
-
-
 def _normalized_name(name: str) -> str:
     return unicodedata.normalize("NFKC", name.strip()).casefold()
 
 
 def _canonical_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _payload_references_asset(value: Any, asset_id: str) -> bool:
-    if isinstance(value, dict):
-        if (value.get("kind") == "asset_mention" and value.get("asset_id") == asset_id) or (
-            value.get("type") == "asset_mention" and value.get("assetId") == asset_id
-        ):
-            return True
-        for key, child in value.items():
-            if key in {"asset_id", "assetId"}:
-                continue
-            if (key.endswith("_asset_id") or key.endswith("AssetId")) and child == asset_id:
-                return True
-            if (
-                key
-                in {
-                    "reference_asset_ids",
-                    "referenced_asset_ids",
-                    "referenceAssetIds",
-                    "assetIds",
-                }
-                and isinstance(child, list)
-                and asset_id in child
-            ):
-                return True
-            if _payload_references_asset(child, asset_id):
-                return True
-        return False
-    if isinstance(value, list):
-        return any(_payload_references_asset(item, asset_id) for item in value)
-    return False
 
 
 class ProjectAssetStore:
@@ -258,6 +221,7 @@ class ProjectAssetStore:
             kind=kind,
             scope=scope,
             shot_id=shot_id,
+            shot_ids=(shot_id,) if shot_id else (),
             source=ProjectAssetSource.UPLOAD,
             created_at=datetime.now(UTC),
         )
@@ -279,6 +243,7 @@ class ProjectAssetStore:
         kind: ProjectAssetPurpose = ProjectAssetPurpose.REFERENCE,
         scope: AssetScope = AssetScope.COMMON,
         shot_id: str | None = None,
+        shot_ids: tuple[str, ...] = (),
         replace_asset_id: str | None = None,
     ) -> ProjectAsset:
         """Register a generated image, optionally revising an existing project asset."""
@@ -299,6 +264,11 @@ class ProjectAssetStore:
                 else None
             )
             asset_id = current.asset_id if current else str(uuid.uuid4())
+            effective_shot_ids = (
+                shot_ids
+                or (current.shot_ids if current else ())
+                or ((shot_id,) if shot_id else ())
+            )
             self._ensure_unique_name(
                 connection,
                 project_id,
@@ -324,6 +294,7 @@ class ProjectAssetStore:
                 kind=kind,
                 scope=scope,
                 shot_id=shot_id,
+                shot_ids=effective_shot_ids,
                 source=ProjectAssetSource.GENERATED,
                 source_task_id=source_task_id,
                 created_at=datetime.now(UTC),
@@ -683,6 +654,7 @@ class ProjectAssetStore:
         scope: AssetScope | None = None,
         shot_id: str | None = None,
         shot_id_was_set: bool = False,
+        shot_ids: tuple[str, ...] | None = None,
     ) -> ProjectAsset:
         with self._transaction(immediate=True) as connection:
             current = self._get_current(connection, project_id, asset_id)
@@ -697,6 +669,8 @@ class ProjectAssetStore:
             }
             if shot_id_was_set:
                 values["shot_id"] = shot_id
+            if shot_ids is not None:
+                values["shot_ids"] = shot_ids
             updated = current.model_copy(update=values)
             # model_copy does not rerun Pydantic validators.
             updated = ProjectAsset.model_validate(updated.model_dump(mode="python"))
@@ -706,9 +680,6 @@ class ProjectAssetStore:
     def retire_asset(self, project_id: str, asset_id: str) -> None:
         with self._transaction(immediate=True) as connection:
             current = self._get_current(connection, project_id, asset_id)
-            references = self._find_references(connection, project_id, asset_id)
-            if references:
-                raise ProjectAssetDependencyError(references)
             retired = current.model_copy(
                 update={
                     "revision": current.revision + 1,
@@ -1026,41 +997,3 @@ class ProjectAssetStore:
         ).fetchone()
         if row is not None:
             raise DuplicateProjectAssetNameError(name)
-
-    @staticmethod
-    def _find_references(
-        connection: sqlite3.Connection, project_id: str, asset_id: str
-    ) -> tuple[str, ...]:
-        references: list[str] = []
-        candidates = (
-            ("project_workspace_revisions", "project_id", "project workspace"),
-            ("asset_plan_revisions", "plan_id", "asset plan"),
-            ("image_prompt_revisions", "prompt_revision_id", "image prompt"),
-            ("h3_prompt_revisions", "prompt_revision_id", "H3 prompt"),
-        )
-        for table, identity_column, label in candidates:
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-            ).fetchone()
-            if not exists:
-                continue
-            rows = connection.execute(
-                f"""
-                SELECT current.payload_json FROM {table} current
-                WHERE current.project_id = ?
-                  AND current.revision = (
-                    SELECT MAX(candidate.revision) FROM {table} candidate
-                    WHERE candidate.{identity_column} = current.{identity_column}
-                  )
-                """,
-                (project_id,),
-            ).fetchall()
-            for row in rows:
-                try:
-                    payload = json.loads(row["payload_json"])
-                except json.JSONDecodeError:
-                    continue
-                if _payload_references_asset(payload, asset_id):
-                    references.append(label)
-                    break
-        return tuple(references)

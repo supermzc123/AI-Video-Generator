@@ -85,6 +85,32 @@ function extractH3Description(stream: string): string | null {
   return stream || null;
 }
 
+function detachAsset(project: ProjectDraft, assetId: string): ProjectDraft {
+  const conceptNodes = project.idea.conceptDocument.nodes.filter(
+    (node) => node.type !== "asset_mention" || node.assetId !== assetId,
+  );
+  return {
+    ...project,
+    idea: {
+      ...project.idea,
+      concept: conceptNodes.map((node) => node.type === "asset_mention" ? `@${node.displayName}` : node.text).join(""),
+      conceptDocument: { nodes: conceptNodes },
+    },
+    assets: project.assets.filter((asset) => asset.id !== assetId),
+    assetPlans: project.assetPlans.map((plan) => plan.fulfilledByAssetId === assetId
+      ? { ...plan, fulfilledByAssetId: null, state: "ready" as const }
+      : plan),
+    prompts: {
+      ...project.prompts,
+      imagePrompts: project.prompts.imagePrompts.map((prompt) => ({
+        ...prompt,
+        referenceAssetIds: prompt.referenceAssetIds.filter((id) => id !== assetId),
+      })),
+      h3Prompts: project.prompts.h3Prompts.filter((prompt) => !prompt.assetIds.includes(assetId)),
+    },
+  };
+}
+
 export const pipelineOrder: PipelineStageId[] = [
   "config",
   "idea",
@@ -1237,7 +1263,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     } finally { setActionBusy(false); }
   };
 
-  const patchAsset = async (asset: AssetDraft, changes: Partial<Pick<AssetDraft, "name" | "kind" | "scope" | "shotId">>) => {
+  const patchAsset = async (asset: AssetDraft, changes: Partial<Pick<AssetDraft, "name" | "kind" | "scope" | "shotId" | "shotIds">>) => {
     const next = { ...asset, ...changes };
     if (next.name.trim() !== asset.name && project.assets.some((item) => item.id !== asset.id && item.name.toLocaleLowerCase() === next.name.trim().toLocaleLowerCase())) {
       setActionMessage(`素材名称“${next.name}”已存在`);
@@ -1263,16 +1289,17 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const removeAsset = async (asset: AssetDraft) => {
     setActionBusy(true);
     try {
-      await deleteProjectAsset(project.projectId, asset.id);
       const changed = invalidateFromStage(
-        { ...project, assets: project.assets.filter((item) => item.id !== asset.id) },
+        detachAsset(project, asset.id),
         project.activeStage === "idea" ? "idea" : "assets",
         pipelineOrder,
       );
-      onChange(await saveProjectToControlPlane(changed));
+      const saved = await saveProjectToControlPlane(changed);
+      await deleteProjectAsset(project.projectId, asset.id);
+      onChange(saved);
       setActionMessage(`已删除素材“${asset.name}”`);
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : "素材仍被下游引用，无法移除");
+      setActionError(cause instanceof Error ? cause.message : "删除素材失败");
     } finally { setActionBusy(false); }
   };
 
@@ -1744,25 +1771,22 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         </div>}
 
         {project.activeStage === "assets" && <div className="asset-stage">
-          <div className="inline-toolbar"><span>{project.assets.length} 个素材 · 公共素材自动绑定相关片段</span><div className="toolbar-actions"><button className="secondary-button" onClick={onOpenWorkflows}><SlidersHorizontal size={16} />图片工作流</button><button className="primary-button" disabled={actionBusy || !workerOnline || !project.assetPlans.some((plan) => !plan.fulfilledByAssetId && Boolean(imageWorkflowForPlan(plan.id)))} onClick={() => void generateAllAssets()}><Play size={15} />生成全部素材</button><label className="primary-button" role="button" aria-label="上传项目参考素材" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={16} />上传参考素材<input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div></div>
+          <div className="inline-toolbar"><span>{project.assets.length} 个素材 · 仅按分镜中的明确勾选引用</span><div className="toolbar-actions"><button className="secondary-button" onClick={onOpenWorkflows}><SlidersHorizontal size={16} />图片工作流</button><button className="primary-button" disabled={actionBusy || !workerOnline || !project.assetPlans.some((plan) => !plan.fulfilledByAssetId && Boolean(imageWorkflowForPlan(plan.id)))} onClick={() => void generateAllAssets()}><Play size={15} />生成全部素材</button><label className="primary-button" role="button" aria-label="上传项目参考素材" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={16} />上传参考素材<input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div></div>
           <label className="check-label"><input type="checkbox" checked={project.referenceAssetMode === "none"} onChange={(event) => update("assets", (current) => ({ ...current, referenceAssetMode: event.target.checked ? "none" : "planned" }))} />本项目不需要参考素材，交由 H3 直接生成</label>
           <div className="asset-shot-map">
             <div className="inline-toolbar"><h3>分镜素材引用</h3><span>先按分镜查看引用，再在下方集中管理素材</span></div>
             {project.shots.map((shot, index) => {
               const plans = project.assetPlans.filter((plan) =>
-                (plan.shotIds.length ? plan.shotIds.includes(shot.id) : plan.shotId === shot.id)
-                || (plan.scope === "public" && plan.shotIds.length === 0),
+                plan.shotIds.includes(shot.id) || plan.shotId === shot.id,
               );
               const referencedAssets = project.assets.filter((asset) => (
-                asset.scope === "public"
-                || asset.shotId === shot.id
+                asset.shotIds.includes(shot.id)
                 || plans.some((plan) => plan.fulfilledByAssetId === asset.id)
               ));
               const togglePlanShot = (plan: ProjectDraft["assetPlans"][number], checked: boolean) => {
-                const allShotIds = project.shots.map((item) => item.id);
                 const currentIds = plan.shotIds.length
                   ? plan.shotIds
-                  : plan.scope === "public" ? allShotIds : plan.shotId ? [plan.shotId] : [];
+                  : plan.shotId ? [plan.shotId] : [];
                 const nextIds = checked
                   ? [...new Set([...currentIds, shot.id])]
                   : currentIds.filter((id) => id !== shot.id);
@@ -1779,27 +1803,21 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                   {project.assetPlans.length ? project.assetPlans.map((plan) => {
                     const checked = plan.shotIds.length
                       ? plan.shotIds.includes(shot.id)
-                      : plan.scope === "public" && plan.shotId === null
-                        ? true
-                        : plan.shotId === shot.id;
+                      : plan.shotId === shot.id;
                     const fulfilled = project.assets.find((asset) => asset.id === plan.fulfilledByAssetId);
                     return <label key={plan.id} className="asset-shot-map-option"><input type="checkbox" checked={checked} onChange={(event) => togglePlanShot(plan, event.target.checked)} /><span>@{fulfilled?.name ?? plan.name}</span></label>;
                   }) : <span>暂无素材需求</span>}
                   {project.assets.filter((asset) => asset.status === "ready" && !project.assetPlans.some((plan) => plan.fulfilledByAssetId === asset.id)).map((asset) => {
-                    const checked = asset.scope === "public" || asset.shotId === shot.id;
+                    const checked = asset.shotIds.includes(shot.id);
                     return <label key={asset.id} className="asset-shot-map-option asset-shot-map-uploaded">
                       <input
                         type="checkbox"
                         checked={checked}
                         onChange={(event) => {
                           if (event.target.checked) {
-                            void patchAsset(asset, { scope: "shot", shotId: shot.id });
-                          } else if (asset.scope === "public") {
-                            const otherShot = project.shots.find((item) => item.id !== shot.id);
-                            if (otherShot) void patchAsset(asset, { scope: "shot", shotId: otherShot.id });
-                            else setActionMessage("项目只有一个分镜时，公共素材始终属于该分镜");
+                            void patchAsset(asset, { scope: "public", shotId: null, shotIds: [...new Set([...asset.shotIds, shot.id])] });
                           } else {
-                            setActionMessage("该素材已是其它分镜专用素材");
+                            void patchAsset(asset, { scope: "public", shotId: null, shotIds: asset.shotIds.filter((id) => id !== shot.id) });
                           }
                         }}
                       />
@@ -1832,12 +1850,12 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                 if (scope === "shot") {
                   const shotId = asset.shotId ?? project.shots[0]?.id ?? null;
                   if (!shotId) { setActionError("请先创建电影分镜，再将素材设为镜头专用"); return; }
-                  void patchAsset(asset, { scope, shotId });
+                  void patchAsset(asset, { scope, shotId, shotIds: [shotId] });
                 } else {
                   void patchAsset(asset, { scope, shotId: null });
                 }
               }}><option value="public">公共</option><option value="shot" disabled={!project.shots.length}>镜头专用</option></select>
-              {asset.scope === "shot" && <select value={asset.shotId ?? ""} onChange={(event) => void patchAsset(asset, { shotId: event.target.value || null })}><option value="">选择分镜</option>{project.shots.map((shot) => <option key={shot.id} value={shot.id}>{shot.title}</option>)}</select>}
+              {asset.scope === "shot" && <select value={asset.shotId ?? ""} onChange={(event) => { const shotId = event.target.value || null; if (shotId) void patchAsset(asset, { shotId, shotIds: [shotId] }); }}><option value="">选择分镜</option>{project.shots.map((shot) => <option key={shot.id} value={shot.id}>{shot.title}</option>)}</select>}
               {asset.status === "missing_blob" && <label className="secondary-button" role="button" aria-label={`重新关联素材 ${asset.name}`} tabIndex={0} onKeyDown={activateFileLabel}><Upload size={14} />重新关联<input type="file" accept="image/*,video/*,audio/*" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void relinkAsset(asset, file); }} /></label>}
               <button className="icon-button" title="移除素材" onClick={() => void removeAsset(asset)}><Trash2 size={16} /></button>
             </div>)}

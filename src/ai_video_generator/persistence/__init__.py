@@ -1,7 +1,6 @@
 from .project_assets import (
     DuplicateProjectAssetNameError,
     InvalidProjectImageError,
-    ProjectAssetDependencyError,
     ProjectAssetNotFoundError,
     ProjectAssetStore,
     ProjectAssetTooLargeError,
@@ -27,7 +26,6 @@ __all__ = [
     "TaskNotFoundError",
     "DuplicateProjectAssetNameError",
     "InvalidProjectImageError",
-    "ProjectAssetDependencyError",
     "ProjectAssetNotFoundError",
     "ProjectAssetStore",
     "ProjectAssetTooLargeError",
