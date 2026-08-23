@@ -782,6 +782,10 @@ input[type="file"] { display: none; }
   color: var(--text);
 }
 
+.asset-shot-map-uploaded {
+  color: var(--accent);
+}
+
 .asset-shot-map-assets {
   grid-column: 1 / -1;
   display: flex;
