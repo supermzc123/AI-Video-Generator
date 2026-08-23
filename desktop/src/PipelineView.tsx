@@ -1035,20 +1035,29 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const generateAllAssets = async () => {
     const targets = project.assetPlans.filter((plan) => (
       !plan.fulfilledByAssetId
-      && Boolean(project.prompts.imagePrompts.find((item) => item.assetPlanId === plan.id)?.prompt.trim())
       && Boolean(imageWorkflowForPlan(plan.id))
       && !activeImageTasks[plan.id]
     ));
     if (!targets.length) {
-      setActionError("没有可直接生成的素材；请先完成图片提示词并选择已批准图片工作流");
+      setActionError("没有待生成素材，或尚未登记已批准的图片工作流");
       return;
     }
     setActionBusy(true);
-    setActionMessage(`正在并发生成 ${targets.length} 份素材...`);
+    setActionMessage(`正在准备并并发生成 ${targets.length} 份素材...`);
     try {
-      const results = await Promise.allSettled(targets.map(async (plan) => (
-        [plan.id, await runProjectImagePrompt(project.projectId, plan.id)] as const
-      )));
+      const results = await Promise.allSettled(targets.map(async (plan) => {
+        const existing = project.prompts.imagePrompts.find((item) => item.assetPlanId === plan.id);
+        if (!existing?.prompt.trim()) {
+          await streamGenerateImagePrompt(
+            project.projectId,
+            plan.id,
+            null,
+            imageWorkflowForPlan(plan.id),
+            () => undefined,
+          );
+        }
+        return [plan.id, await runProjectImagePrompt(project.projectId, plan.id)] as const;
+      }));
       const started = results.flatMap((result) => (
         result.status === "fulfilled" ? [result.value] : []
       ));
@@ -1735,7 +1744,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         </div>}
 
         {project.activeStage === "assets" && <div className="asset-stage">
-          <div className="inline-toolbar"><span>{project.assets.length} 个素材 · 公共素材自动绑定相关片段</span><div className="toolbar-actions"><button className="secondary-button" onClick={onOpenWorkflows}><SlidersHorizontal size={16} />图片工作流</button><button className="primary-button" disabled={actionBusy || !workerOnline || !project.assetPlans.some((plan) => !plan.fulfilledByAssetId && project.prompts.imagePrompts.some((prompt) => prompt.assetPlanId === plan.id && prompt.prompt.trim()) && Boolean(imageWorkflowForPlan(plan.id)))} onClick={() => void generateAllAssets()}><Play size={15} />生成全部素材</button><label className="primary-button" role="button" aria-label="上传项目参考素材" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={16} />上传参考素材<input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div></div>
+          <div className="inline-toolbar"><span>{project.assets.length} 个素材 · 公共素材自动绑定相关片段</span><div className="toolbar-actions"><button className="secondary-button" onClick={onOpenWorkflows}><SlidersHorizontal size={16} />图片工作流</button><button className="primary-button" disabled={actionBusy || !workerOnline || !project.assetPlans.some((plan) => !plan.fulfilledByAssetId && Boolean(imageWorkflowForPlan(plan.id)))} onClick={() => void generateAllAssets()}><Play size={15} />生成全部素材</button><label className="primary-button" role="button" aria-label="上传项目参考素材" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={16} />上传参考素材<input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div></div>
           <label className="check-label"><input type="checkbox" checked={project.referenceAssetMode === "none"} onChange={(event) => update("assets", (current) => ({ ...current, referenceAssetMode: event.target.checked ? "none" : "planned" }))} />本项目不需要参考素材，交由 H3 直接生成</label>
           <div className="asset-shot-map">
             <div className="inline-toolbar"><h3>分镜素材引用</h3><span>先按分镜查看引用，再在下方集中管理素材</span></div>
