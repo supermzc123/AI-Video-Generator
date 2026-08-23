@@ -13,6 +13,9 @@ from ai_video_generator.domain import (
     ProjectRunState,
     ReviewMode,
     ReviewPolicy,
+    SegmentGenerationVersion,
+    SegmentVersionState,
+    TaskCheckpoint,
     TaskKind,
     TaskSpec,
     TaskState,
@@ -72,6 +75,106 @@ def test_delivery_plan_uses_active_video_inputs_without_compiling_h3() -> None:
     assert plan.blockers == ()
     assert [task.kind for task in plan.tasks] == [TaskKind.MASTER_ASSEMBLY, TaskKind.EXPORT]
     assert plan.tasks[0].depends_on == ("active-video-snapshot",)
+
+
+@pytest.mark.asyncio
+async def test_delivery_source_snapshot_registers_active_video_checkpoint(tmp_path) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    payload = {
+        "prompts": {
+            "imagePrompts": [],
+            "h3Prompts": [ready_h3_prompt("segment-1")],
+        },
+        "postProcessing": {
+            "seedvr": {"enabled": False},
+            "rife": {"enabled": False},
+            "whisper": {"enabled": False},
+        },
+    }
+    video_path = tmp_path / "videos" / "segment-1.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/v1/projects",
+            json={
+                "project_id": "delivery-snapshot",
+                "name": "Delivery snapshot",
+                "width": 320,
+                "height": 480,
+                "target_duration_seconds": 4,
+            },
+        )
+        await client.post(
+            "/api/v1/projects/delivery-snapshot/workspace",
+            json={"revision": 1, "payload": payload},
+        )
+
+        store = SQLiteTaskStore(tmp_path / "control-plane.db")
+        manifest = TaskWorkloadManifest(
+            task_kind=TaskKind.H3_GENERATION,
+            workflow_sha256="a" * 64,
+            node_schema_sha256="b" * 64,
+            prompt={"1": {"class_type": "SaveVideo", "inputs": {}}},
+            outputs=(ComfyUIOutput(node_id="1", media_type="video/mp4"),),
+            context={"project_id": "delivery-snapshot", "segment_id": "segment-1"},
+        )
+        manifest_record = store.put_workload_manifest(manifest)
+        source = TaskSpec(
+            task_id="source-h3",
+            project_id="delivery-snapshot",
+            kind=TaskKind.H3_GENERATION,
+            state=TaskState.SUCCEEDED,
+            idempotency_key="c" * 64,
+            input_fingerprint="d" * 64,
+            workload_manifest_sha256=manifest_record.sha256,
+        )
+        store.add_task(source)
+        store.put_task_checkpoint(
+            TaskCheckpoint(
+                checkpoint_id="source-h3:video",
+                task_id=source.task_id,
+                sequence=1,
+                phase="video_saved",
+                payload={"path": str(video_path), "sha256": "e" * 64, "segment_id": "segment-1"},
+                created_at=datetime.now(UTC),
+            )
+        )
+        store.put_segment_generation_version(
+            SegmentGenerationVersion(
+                version_id="segment-version:1",
+                project_id="delivery-snapshot",
+                shot_id="shot-1",
+                segment_id="segment-1",
+                segment_index=0,
+                generation_number=1,
+                batch_id="batch-1",
+                task_id=source.task_id,
+                seed=1,
+                state=SegmentVersionState.ACTIVE,
+                artifact_id="source-h3:video",
+                created_at=datetime.now(UTC),
+            )
+        )
+
+        compiled = await client.post(
+            "/api/v1/projects/delivery-snapshot/delivery/tasks/compile"
+        )
+
+    assert compiled.status_code == 201
+    snapshot = next(
+        task
+        for task in store.list_tasks(project_id="delivery-snapshot")
+        if task.task_id.startswith("delivery-source:delivery-snapshot:")
+    )
+    checkpoint = next(
+        item
+        for item in store.list_task_checkpoints(snapshot.task_id)
+        if item.phase == "video_saved"
+    )
+    assert checkpoint.payload["path"] == str(video_path)
 
 
 def test_project_task_plan_batches_conditioning_before_h3_and_export() -> None:

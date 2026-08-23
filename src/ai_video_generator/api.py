@@ -3771,6 +3771,18 @@ def create_app(
             source = store.get_task(version.task_id)
             if not version.artifact_id or not source.workload_manifest_sha256:
                 raise HTTPException(status_code=409, detail=f"片段 {segment_id} 没有可用的活动视频")
+            source_checkpoint = next(
+                (
+                    item
+                    for item in reversed(store.list_task_checkpoints(source.task_id))
+                    if item.phase == "video_saved"
+                    and isinstance(item.payload.get("path"), str)
+                    and Path(str(item.payload["path"])).is_file()
+                ),
+                None,
+            )
+            if source_checkpoint is None:
+                raise HTTPException(status_code=409, detail=f"片段 {segment_id} 的活动视频尚未登记")
             snapshot_fingerprint = hashlib.sha256(
                 f"{version.version_id}:{version.artifact_id}:{source.task_id}".encode()
             ).hexdigest()
@@ -3783,6 +3795,23 @@ def create_app(
                     idempotency_key=snapshot_fingerprint,
                     input_fingerprint=snapshot_fingerprint,
                     workload_manifest_sha256=source.workload_manifest_sha256,
+                )
+            )
+            # Delivery snapshots freeze the exact active video version.  The
+            # snapshot must carry the media checkpoint because delivery
+            # execution resolves paths through task-owned checkpoints.
+            store.put_task_checkpoint(
+                source_checkpoint.model_copy(
+                    update={
+                        "checkpoint_id": f"{snapshot.task_id}:video",
+                        "task_id": snapshot.task_id,
+                        "payload": {
+                            **source_checkpoint.payload,
+                            "segment_id": segment_id,
+                            "source_task_id": source.task_id,
+                            "source_version_id": version.version_id,
+                        },
+                    }
                 )
             )
             segment_outputs[segment_id] = snapshot.task_id
