@@ -233,14 +233,14 @@ Ruff：通过
 ## 8. 本机开发环境
 
 ```text
-工作区：H:\视频生成工具
-ComfyUI：D:\Comfy_new\ComfyUI
+工作区：<项目根目录>
+ComfyUI：<用户选择的 ComfyUI 安装目录>
 GPU：NVIDIA RTX 3080 Ti 12GB
 系统内存：约32GB
 开发API：通常为 http://127.0.0.1:8000
 Vite前端：http://127.0.0.1:1420
 ComfyUI：http://127.0.0.1:8188
-应用数据：C:\Users\Super_mzc\AppData\Local\supermzc123\AI Video Generator\data
+应用数据：%LOCALAPPDATA%\supermzc123\AI Video Generator\data
 ```
 
 常用命令：
@@ -257,7 +257,7 @@ ComfyUI：http://127.0.0.1:8188
 .\.venv\Scripts\python.exe -m pytest -q
 
 # 前端检查
-Set-Location H:\视频生成工具\desktop
+Set-Location .\desktop
 npm run build
 ```
 
@@ -440,7 +440,7 @@ SageAttention：关闭
 可直接提供给新对话的开场指令：
 
 ```text
-请先阅读 H:\视频生成工具\docs\HANDOFF.md，并检查当前git状态。
+请先阅读 docs\HANDOFF.md，并检查当前git状态。
 保护现有未提交修改，不读取或输出任何API Key，不打包。
 先运行确定性验证，然后按文档“阶段B”执行Ref2VA四秒控制实验；
 每次只改变一个变量，保存manifest和产物，并根据结果修复回归。

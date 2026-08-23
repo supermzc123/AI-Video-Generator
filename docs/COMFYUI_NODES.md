@@ -19,7 +19,7 @@
 节点代码位于`comfyui_nodes/ai_video_generator_nodes`。命令行脚本仅作为开发和故障排查入口：
 
 ```powershell
-.\scripts\install-avg-comfyui-nodes.ps1 -ComfyUIRoot D:\Comfy_new\ComfyUI
+.\scripts\install-avg-comfyui-nodes.ps1 -ComfyUIRoot C:\path\to\ComfyUI
 ```
 
 安装完成后需正常重启ComfyUI一次以注册节点。应用不会自行停止或重启ComfyUI。

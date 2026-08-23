@@ -65,7 +65,7 @@
 - 双图 reference 缓存约 6.49 MB；扩散图不含 CLIP、LoadImage 或 ReferenceToVideo，输出保持同一主体身份。
 - SeedVR2使用ComfyUI官方节点和本机7B INT8 ConvRot权重完成24帧修复；边缘更清晰，但简单样片也显示背景颗粒放大和轻微颜色纹理泄漏，因此只作为短预览后启用的可选步骤。
 
-测试工作流、metrics、history、抽帧和对比图保存在 `work/gpu-tests/`。ComfyUI 输出保存在 `D:\Comfy_new\ComfyUI\output\gpu-tests`。
+测试工作流、metrics、history、抽帧和对比图保存在 `work/gpu-tests/`。ComfyUI 输出保存在 `<ComfyUI安装目录>\output\gpu-tests`。
 
 ## 本机基线
 
