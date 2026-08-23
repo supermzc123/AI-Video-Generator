@@ -1243,6 +1243,32 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     } finally { setActionBusy(false); }
   };
 
+  const bindExistingAssetToPlan = async (plan: ProjectDraft["assetPlans"][number], assetId: string) => {
+    const asset = project.assets.find((item) => item.id === assetId && item.status === "ready");
+    if (!asset) return;
+    setActionBusy(true);
+    try {
+      const changed = invalidateFromStage({
+        ...project,
+        assetPlans: project.assetPlans.map((item) => item.id === plan.id
+          ? { ...item, fulfilledByAssetId: asset.id, state: "satisfied" as const }
+          : item),
+        prompts: {
+          ...project.prompts,
+          imagePrompts: project.prompts.imagePrompts.filter((item) => item.assetPlanId !== plan.id),
+          h3Prompts: [],
+          generatedAt: null,
+        },
+      }, "assets", pipelineOrder);
+      onChange(await saveProjectToControlPlane(changed));
+      setActionMessage(`已将上传素材“${asset.name}”绑定到需求“${plan.name}”；请重新生成视频提示词`);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "绑定已有素材失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   const removeAsset = async (asset: AssetDraft) => {
     setActionBusy(true);
     try {
@@ -1819,6 +1845,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                 <span className={`state ${fulfilled ? "state-ready" : ""}`}>{generating ? "GENERATING" : fulfilled ? "SATISFIED" : hasPrompt ? "PROMPT READY" : plan.state.toUpperCase()}</span>
                 <div className="asset-plan-actions">
                   {!fulfilled && !generating && <label className="asset-plan-workflow"><span>图片工作流</span><select value={selectedWorkflow} onChange={(event) => setSelectedWorkflowByPlan((current) => ({ ...current, [plan.id]: event.target.value }))}><option value="">请选择</option>{imageWorkflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name} · R{workflow.revision}</option>)}</select></label>}
+                  {!fulfilled && !generating && project.assets.some((asset) => asset.status === "ready") && <label className="asset-plan-workflow"><span>使用已有素材</span><select defaultValue="" disabled={actionBusy} onChange={(event) => { if (event.target.value) void bindExistingAssetToPlan(plan, event.target.value); }}><option value="">选择已上传素材</option>{project.assets.filter((asset) => asset.status === "ready").map((asset) => <option value={asset.id} key={asset.id}>@{asset.name}</option>)}</select></label>}
                   {!fulfilled && !generating && <label className="secondary-button" role="button" aria-label={`上传图片填充素材需求 ${plan.name}`} tabIndex={0} onKeyDown={activateFileLabel}><Upload size={14} />上传填充<input type="file" accept="image/*" onChange={(event) => queueAssetUploads(event, plan.id)} /></label>}
                   {!generating && <button className={!fulfilled ? "primary-button" : "secondary-button"} disabled={actionBusy || !selectedWorkflow} onClick={() => openImagePromptDialog(plan)}><SlidersHorizontal size={14} />编辑提示词</button>}
                   {fulfilled?.source === "generated" && hasPrompt && !generating && !pendingCandidate && <button className="secondary-button" disabled={actionBusy || !workerOnline} title="生成候选版本，不会立即替换当前素材" onClick={() => void regenerateAssetPlan(plan)}><RotateCcw size={14} />按原提示词重新生成</button>}
