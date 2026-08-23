@@ -13,7 +13,7 @@
 - H3 外部 Profile、官方 Turbo provider 校验、可选 KJ SageAttention 和 TeaCache 阻断。
 - H3 static conditioning 与初始 AV latent 的安全 `safetensors+json-v1` 缓存。
 - 全部 conditioning 编码完成后卸载编码器，再加载扩散模型的阶段屏障。
-- Niko H3 Motion Context v0.3.0 provider、双流 AV latent、续段裁切和能力探测。
+- Niko H3 Motion Context v0.3.1 provider、双流 AV latent、续段裁切和能力探测。
 - OpenAI-compatible 多模态 LLM Harness；`gemini-3.7-flash` 已完成真实 JSON、图片和工作流映射联调。
 - 内容寻址的远程 Worker workload manifest、HTTPS/WSS、租约、传输和结果收据。
 - FFmpeg 导出计划和原子导出函数。
@@ -75,7 +75,7 @@
 - H3：FL2VA pruned INT8、Qwen3-VL-32B INT8、video/audio VAE
 - 官方 Turbo：commit `4274783a23afcfdbea3b4876cb79effd6c510785`
 - 本次 LoRA：`minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors`
-- Motion Context：v0.3.0，commit `658ba11ae91737391a247cf9758d0063c43491b3`
+- Motion Context：v0.3.1，commit `725a731e644c669601799da1eb63f4e7497c628f`
 - AVG conditioning 节点：已安装并由 `/object_info` 验证
 - TeaCache：未在任何验收工作流中使用，Profile 继续阻断
 

@@ -17,7 +17,7 @@ from ai_video_generator.domain import (
 from ai_video_generator.services import conditioning_fingerprint
 
 MOTION_CONTEXT_REPOSITORY = "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context.git"
-PINNED_MOTION_CONTEXT_COMMIT = "658ba11ae91737391a247cf9758d0063c43491b3"
+PINNED_MOTION_CONTEXT_COMMIT = "725a731e644c669601799da1eb63f4e7497c628f"
 MOTION_CONTEXT_NODE_TYPES = (
     "MiniMaxH3MotionContext",
     "MiniMaxH3MotionContextLoadLatent",
@@ -26,7 +26,7 @@ MOTION_CONTEXT_NODE_TYPES = (
     "MiniMaxH3MotionContextTrim",
 )
 PINNED_MOTION_CONTEXT_PROFILE = MotionContextProfile(
-    provider_id="niko-h3-motion-context-v0.3.0",
+    provider_id="niko-h3-motion-context-v0.3.1",
     source_repository=MOTION_CONTEXT_REPOSITORY,
     source_commit=PINNED_MOTION_CONTEXT_COMMIT,
     node_types=MOTION_CONTEXT_NODE_TYPES,

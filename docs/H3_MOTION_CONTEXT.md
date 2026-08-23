@@ -2,8 +2,8 @@
 
 This document records the inspected contract of
 [`NikoDemon80/ComfyUI-H3-Motion-Context`](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
-at tag `v0.3.0`, commit
-`658ba11ae91737391a247cf9758d0063c43491b3` (2026-08-11).
+at tag `v0.3.1`, commit
+`725a731e644c669601799da1eb63f4e7497c628f` (2026-08-14).
 
 The plugin is not currently installed in the configured ComfyUI Worker. Do not
 advertise Motion Context capability until the post-restart `object_info` check
