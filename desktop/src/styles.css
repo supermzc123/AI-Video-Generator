@@ -781,3 +781,31 @@ input[type="file"] { display: none; }
   gap: 6px;
   color: var(--text);
 }
+
+.asset-shot-map-assets {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.asset-shot-map-assets > small {
+  flex-basis: 100%;
+}
+
+.asset-shot-map-asset {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.asset-shot-map-empty {
+  font-size: 11px;
+}

@@ -1736,6 +1736,11 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                 (plan.shotIds.length ? plan.shotIds.includes(shot.id) : plan.shotId === shot.id)
                 || (plan.scope === "public" && plan.shotIds.length === 0),
               );
+              const referencedAssets = project.assets.filter((asset) => (
+                asset.scope === "public"
+                || asset.shotId === shot.id
+                || plans.some((plan) => plan.fulfilledByAssetId === asset.id)
+              ));
               const togglePlanShot = (plan: ProjectDraft["assetPlans"][number], checked: boolean) => {
                 const allShotIds = project.shots.map((item) => item.id);
                 const currentIds = plan.shotIds.length
@@ -1763,6 +1768,15 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                     return <label key={plan.id} className="asset-shot-map-option"><input type="checkbox" checked={checked} onChange={(event) => togglePlanShot(plan, event.target.checked)} /><span>@{plan.name}</span></label>;
                   }) : <span>暂无素材需求</span>}
                   {!plans.length && project.assetPlans.length > 0 && <small>当前未引用素材</small>}
+                </div>
+                <div className="asset-shot-map-assets">
+                  <small>已上传 / 已生成素材</small>
+                  {referencedAssets.length ? referencedAssets.map((asset) => (
+                    <span className="asset-shot-map-asset" key={asset.id}>
+                      {asset.mediaKind === "video" ? <Film size={12} /> : asset.mediaKind === "audio" ? <Music size={12} /> : <ImagePlus size={12} />}
+                      @{asset.name}
+                    </span>
+                  )) : <span className="asset-shot-map-empty">暂无已绑定素材</span>}
                 </div>
               </div>;
             })}
