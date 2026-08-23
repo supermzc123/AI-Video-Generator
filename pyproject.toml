@@ -4,28 +4,37 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-video-generator"
-version = "0.1.0"
+version = "0.2.0b1"
 description = "Local-first MiniMax H3 video generation control plane"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "GPL-3.0-only"
 dependencies = [
     "fastapi>=0.116,<1",
+    "faster-whisper>=1.2,<2",
     "httpx>=0.28,<1",
+    "pillow>=11.3,<12",
+    "platformdirs>=4.3,<5",
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.10,<3",
+    "python-multipart>=0.0.20,<1",
     "uvicorn[standard]>=0.35,<1",
 ]
 
 [project.optional-dependencies]
+worker = [
+    "safetensors>=0.5,<1",
+    "websockets>=15,<16",
+]
 dev = [
+    "pyinstaller>=6.15,<7",
     "pytest>=8.4,<9",
     "pytest-asyncio>=1.1,<2",
     "ruff>=0.12,<1",
 ]
-
 [project.scripts]
 aivideo-api = "ai_video_generator.main:run"
+aivideo-worker = "ai_video_generator.worker_cli:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_video_generator"]

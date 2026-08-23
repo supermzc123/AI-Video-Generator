@@ -5,7 +5,7 @@
 首版采用独立应用控制 ComfyUI，不把产品状态塞进 ComfyUI 工作流，也不让前端直接编排节点。
 
 ```text
-Local Web UI
+Tauri 2 + React Desktop UI
      | HTTP + WebSocket
 Python Control Plane
      |-- Project / Revision Service
@@ -16,10 +16,10 @@ Python Control Plane
      |
 H3 Worker Adapter
      |
-forked Motion Director + official H3 nodes + ComfyUI
+versioned controlled H3 workflows + validated ComfyUI nodes
 ```
 
-首版推荐 Python 3.11/3.12、FastAPI、Pydantic、SQLAlchemy 2、Alembic 和 SQLite WAL。媒体文件保存在项目目录，SQLite 只保存索引、状态和血缘；使用 `httpx` 和 WebSocket 对接 Worker。UI 先做本地 Web，成熟后再决定是否用 Tauri 封装。暂不引入 Redis、Celery、Temporal 或 Kubernetes。
+首版采用 Python 3.11/3.12、FastAPI、Pydantic和SQLite WAL。媒体文件保存在项目目录，SQLite只保存索引、状态和血缘；使用`httpx`与WebSocket对接Worker。桌面端采用Tauri 2 + React/TypeScript/Vite，关闭窗口后驻留托盘。暂不引入Redis、Celery、Temporal或Kubernetes。
 
 ## 2. 核心领域模型
 
@@ -80,13 +80,11 @@ LLM 只建议叙事拆分点，不直接计算 H3 帧数、overlap 或 trim。�
 
 ## 5. H3 Worker 边界
 
-首选 fork `j955229/ComfyUI-MiniMax-H3-Motion-Director` 作为唯一 H3 执行引擎。它已覆盖公共/局部参考、视听继承、选择性重跑、磁盘 latent cache 和多种生成模式。
+H3工作流与本项目的静态conditioning缓存、Motion Context和任务产物契约高度耦合，因此产品随版本发布经过验证的受控节点图，不要求用户自行准备。图形拓扑不在GUI中开放；用户只能从Worker能力清单选择扩散模型、文本编码器、视频/音频VAE、Turbo LoRA及受支持的运行参数。每个受控图、节点Schema、模型选择和插件版本都进入任务指纹。
 
-产品数据库是项目、素材、镜头和修订的唯一真相源。Motion Director 的内置素材库、提示词增强器、弹窗时间线和基于 `node_id` 的缓存身份不作为产品接口。fork 后优先将缓存根改为 `project_id/run_id/shot_revision`。
+产品数据库仍是项目、素材、镜头和修订的唯一真相源。任何工作流内置素材库、提示词增强器、弹窗时间线或基于`node_id`的缓存身份都不作为产品接口。Motion Context可以由经验证的外部节点提供，但同一Profile必须只有一套明确的继承路径和patch owner。
 
-同一个生产 Worker 不安装独立 `ComfyUI-H3-Motion-Context` 或 `Contex Loop`，以免出现重复 patch owner 或编排器冲突。`Contex Loop` 只作为隔离实例中的恢复设计参考或备选引擎；`Conditioning Cache` 经安全和内容寻址改造后再评估。
-
-Worker 的 `custom_nodes` 首版只允许官方 H3 核心、我方 Motion Director fork 和经过白名单验证的保存/预览节点。所有 commit 固定，禁止自动 `git pull`。启动时报告 ComfyUI、插件、模型哈希和 patch owner；发现重复或未知 wrapper 时拒绝接任务。
+Worker 的`custom_nodes`必须报告来源、提交和节点Schema。Turbo只接受锁定官方`ComfyUI-MiniMax-H3-Turbo`的LoRA加载器与sampler；SageAttention可使用KJNodes的H3专用patch并显式标记实验风险；TeaCache在标准和Turbo Profile中都被拒绝。发现重复、未知或来源不符的实现时拒绝接任务。
 
 主应用只依赖稳定 Adapter API：
 
@@ -170,6 +168,4 @@ logs/
 
 ## 9. 许可证与备选路径
 
-Motion Director、Contex Loop 和独立 Motion Context 均为 GPL-3.0；Conditioning Cache 为 MIT。fork 和分发时保留原版权、NOTICE 与第三方许可证。模型许可独立于节点代码许可，发布前另行核对地域与商用条款。
-
-若 P0 证明 Motion Director 的 UI 与执行核心无法合理解耦，备选方案是产品自行编排单片段，配合独立 Motion Context 和官方 H3 节点。该方案边界更干净，但需要自行补齐公共素材、多模式、缓存传播、选择性重跑和拼接能力。
+项目代码采用GPL-3.0；外部节点继续遵守各自许可证，官方MiniMax H3 Turbo插件为Apache-2.0。fork和分发时保留原版权、NOTICE与第三方许可证。模型许可独立于节点代码许可，发布前另行核对地域与商用条款。

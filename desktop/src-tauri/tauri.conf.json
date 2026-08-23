@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI Video Generator",
+  "version": "0.2.0-beta.1",
+  "identifier": "io.github.supermzc123.aivideogenerator",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run prepare:release-assets && npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AI Video Generator",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 760,
+        "minHeight": 560
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:1420 ws://localhost:1420; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob: data:; media-src 'self' http://127.0.0.1:* blob:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "license": "../../LICENSE",
+    "windows": {
+      "wix": {
+        "version": "0.2.0.1",
+        "upgradeCode": "a3ae9a39-cbaa-548d-9e9b-4264497c936f"
+      }
+    },
+    "resources": {
+      "resources/control-plane/": "control-plane/",
+      "resources/ffmpeg/": "ffmpeg/",
+      "resources/installers/": "installers/",
+      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    },
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "profile_id": "postprocess:rife49:2x:24-to-48",
+  "revision": 1,
+  "name": "RIFE 4.9 2x (24 fps to 48 fps)",
+  "workflow_file": "rife49_2x_api.json",
+  "workflow_sha256": "a2bbd1b99527dbf6f1f81a762a6b88b99327400f9623461ae19089423d8cdebf",
+  "execution": {
+    "kind": "frame_interpolation",
+    "source_fps": 24.0,
+    "output_fps": 48.0,
+    "multiplier": 2,
+    "preserve_audio": true,
+    "gpu_task": true,
+    "default_enabled": false
+  },
+  "bindings": [
+    {
+      "binding_id": "input_video",
+      "node_id": "1",
+      "input_name": "video",
+      "value_type": "relative_video_path",
+      "required": true
+    },
+    {
+      "binding_id": "source_fps",
+      "node_id": "1",
+      "input_name": "force_rate",
+      "value_type": "number",
+      "minimum": 1.0,
+      "default": 24.0
+    },
+    {
+      "binding_id": "multiplier",
+      "node_id": "2",
+      "input_name": "multiplier",
+      "value_type": "integer",
+      "minimum": 2,
+      "default": 2
+    },
+    {
+      "binding_id": "dtype",
+      "node_id": "2",
+      "input_name": "dtype",
+      "value_type": "enum",
+      "allowed": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "default": "float16"
+    },
+    {
+      "binding_id": "output_fps",
+      "node_id": "3",
+      "input_name": "frame_rate",
+      "value_type": "number",
+      "minimum": 1.0,
+      "default": 48.0
+    },
+    {
+      "binding_id": "output_prefix",
+      "node_id": "3",
+      "input_name": "filename_prefix",
+      "value_type": "string",
+      "default": "AI-Video-Generator/rife49_2x"
+    }
+  ],
+  "output": {
+    "node_id": "3",
+    "media_type": "video/mp4",
+    "history_field": "gifs"
+  },
+  "requirements": {
+    "node_types": [
+      "RIFE VFI",
+      "VHS_LoadVideo",
+      "VHS_VideoCombine"
+    ],
+    "weights": [
+      {
+        "name": "rife49.pth",
+        "relative_to_node": "ckpts/rife/rife49.pth",
+        "size_bytes": 21345274,
+        "sha256": "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533",
+        "sources": [
+          "https://hf-mirror.com/marduk191/rife/resolve/main/rife49.pth",
+          "https://huggingface.co/marduk191/rife/resolve/main/rife49.pth"
+        ]
+      }
+    ],
+    "node_source_fingerprints": {
+      "comfyui-frame-interpolation/vfi_models/rife/__init__.py": "416616e737e6bafb62b6df83eeb9829377fa45a2e2c403f4d818d8ce9dd9b11d",
+      "comfyui-videohelpersuite/videohelpersuite/nodes.py": "6d975d8fd8906784a4d9233ccc1238150ed33c6311d06c53fd08b5ee96e30442"
+    },
+    "licenses": {
+      "comfyui-frame-interpolation": "MIT",
+      "comfyui-videohelpersuite": "GPL-3.0"
+    }
+  },
+  "safety": {
+    "split_before_interpolation": true,
+    "forbid_cross_cut": true,
+    "forbid_cross_black_frame": true,
+    "forbid_cross_motion_context_reset": true,
+    "notes": "Run one approved shot segment per invocation. Never concatenate shots before RIFE."
+  }
+}

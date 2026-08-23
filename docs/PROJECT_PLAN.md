@@ -25,10 +25,11 @@
 ### 必须完成
 
 - 单用户、单机、本地优先。
-- 一套经过验证的 MiniMax H3 ComfyUI 工作流。
+- 至少一套随软件提供、经过验证且可版本化升级的 MiniMax H3 ComfyUI受控工作流。
 - 一种 OpenAI-compatible LLM 接入方式，并用一个实际模型验收。
 - 大纲、电影分镜、H3 生成片段三层结构化数据。
 - 公共参考素材、镜头专用素材及明确的用途绑定。
+- 内置图片模板和用户上传的ComfyUI API工作流，使用类型化字段绑定。
 - 单段不超过 15 秒；长镜头自动拆分并通过 Motion Context 连续生成。
 - 大纲、分镜、生成结果三个正式审核门。
 - 持久化队列、取消、失败重试、局部重跑和应用重启恢复。
@@ -52,7 +53,7 @@
 
 目标：在写完整产品前消除 H3 执行层的关键风险。
 
-- fork 并固定 Motion Director、官方 H3 节点和 ComfyUI 的 commit。
+- 固定ComfyUI、官方H3 Turbo节点和选用的Motion Context provider提交；经过验证的H3节点图作为版本化受控资源随软件提供。
 - Worker 冷启动时只允许一个 Motion Context runtime patch owner。
 - 通过 API 提交 H3 任务，读取进度、历史和结果。
 - 验证 14 秒、16 秒和 31 秒电影镜头的拆分与成片时长。
@@ -66,7 +67,7 @@
 - 比较 2、5、10 段长链的人物、动作、色彩和音质退化。
 - 冻结首版 ChainSpec、Worker API、核心 Schema 和产物 manifest。
 
-第一版同一 ComfyUI 实例不并装独立 `ComfyUI-H3-Motion-Context` 或 `Contex Loop`。它们与 Motion Director 的运行时补丁或多段编排职责重叠，只能在隔离实例中做备选验证。
+第一版不预设唯一Motion Context插件，但每个生产Profile只能声明一套继承机制和patch owner；发现重复或冲突wrapper时拒绝执行。
 
 退出条件：无需手工改数据库即可重复运行同一测试，重启控制程序和 ComfyUI 后能重新关联任务；成片时长误差不超过 1 视频帧，音画差不超过 1 视频帧。
 

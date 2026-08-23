@@ -1,0 +1,101 @@
+{
+  "115": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 0.1,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "\u5206\u8fa8\u7387\u9009\u62e9\u5668"
+    }
+  },
+  "119": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "\u52a0\u8f7dVAE"
+    }
+  },
+  "128": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "\u52a0\u8f7dCLIP"
+    }
+  },
+  "131": {
+    "inputs": {
+      "prompt": "A single matte red cube centered on a neutral gray studio floor, locked camera, soft even light, almost no motion. Audio: silence, no music, no speech.",
+      "width": [
+        "115",
+        0
+      ],
+      "height": [
+        "115",
+        1
+      ],
+      "length": [
+        "132",
+        1
+      ],
+      "clip": [
+        "128",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ImageToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Image to Video"
+    }
+  },
+  "132": {
+    "inputs": {
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+      "values.a": [
+        "133",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "\u6570\u5b66\u8868\u8fbe\u5f0f"
+    }
+  },
+  "133": {
+    "inputs": {
+      "value": 5.0
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Float (duration)"
+    }
+  },
+  "avg-save-h3-static": {
+    "class_type": "AVGSaveH3StaticConditioning",
+    "inputs": {
+      "conditioning": [
+        "131",
+        0
+      ],
+      "latent": [
+        "131",
+        1
+      ],
+      "fingerprint": "dbdcad3bc498e89e08562829e265824f8c596350463a372b5efc7103e0fc84c1"
+    },
+    "_meta": {
+      "title": "AVG H3 static cache output"
+    }
+  }
+}

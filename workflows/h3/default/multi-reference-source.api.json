@@ -1,0 +1,301 @@
+{
+  "92": {
+    "inputs": {
+      "filename_prefix": "gpu-tests/h3_multi_image_public_20260815",
+      "format": "auto",
+      "codec": "auto",
+      "video": [
+        "130",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "\u4fdd\u5b58\u89c6\u9891"
+    }
+  },
+  "115": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 0.1,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "\u5206\u8fa8\u7387\u9009\u62e9\u5668"
+    }
+  },
+  "119": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "\u52a0\u8f7dVAE"
+    }
+  },
+  "120": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "\u52a0\u8f7dVAE"
+    }
+  },
+  "121": {
+    "inputs": {
+      "samples": [
+        "125",
+        0
+      ],
+      "vae": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE\u89e3\u7801\uff08\u97f3\u9891\uff09"
+    }
+  },
+  "122": {
+    "inputs": {
+      "samples": [
+        "125",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE\u89e3\u7801"
+    }
+  },
+  "124": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 6,
+      "denoise": 1,
+      "model": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "\u57fa\u672c\u8c03\u5ea6\u5668"
+    }
+  },
+  "125": {
+    "inputs": {
+      "noise": [
+        "129",
+        0
+      ],
+      "guider": [
+        "126",
+        0
+      ],
+      "sampler": [
+        "135",
+        0
+      ],
+      "sigmas": [
+        "124",
+        0
+      ],
+      "latent_image": [
+        "131",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "\u81ea\u5b9a\u4e49\u91c7\u6837\u5668\uff08\u9ad8\u7ea7\uff09"
+    }
+  },
+  "126": {
+    "inputs": {
+      "model": [
+        "136",
+        0
+      ],
+      "conditioning": [
+        "131",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "\u57fa\u672c\u5f15\u5bfc\u5668"
+    }
+  },
+  "127": {
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet\u52a0\u8f7d\u5668"
+    }
+  },
+  "128": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "\u52a0\u8f7dCLIP"
+    }
+  },
+  "129": {
+    "inputs": {
+      "noise_seed": 46
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "\u968f\u673a\u566a\u6ce2"
+    }
+  },
+  "130": {
+    "inputs": {
+      "fps": 24,
+      "bit_depth": 8,
+      "images": [
+        "122",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "\u521b\u5efa\u89c6\u9891"
+    }
+  },
+  "131": {
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "inputs": {
+      "clip": [
+        "128",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ],
+      "audio_vae": [
+        "120",
+        0
+      ],
+      "prompt": "<Picture 1> and <Picture 2> show the same matte red cube. Keep its exact identity and proportions. The cube rests in a neutral gray studio, locked camera, soft even light, almost no motion. Audio: silence, no music, no speech.",
+      "width": [
+        "115",
+        0
+      ],
+      "height": [
+        "115",
+        1
+      ],
+      "length": [
+        "132",
+        1
+      ],
+      "ref_image_size": "match",
+      "ref_images.ref_image_0": [
+        "ref-1",
+        0
+      ],
+      "ref_images.ref_image_1": [
+        "ref-2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "MiniMax H3 multi-image public reference"
+    }
+  },
+  "132": {
+    "inputs": {
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+      "values.a": [
+        "133",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "\u6570\u5b66\u8868\u8fbe\u5f0f"
+    }
+  },
+  "133": {
+    "inputs": {
+      "value": 5.0
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Float (duration)"
+    }
+  },
+  "134": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+      "strength": 1.0,
+      "low_vram": true,
+      "model": [
+        "127",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3TurboLoRA",
+    "_meta": {
+      "title": "MiniMax-H3 Turbo LoRA"
+    }
+  },
+  "135": {
+    "inputs": {},
+    "class_type": "MiniMaxH3TurboSampler",
+    "_meta": {
+      "title": "MiniMax-H3 Turbo Sampler (4-step)"
+    }
+  },
+  "136": {
+    "inputs": {
+      "model": [
+        "134",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3MemoryEfficientSageAttentionPatch",
+    "_meta": {
+      "title": "MiniMax H3 SageAttention (low-load test)"
+    }
+  },
+  "ref-1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "avg-test-public-cube-1.png"
+    },
+    "_meta": {
+      "title": "AVG_REFERENCE_1 public cube"
+    }
+  },
+  "ref-2": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "avg-test-public-cube-2.png"
+    },
+    "_meta": {
+      "title": "AVG_REFERENCE_2 public cube"
+    }
+  }
+}

@@ -1,4 +1,7 @@
 .env
+/api-key.txt
+.tmp/
+data/
 .venv/
 .pytest_cache/
 .ruff_cache/
@@ -9,6 +12,27 @@ __pycache__/
 htmlcov/
 dist/
 build/
+node_modules/
+*.tsbuildinfo
+desktop/vite.config.js
+desktop/vite.config.d.ts
+desktop/src-tauri/target/
+desktop/src-tauri/resources/control-plane/*
+!desktop/src-tauri/resources/control-plane/.gitkeep
+desktop/src-tauri/resources/ffmpeg/*
+!desktop/src-tauri/resources/ffmpeg/.gitkeep
+desktop/src-tauri/resources/installers/*
+!desktop/src-tauri/resources/installers/.gitkeep
+
+# Release packages and large model/runtime payloads
+release/
+*.safetensors
+*.gguf
+*.pth
+*.ckpt
+*.onnx
+*.msi
+*-setup.exe
 
 # Local project data and generated media
 *.db

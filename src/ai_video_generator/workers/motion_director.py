@@ -7,13 +7,33 @@ from ai_video_generator.domain import (
     ContextMode,
     DryRunPlan,
     GenerationMode,
+    GenerationSegment,
     ModelResidency,
+    MotionContextHandoff,
+    MotionContextProfile,
     PlannedTask,
     TaskType,
 )
 from ai_video_generator.services import conditioning_fingerprint
 
-PINNED_MOTION_DIRECTOR_COMMIT = "a58f28271a9db8af2a802533a1078b5890c9c4b9"
+MOTION_CONTEXT_REPOSITORY = "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context.git"
+PINNED_MOTION_CONTEXT_COMMIT = "658ba11ae91737391a247cf9758d0063c43491b3"
+MOTION_CONTEXT_NODE_TYPES = (
+    "MiniMaxH3MotionContext",
+    "MiniMaxH3MotionContextLoadLatent",
+    "MiniMaxH3MotionContextSaveLatent",
+    "MiniMaxH3MotionContextSeamProbe",
+    "MiniMaxH3MotionContextTrim",
+)
+PINNED_MOTION_CONTEXT_PROFILE = MotionContextProfile(
+    provider_id="niko-h3-motion-context-v0.3.0",
+    source_repository=MOTION_CONTEXT_REPOSITORY,
+    source_commit=PINNED_MOTION_CONTEXT_COMMIT,
+    node_types=MOTION_CONTEXT_NODE_TYPES,
+    native_fps=24,
+    context_lengths=(5, 22, 39, 56),
+    handoff=MotionContextHandoff.AV_LATENT,
+)
 SUPPORTED_MODES = {
     GenerationMode.T2VA,
     GenerationMode.I2VA,
@@ -28,11 +48,10 @@ def compile_dry_run(
     chain: ChainSpec,
     stack: ConditioningStack,
     *,
-    motion_director_installed: bool,
+    motion_context_profile: MotionContextProfile | None,
 ) -> DryRunPlan:
     fingerprints_by_segment = {
-        segment.segment_id: conditioning_fingerprint(segment, stack)
-        for segment in chain.segments
+        segment.segment_id: conditioning_fingerprint(segment, stack) for segment in chain.segments
     }
     grouped: OrderedDict[str, list[str]] = OrderedDict()
     for segment in chain.segments:
@@ -114,24 +133,37 @@ def compile_dry_run(
     blockers: list[str] = [
         "Dry-run plans cannot be submitted; the Worker execution endpoint is not implemented"
     ]
-    if not motion_director_installed:
-        blockers.append("Motion Director is not installed in the configured ComfyUI Worker")
-    if stack.worker_engine_commit != PINNED_MOTION_DIRECTOR_COMMIT:
-        blockers.append(
-            "Conditioning stack does not match the pinned Motion Director commit "
-            f"{PINNED_MOTION_DIRECTOR_COMMIT}"
-        )
+    motion_segments = tuple(
+        segment
+        for segment in chain.segments
+        if segment.incoming_context.mode == ContextMode.MOTION_CONTEXT
+    )
+    if motion_segments:
+        if motion_context_profile is None:
+            blockers.append(
+                "A verified Motion Context provider is not installed in the configured "
+                "ComfyUI Worker"
+            )
+        else:
+            blockers.extend(
+                _validate_motion_context_segments(motion_segments, motion_context_profile)
+            )
+            if stack.worker_engine_commit != motion_context_profile.source_commit:
+                blockers.append(
+                    "Conditioning stack does not match Motion Context provider commit "
+                    f"{motion_context_profile.source_commit}"
+                )
 
     unsupported = sorted(
         {
             segment.generation_mode.value
-            for segment in chain.segments
+            for segment in motion_segments
             if segment.generation_mode not in SUPPORTED_MODES
         }
     )
     if unsupported:
         blockers.append(
-            "Motion Director adapter mapping is not defined for modes: " + ", ".join(unsupported)
+            "Motion Context adapter mapping is not defined for modes: " + ", ".join(unsupported)
         )
 
     duplicate_count = len(chain.segments) - len(artifacts)
@@ -144,9 +176,47 @@ def compile_dry_run(
         project_id=chain.project_id,
         run_id=chain.run_id,
         shot_revision_id=chain.shot_revision_id,
-        engine_commit=PINNED_MOTION_DIRECTOR_COMMIT,
+        engine_commit=(
+            motion_context_profile.source_commit
+            if motion_context_profile is not None
+            else PINNED_MOTION_CONTEXT_COMMIT
+        ),
         conditioning_artifacts=artifacts,
         tasks=tuple(tasks),
         warnings=tuple(warnings),
         blockers=tuple(blockers),
     )
+
+
+def _validate_motion_context_segments(
+    segments: tuple[GenerationSegment, ...],
+    profile: MotionContextProfile,
+) -> list[str]:
+    blockers: list[str] = []
+    for segment in segments:
+        incoming = segment.incoming_context
+        prefix = f"Segment {segment.segment_id}"
+        if segment.fps != profile.native_fps:
+            blockers.append(
+                f"{prefix} uses {segment.fps}fps; {profile.provider_id} requires "
+                f"{profile.native_fps}fps"
+            )
+        if incoming.context_frames not in profile.context_lengths:
+            allowed = ", ".join(str(value) for value in profile.context_lengths)
+            blockers.append(
+                f"{prefix} context_length must be one of {allowed}; got {incoming.context_frames}"
+            )
+        if profile.handoff == MotionContextHandoff.AV_LATENT and not (
+            incoming.visual and incoming.audio
+        ):
+            blockers.append(
+                f"{prefix} must bind both visual and audio context for AV latent handoff"
+            )
+        if incoming.trim_head_frames != incoming.context_frames:
+            blockers.append(f"{prefix} trim_head_frames must equal the bound context_length")
+        unused = segment.sample_frames - incoming.trim_head_frames - segment.visible_frames
+        if unused < 0 or unused >= 17:
+            blockers.append(
+                f"{prefix} sample/visible/trim values are inconsistent with the H3 frame grid"
+            )
+    return blockers
