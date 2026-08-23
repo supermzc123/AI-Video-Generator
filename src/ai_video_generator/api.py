@@ -211,6 +211,7 @@ from ai_video_generator.services.shot_compiler import ShotCompilationRequest, co
 from ai_video_generator.services.user_video_workflows import (
     compile_user_video_workflow_manifest,
 )
+from ai_video_generator.services.workspace_topology import normalize_workspace_topology
 from ai_video_generator.workers import (
     PINNED_MOTION_CONTEXT_PROFILE,
     ComfyUIAdapter,
@@ -3030,13 +3031,14 @@ def create_app(
     async def save_project_workspace(
         project_id: str, request: WorkspaceSaveRequest
     ) -> ProjectWorkspaceRevision:
+        payload = normalize_workspace_topology(request.payload)
         canonical = json.dumps(
-            request.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         revision = ProjectWorkspaceRevision(
             project_id=project_id,
             revision=request.revision,
-            payload=request.payload,
+            payload=payload,
             payload_sha256=hashlib.sha256(canonical).hexdigest(),
             created_at=datetime.now(UTC),
         )
@@ -3044,8 +3046,8 @@ def create_app(
             stored = get_task_store().put_project_workspace_revision(revision)
             try:
                 state = get_task_store().get_project_run_state(project_id)
-                approvals = request.payload.get("stageApprovals", {})
-                budget_value = request.payload.get("timeBudgetSeconds")
+                approvals = payload.get("stageApprovals", {})
+                budget_value = payload.get("timeBudgetSeconds")
                 budget = (
                     TimeBudget(
                         total_seconds=float(budget_value),
@@ -3071,8 +3073,8 @@ def create_app(
                             and "outline" in approvals,
                             "current_stage": (
                                 "generation"
-                                if request.payload.get("activeStage") == "review"
-                                else str(request.payload.get("activeStage", "idea"))
+                                if payload.get("activeStage") == "review"
+                                else str(payload.get("activeStage", "idea"))
                             ),
                             "time_budget": budget,
                             "updated_at": datetime.now(UTC),
@@ -3093,13 +3095,14 @@ def create_app(
             raise HTTPException(status_code=422, detail="project path identity mismatch")
         if int(request.payload.get("revision") or 0) != request.project.revision:
             raise HTTPException(status_code=422, detail="workspace and project revisions differ")
+        payload = normalize_workspace_topology(request.payload)
         canonical = json.dumps(
-            request.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         workspace_revision = ProjectWorkspaceRevision(
             project_id=project_id,
             revision=request.project.revision,
-            payload=request.payload,
+            payload=payload,
             payload_sha256=hashlib.sha256(canonical).hexdigest(),
             created_at=datetime.now(UTC),
         )

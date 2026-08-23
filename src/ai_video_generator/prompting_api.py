@@ -56,6 +56,7 @@ from ai_video_generator.persistence.project_assets import (
     ProjectAssetStore,
 )
 from ai_video_generator.services.llm_streaming import stream_llm_operation
+from ai_video_generator.services.workspace_topology import normalize_workspace_topology
 
 
 class ImagePromptGenerationRequest(BaseModel):
@@ -745,6 +746,7 @@ async def _generate_and_commit(
         latest_prompts["imagePrompts"] = merged_images
         latest_prompts["generatedAt"] = prompts["generatedAt"]
         latest_prompts["generationSummary"] = prompts["generationSummary"]
+        latest_payload = normalize_workspace_topology(latest_payload)
         latest_payload["revision"] = latest_project.revision + 1
         latest_payload["updatedAt"] = datetime.now(UTC).isoformat()
         latest_canonical = json.dumps(latest_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
