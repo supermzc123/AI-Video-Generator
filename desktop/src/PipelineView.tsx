@@ -616,7 +616,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       message: "先上传或生成并确认全部需求图片；完成后才会生成 H3 视频提示词",
     },
     prompts: {
-      valid: project.prompts.h3Prompts.length === segmentCount
+      valid: h3SegmentSlots.length > 0
         && h3SegmentSlots.every((slot) => Boolean(promptForSlot(slot)?.prompt.trim())),
       message: "每个 H3 片段都需要一份非空视频提示词；点击下一步即确认当前文本",
     },
