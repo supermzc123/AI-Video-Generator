@@ -307,3 +307,91 @@ def test_comfy_v3_autogrow_rejects_unknown_or_out_of_range_slots() -> None:
     inspection = inspect_api_workflow(source, info)
 
     assert any("not exposed by object_info" in issue for issue in inspection.issues)
+
+
+def test_dynamic_combo_and_matchtype_are_valid_workflow_contracts() -> None:
+    info = {
+        "LoadImage": {
+            "input": {"required": {"image": ["STRING"]}},
+            "output": ["IMAGE"],
+        },
+        "ModelLoader": {
+            "input": {"required": {"model": ["COMBO", {"options": ["model.safetensors"]}]}},
+            "output": ["MODEL"],
+        },
+        "ResizeImageMaskNode": {
+            "input": {
+                "required": {
+                    "input": ["COMFY_MATCHTYPE_V3"],
+                    "resize_type": [
+                        "COMFY_DYNAMICCOMBO_V3",
+                        {
+                            "options": [
+                                {
+                                    "key": "scale by multiplier",
+                                    "inputs": {
+                                        "required": {
+                                            "multiplier": [
+                                                "FLOAT",
+                                                {"min": 0.01, "max": 8.0},
+                                            ]
+                                        }
+                                    },
+                                }
+                            ]
+                        },
+                    ],
+                }
+            },
+            "output": ["COMFY_MATCHTYPE_V3"],
+        },
+        "SaveImage": object_info()["SaveImage"],
+    }
+    source = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
+        "2": {"class_type": "ModelLoader", "inputs": {"model": "model.safetensors"}},
+        "3": {
+            "class_type": "ResizeImageMaskNode",
+            "inputs": {
+                "input": ["1", 0],
+                "resize_type": "scale by multiplier",
+                "resize_type.multiplier": 2.0,
+            },
+        },
+        "4": {
+            "class_type": "SaveImage",
+            "inputs": {"images": ["3", 0], "filename_prefix": "test"},
+        },
+    }
+
+    inspection = inspect_api_workflow(source, info).model_copy(
+        update={
+            "bindings": (
+                WorkflowBindingDraft(
+                    binding_id="model",
+                    semantic=BindingSemantic.MODEL,
+                    node_id="2",
+                    input_name="model",
+                    value_type=BindingValueType.STRING,
+                    title="Model",
+                ),
+                WorkflowBindingDraft(
+                    binding_id="upscale",
+                    semantic=BindingSemantic.UPSCALE_FACTOR,
+                    node_id="3",
+                    input_name="resize_type.multiplier",
+                    value_type=BindingValueType.NUMBER,
+                    title="Upscale factor",
+                ),
+            )
+        }
+    )
+    template = workflow_template_from_inspection(
+        inspection,
+        template_id="restoration:test",
+        name="Restoration",
+        approval=WorkflowApproval.APPROVED,
+    )
+
+    assert inspection.compatible
+    assert validate_workflow_template(template, info) == ()

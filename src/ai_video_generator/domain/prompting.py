@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter, field_validator, model_validator
+from pydantic import AliasChoices, Field, TypeAdapter, field_validator, model_validator
 
 from .chain import SHA256_PATTERN, FrozenModel, GenerationMode
 from .project import AssetScope
@@ -14,6 +14,12 @@ class ProjectAssetState(StrEnum):
     AVAILABLE = "available"
     MISSING_BLOB = "missing_blob"
     RETIRED = "retired"
+
+
+class ProjectAssetMediaKind(StrEnum):
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
 
 
 class ProjectAssetPurpose(StrEnum):
@@ -87,9 +93,13 @@ class ProjectAsset(FrozenModel):
     sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     preview_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     mime_type: str | None = Field(default=None, min_length=1, max_length=200)
+    media_kind: ProjectAssetMediaKind = ProjectAssetMediaKind.IMAGE
     byte_size: int | None = Field(default=None, ge=0)
     width: int | None = Field(default=None, ge=1)
     height: int | None = Field(default=None, ge=1)
+    duration_seconds: float | None = Field(default=None, gt=0)
+    frame_rate: float | None = Field(default=None, gt=0)
+    has_audio: bool | None = None
     kind: ProjectAssetPurpose = ProjectAssetPurpose.REFERENCE
     scope: AssetScope = AssetScope.COMMON
     shot_id: str | None = Field(default=None, min_length=1)
@@ -108,9 +118,28 @@ class ProjectAsset(FrozenModel):
 
     @model_validator(mode="after")
     def validate_blob_and_scope(self) -> ProjectAsset:
-        metadata = (self.sha256, self.mime_type, self.byte_size, self.width, self.height)
+        metadata = (self.sha256, self.mime_type, self.byte_size)
         if self.state == ProjectAssetState.AVAILABLE and any(value is None for value in metadata):
-            raise ValueError("available project assets require blob and image metadata")
+            raise ValueError(
+                "available project assets require blob and image metadata or media metadata"
+            )
+        if self.state == ProjectAssetState.AVAILABLE:
+            if self.media_kind == ProjectAssetMediaKind.IMAGE and (
+                self.width is None or self.height is None
+            ):
+                raise ValueError("available images require dimensions")
+            if self.media_kind == ProjectAssetMediaKind.VIDEO and (
+                self.width is None
+                or self.height is None
+                or self.duration_seconds is None
+                or self.frame_rate is None
+            ):
+                raise ValueError("available videos require dimensions, duration, and frame rate")
+            if (
+                self.media_kind == ProjectAssetMediaKind.AUDIO
+                and self.duration_seconds is None
+            ):
+                raise ValueError("available audio references require duration")
         if self.state == ProjectAssetState.MISSING_BLOB and self.sha256 is not None:
             raise ValueError("missing_blob assets cannot reference a blob")
         if self.scope == AssetScope.SHOT:
@@ -273,7 +302,7 @@ class ImagePromptRevision(FrozenModel):
 
 
 class H3PromptRevision(FrozenModel):
-    schema_version: str = "1.0"
+    schema_version: str = "2.0"
     prompt_revision_id: str = Field(min_length=1, max_length=200)
     project_id: str = Field(min_length=1, max_length=200)
     revision: int = Field(default=1, ge=1)
@@ -282,7 +311,16 @@ class H3PromptRevision(FrozenModel):
     harness_id: str = Field(min_length=1, max_length=200)
     harness_revision: int = Field(ge=1)
     reference_asset_ids: tuple[str, ...] = ()
-    execution_prompt_zh: str = Field(min_length=1, max_length=7000)
+    execution_prompt: str = Field(
+        min_length=1,
+        max_length=7000,
+        validation_alias=AliasChoices("execution_prompt", "execution_prompt_zh"),
+    )
+    harness_manifest_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    route: str | None = Field(default=None, max_length=100)
+    asset_role_ledger: tuple[dict[str, object], ...] = ()
+    assumptions: tuple[str, ...] = ()
+    stage_trace: tuple[dict[str, object], ...] = ()
     terminal_state: str | None = Field(default=None, min_length=2, max_length=4000)
     review: PromptReviewResult
     state: PromptRevisionState = PromptRevisionState.DRAFT
@@ -296,6 +334,17 @@ class H3PromptRevision(FrozenModel):
         if self.generation_mode == GenerationMode.REF2VA and not self.reference_asset_ids:
             raise ValueError("Ref2VA prompts require at least one reference asset")
         return self
+
+    @property
+    def execution_prompt_zh(self) -> str:
+        """Read-only compatibility for callers using the legacy field name."""
+        return self.execution_prompt
+
+    def model_copy(self, *, update=None, deep: bool = False):
+        mapped = dict(update or {})
+        if "execution_prompt_zh" in mapped and "execution_prompt" not in mapped:
+            mapped["execution_prompt"] = mapped.pop("execution_prompt_zh")
+        return super().model_copy(update=mapped, deep=deep)
 
 
 class PromptSet(FrozenModel):

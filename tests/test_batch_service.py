@@ -1,5 +1,5 @@
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -16,7 +16,7 @@ from ai_video_generator.domain import (
     TaskSpec,
     TaskState,
 )
-from ai_video_generator.persistence import SQLiteTaskStore
+from ai_video_generator.persistence import SQLiteTaskStore, StoreConflictError
 from ai_video_generator.services.batch_runs import (
     batch_project_tasks,
     reconcile_batch_runs,
@@ -99,6 +99,24 @@ def test_client_task_ids_cannot_create_an_orphaned_batch_successor(tmp_path) -> 
     resolved = resolve_batch_run(store, _batch("review", task_ids=("export",)))
 
     assert resolved.items[0].task_ids == ("h3", "review", "export")
+
+
+def test_project_cannot_join_two_active_batches(tmp_path) -> None:
+    store = SQLiteTaskStore(tmp_path / "batch.db")
+    store.add_task(_task("selected", TaskKind.H3_GENERATION, state=TaskState.READY))
+    first = _batch("next_ready", task_ids=("selected",))
+    store.put_batch_run(resolve_batch_run(store, first))
+    second = first.model_copy(
+        update={
+            "batch_id": "batch-2",
+            "name": "Second",
+            "created_at": first.created_at + timedelta(seconds=1),
+            "updated_at": first.updated_at + timedelta(seconds=1),
+        }
+    )
+
+    with pytest.raises(StoreConflictError, match="already belongs to an active batch"):
+        resolve_batch_run(store, second)
 
 
 def test_batch_project_tasks_are_limited_to_frozen_member_ids(tmp_path) -> None:
@@ -231,6 +249,107 @@ async def test_outline_approved_project_enters_batch_before_dag_compilation(tmp_
     task_ids = response.json()["items"][0]["task_ids"]
     assert len(task_ids) == 1
     assert task_ids[0].startswith("batch-plan:project-outline:")
+
+
+@pytest.mark.asyncio
+async def test_batch_admission_uses_latest_committed_workspace_progress(tmp_path) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    now = datetime.now(UTC)
+    project = ProjectSpec(
+        project_id="committed-assets",
+        revision=1,
+        name="Committed assets project",
+        target_duration_seconds=30,
+    )
+    batch = BatchRun(
+        batch_id="batch-committed-assets",
+        name="Continue from assets",
+        items=(BatchRunItem(project_id=project.project_id),),
+        created_at=now,
+        updated_at=now,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/api/v1/projects", json=project.model_dump(mode="json")
+        )
+        assert created.status_code == 201
+        committed_project = project.model_copy(update={"revision": 2})
+        committed = await client.post(
+            f"/api/v1/projects/{project.project_id}/commit",
+            json={
+                "project": committed_project.model_dump(mode="json"),
+                "payload": {
+                    "revision": 2,
+                    "activeStage": "assets",
+                    "stageApprovals": {
+                        "outline": now.isoformat(),
+                        "storyboard": now.isoformat(),
+                    },
+                    "outline": [{"id": "beat-1", "title": "Opening"}],
+                    "shots": [{"id": "shot-1", "title": "Arrival"}],
+                },
+            },
+        )
+        assert committed.status_code == 201
+
+        state = await client.get(f"/api/v1/projects/{project.project_id}/run-state")
+        admitted = await client.post(
+            "/api/v1/batches", json=batch.model_dump(mode="json")
+        )
+
+    assert state.status_code == 200
+    assert state.json()["outline_approved"] is True
+    assert state.json()["current_stage"] == "assets"
+    assert admitted.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_outline_only_project_defers_boundary_filter_until_after_compilation(
+    tmp_path,
+) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    now = datetime.now(UTC)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/v1/projects",
+            json=ProjectSpec(
+                project_id="outline-review",
+                name="Outline review",
+                target_duration_seconds=30,
+            ).model_dump(mode="json"),
+        )
+        await client.post(
+            "/api/v1/projects/outline-review/workspace",
+            json={
+                "revision": 1,
+                "payload": {
+                    "stageApprovals": {"outline": now.isoformat()},
+                    "outline": [{"id": "beat-1", "title": "Opening"}],
+                },
+            },
+        )
+        batch = BatchRun(
+            batch_id="deferred-review",
+            name="Deferred review",
+            items=(
+                BatchRunItem(project_id="outline-review", start_boundary="review"),
+            ),
+            created_at=now,
+            updated_at=now,
+        )
+        response = await client.post(
+            "/api/v1/batches", json=batch.model_dump(mode="json")
+        )
+
+    assert response.status_code == 201
+    assert response.json()["items"][0]["start_boundary"] == "review"
+    assert response.json()["items"][0]["task_ids"][0].startswith(
+        "batch-plan:outline-review:"
+    )
 
 
 @pytest.mark.asyncio

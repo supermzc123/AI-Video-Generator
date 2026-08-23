@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-项目已具备MVP工程基础，采用 [GPL-3.0](LICENSE) 协议。当前仍禁止未经用户逐批批准的真实GPU测试。
+当前发布版本为 `0.2.0-beta.1`，这是早期 Beta 测试版本，采用 [GPL-3.0](LICENSE) 协议。项目仍可能存在较多 Bug、兼容性问题和状态恢复问题，不应作为生产环境或唯一数据来源。发布边界和已知风险见 [Beta 发布说明](docs/BETA_RELEASE.md)。
 
 首版目标是跑通以下闭环：
 
@@ -28,6 +28,7 @@
 - [H3受控工作流与加速策略](docs/H3_WORKFLOWS.md)
 - [后处理模型与执行策略](docs/POST_PROCESSING.md)
 - [当前构建状态](docs/BUILD_STATUS.md)
+- [面向用户的使用说明](docs/USER_GUIDE.md)
 
 ## 已实现架构
 

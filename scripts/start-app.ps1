@@ -49,17 +49,55 @@ function Test-ProjectFrontendProcess {
     )
 }
 
+function Get-ProjectFrontendOwners {
+    $listeners = @(
+        Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort 1420 -State Listen `
+            -ErrorAction SilentlyContinue
+    )
+    foreach ($ownerId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        if (Test-ProjectFrontendProcess -ProcessId $ownerId) {
+            $ownerId
+        }
+    }
+}
+
+function Stop-ProjectFrontend {
+    foreach ($ownerId in @(Get-ProjectFrontendOwners)) {
+        Write-Output "Restarting project web interface (PID $ownerId)..."
+        Stop-Process -Id $ownerId -Force
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $remaining = Get-ProjectFrontendOwners
+        if ($null -eq $remaining) { return }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The project web interface did not stop before restart."
+}
+
 Write-Output "Starting AI Video Generator..."
 Write-Output ""
 
-if (-not (Test-ApiReady)) {
-    Write-Output "The control plane is offline. Starting it now..."
-    & $restartApiScript -TimeoutSeconds $TimeoutSeconds
-    if ($LASTEXITCODE -ne 0) {
-        throw "The control plane failed to start."
-    }
+if (Test-ApiReady) {
+    Write-Output "Restarting the control plane so the current source is active..."
 } else {
-    Write-Output "Control plane is online: $apiHealthUrl"
+    Write-Output "The control plane is offline. Starting it now..."
+}
+& $restartApiScript -TimeoutSeconds $TimeoutSeconds
+if ($LASTEXITCODE -ne 0) {
+    throw "The control plane failed to start."
+}
+
+$frontendWasReady = Test-FrontendReady
+if ($frontendWasReady) {
+    $healthyOwners = @(Get-ProjectFrontendOwners)
+    if ($healthyOwners.Count -eq 1) {
+        Stop-ProjectFrontend
+    } elseif ($healthyOwners.Count -eq 0) {
+        throw "Port 1420 serves the application, but its process is not the project Vite server. Stop that process and retry."
+    } else {
+        throw "Multiple project web interface processes are listening on port 1420. Stop them and retry."
+    }
 }
 
 if (-not (Test-FrontendReady)) {
@@ -99,11 +137,13 @@ if (-not (Test-FrontendReady)) {
 
     Write-Output "Starting the web interface (PID $($frontendProcess.Id))..."
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $frontendStarted = $false
     do {
         if ($frontendProcess.HasExited) {
             throw "The web interface exited during startup. See $stderrLog"
         }
         if (Test-FrontendReady) {
+            $frontendStarted = $true
             Write-Output "Web interface is online: $frontendUrl"
             Write-Output "Frontend logs: $stdoutLog and $stderrLog"
             break
@@ -111,11 +151,9 @@ if (-not (Test-FrontendReady)) {
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    if (-not (Test-FrontendReady)) {
+    if (-not $frontendStarted) {
         throw "The web interface health check timed out after $TimeoutSeconds seconds. See $stderrLog"
     }
-} else {
-    Write-Output "Web interface is online: $frontendUrl"
 }
 
 if (-not $NoBrowser) {

@@ -21,6 +21,7 @@ class ExecutionMode(StrEnum):
 class ReviewMode(StrEnum):
     HUMAN_AI = "human_ai"
     AI_ONLY = "ai_only"
+    MANUAL = "manual"
     NONE = "none"
 
 
@@ -62,6 +63,36 @@ class HarnessSource(FrozenModel):
     installed_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
 
 
+class HarnessDocumentSnapshot(FrozenModel):
+    source_id: str = Field(min_length=1, max_length=100)
+    source_commit: str = Field(pattern="^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    path: str = Field(min_length=1, max_length=500)
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    content: str = Field(min_length=1, max_length=100_000)
+    stages: tuple[str, ...] = Field(min_length=1)
+
+
+class H3HarnessManifest(FrozenModel):
+    schema_version: str = "2.0"
+    documents: tuple[HarnessDocumentSnapshot, ...] = Field(min_length=1)
+    stage_documents: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    policy: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_documents(self) -> H3HarnessManifest:
+        paths = [item.path for item in self.documents]
+        if len(paths) != len(set(paths)):
+            raise ValueError("harness manifest document paths must be unique")
+        known = set(paths)
+        for stage, stage_paths in self.stage_documents.items():
+            missing = set(stage_paths) - known
+            if not stage.strip() or missing:
+                raise ValueError(
+                    f"invalid harness stage binding {stage!r}: unknown documents {sorted(missing)}"
+                )
+        return self
+
+
 class HarnessBundle(FrozenModel):
     schema_version: str = "1.0"
     harness_id: str = Field(min_length=1, max_length=200)
@@ -82,6 +113,7 @@ class HarnessRevision(FrozenModel):
     approval: ApprovalState = ApprovalState.DRAFT
     workflow_template_id: str | None = None
     workflow_revision: int | None = Field(default=None, ge=1)
+    runtime_manifest: H3HarnessManifest | None = None
     created_at: datetime
 
     @model_validator(mode="after")
@@ -178,6 +210,7 @@ class ProjectRunState(FrozenModel):
     pending_mode: ExecutionMode | None = None
     paused: bool = False
     outline_approved: bool = False
+    generation_revision: int = Field(default=0, ge=0)
     current_stage: str = Field(default="idea", min_length=1, max_length=100)
     review_policy: ReviewPolicy = Field(default_factory=ReviewPolicy)
     time_budget: TimeBudget | None = None
@@ -232,6 +265,15 @@ class BatchRun(FrozenModel):
     items: tuple[BatchRunItem, ...] = Field(min_length=1)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_members(self) -> BatchRun:
+        project_ids = [item.project_id for item in self.items]
+        if len(project_ids) != len(set(project_ids)):
+            raise ValueError("a project may appear only once in a batch")
+        if self.updated_at < self.created_at:
+            raise ValueError("batch updated_at cannot precede created_at")
+        return self
 
 
 class TaskCheckpoint(FrozenModel):

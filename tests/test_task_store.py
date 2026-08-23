@@ -4,6 +4,9 @@ import pytest
 
 from ai_video_generator.domain import (
     ArtifactState,
+    BatchRun,
+    BatchRunItem,
+    BatchState,
     ConditioningArtifact,
     ProjectSpec,
     TaskKind,
@@ -141,6 +144,46 @@ def test_submitted_comfy_prompt_is_reconciled_instead_of_resubmitted(
     assert store.list_unreconciled_comfyui_prompts() == ()
 
 
+def test_failed_comfy_task_retry_clears_old_prompt_and_starts_new_attempt(
+    store: SQLiteTaskStore,
+) -> None:
+    store.add_task(make_task("retry-comfy", state=TaskState.READY))
+    store.transition_task("retry-comfy", TaskState.QUEUED)
+    running = store.transition_task("retry-comfy", TaskState.RUNNING)
+    assert running.attempt == 1
+    store.record_comfyui_prompt("retry-comfy", "failed-prompt")
+    store.transition_task(
+        "retry-comfy",
+        TaskState.FAILED,
+        error_code="comfy_failed",
+        error_message="old failure",
+    )
+
+    ready = store.prepare_task_retry("retry-comfy")
+    assert ready.state == TaskState.READY
+    assert ready.comfyui_prompt_id is None
+    assert ready.error_code is None
+    assert ready.error_message is None
+    assert store.list_unreconciled_comfyui_prompts() == ()
+
+    store.transition_task("retry-comfy", TaskState.QUEUED)
+    retried = store.transition_task("retry-comfy", TaskState.RUNNING)
+    assert retried.attempt == 2
+    assert store.record_comfyui_prompt("retry-comfy", "new-prompt").prompt_id == "new-prompt"
+
+
+def test_manual_retry_reopens_exhausted_attempt_budget(store: SQLiteTaskStore) -> None:
+    store.add_task(make_task("retry-exhausted", state=TaskState.READY, max_attempts=1))
+    store.transition_task("retry-exhausted", TaskState.QUEUED)
+    store.transition_task("retry-exhausted", TaskState.RUNNING)
+    store.transition_task("retry-exhausted", TaskState.FAILED)
+
+    ready = store.prepare_task_retry("retry-exhausted")
+    assert ready.attempt == 0
+    store.transition_task("retry-exhausted", TaskState.QUEUED)
+    assert store.transition_task("retry-exhausted", TaskState.RUNNING).attempt == 1
+
+
 def test_success_promotes_dependant_and_stale_propagates(store: SQLiteTaskStore) -> None:
     first = make_task("a", state=TaskState.READY)
     second = make_task("b", depends_on=("a",))
@@ -203,6 +246,83 @@ def test_workflow_revisions_and_artifacts_are_immutable(store: SQLiteTaskStore) 
     assert store.get_workflow_revision("image", 1) == workflow
     assert store.put_artifact(artifact) == artifact
     assert store.get_artifact("conditioning-1") == artifact
+
+    assert store.delete_workflow_template("image") == 1
+    assert store.list_workflow_revisions("image") == ()
+
+
+def test_running_batch_can_atomically_attach_its_compiled_dag(
+    store: SQLiteTaskStore,
+) -> None:
+    planning = make_task("batch-plan", state=TaskState.RUNNING)
+    generated = make_task("h3-generated", state=TaskState.READY)
+    store.add_task(planning)
+    store.add_task(generated)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    batch = BatchRun(
+        batch_id="batch-expand",
+        name="Expansion",
+        state=BatchState.RUNNING,
+        items=(
+            BatchRunItem(project_id="project-1", task_ids=(planning.task_id,)),
+        ),
+        created_at=now,
+        updated_at=now,
+    )
+    store.put_batch_run(batch)
+
+    expanded = store.expand_running_batch_project_tasks(
+        batch_id=batch.batch_id,
+        project_id="project-1",
+        orchestration_task_id=planning.task_id,
+        task_ids=(generated.task_id,),
+        now=now + timedelta(seconds=1),
+    )
+
+    assert expanded.items[0].task_ids == (planning.task_id, generated.task_id)
+    assert store.list_batch_runs()[0] == expanded
+    with pytest.raises(StoreConflictError, match="another project"):
+        other = make_task("foreign-task").model_copy(update={"project_id": "project-2"})
+        store.add_task(other)
+        store.expand_running_batch_project_tasks(
+            batch_id=batch.batch_id,
+            project_id="project-1",
+            orchestration_task_id=planning.task_id,
+            task_ids=(other.task_id,),
+        )
+
+
+def test_clear_project_tasks_detaches_and_cancels_active_batches(store: SQLiteTaskStore) -> None:
+    task = make_task("clear-me", state=TaskState.READY)
+    store.add_task(task)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    batch = BatchRun(
+        batch_id="batch-clear",
+        name="Clear",
+        state=BatchState.RUNNING,
+        items=(BatchRunItem(project_id="project-1", task_ids=(task.task_id,)),),
+        created_at=now,
+        updated_at=now,
+    )
+    store.put_batch_run(batch)
+
+    assert store.clear_project_tasks("project-1") == 1
+    cleared = store.list_batch_runs()[0]
+    assert cleared.state == BatchState.CANCELLED
+    assert cleared.items[0].task_ids == ()
+    assert store.list_tasks(project_id="project-1") == ()
+
+
+def test_h3_translation_cache_is_scoped_by_prompt_hash(store: SQLiteTaskStore) -> None:
+    first = store.put_h3_prompt_translation("prompt-1", "a" * 64, "中文对照")
+
+    assert first == "中文对照"
+    assert store.get_h3_prompt_translation("prompt-1", "a" * 64) == "中文对照"
+    assert store.get_h3_prompt_translation("prompt-1", "b" * 64) is None
+    assert (
+        store.put_h3_prompt_translation("prompt-1", "a" * 64, "不会覆盖")
+        == "中文对照"
+    )
 
 
 def test_project_revisions_are_immutable_and_latest_is_selected(

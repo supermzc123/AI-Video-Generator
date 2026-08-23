@@ -89,6 +89,65 @@ async def test_cancel_only_interrupts_when_target_is_running() -> None:
 
 
 @pytest.mark.asyncio
+async def test_output_collection_retries_transient_transport_failure() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadTimeout("temporary output read timeout", request=request)
+        return httpx.Response(200, content=b"completed-video")
+
+    adapter = ComfyUIAdapter(None, "http://test", transport=httpx.MockTransport(handler))
+
+    output = await adapter.get_output_image("completed.mp4", subfolder="project")
+
+    assert output == b"completed-video"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_history_poll_retries_transient_read_timeout() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadTimeout("ComfyUI is busy", request=request)
+        return httpx.Response(200, json={"prompt-1": {"outputs": {}}})
+
+    adapter = ComfyUIAdapter(None, "http://test", transport=httpx.MockTransport(handler))
+
+    history = await adapter.get_history("prompt-1")
+
+    assert history == {"outputs": {}}
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_object_info_retries_transient_read_timeout() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ReadTimeout("ComfyUI is busy", request=request)
+        return httpx.Response(
+            200,
+            json={"CLIPTextEncode": {"input": {"required": {}}, "output": []}},
+        )
+
+    adapter = ComfyUIAdapter(None, "http://test", transport=httpx.MockTransport(handler))
+    info = await adapter.get_object_info()
+
+    assert tuple(info.nodes) == ("CLIPTextEncode",)
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
 async def test_prompt_validation_error_preserves_comfyui_node_details() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

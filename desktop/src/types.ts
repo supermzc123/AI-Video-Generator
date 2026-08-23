@@ -14,7 +14,6 @@ export type PipelineStageId =
   | "assets"
   | "prompts"
   | "generation"
-  | "review"
   | "delivery";
 
 export type OutlineBeat = {
@@ -31,12 +30,18 @@ export type ShotDraft = {
   camera: string;
   seed: number;
   durationSeconds: number;
+  motionSegments: Array<{
+    id: string;
+    durationSeconds: number;
+    summary: string;
+  }>;
   locked: boolean;
 };
 
 export type AssetKind = "character" | "scene" | "prop" | "style";
 export type AssetScope = "public" | "shot";
 export type AssetStatus = "ready" | "missing_blob" | "uploading" | "failed";
+export type AssetMediaKind = "image" | "video" | "audio";
 
 export type AssetDraft = {
   id: string;
@@ -44,8 +49,12 @@ export type AssetDraft = {
   originalFileName: string;
   sha256: string | null;
   mimeType: string | null;
+  mediaKind: AssetMediaKind;
   width: number | null;
   height: number | null;
+  durationSeconds?: number | null;
+  frameRate?: number | null;
+  hasAudio?: boolean | null;
   byteSize: number | null;
   kind: AssetKind;
   scope: AssetScope;
@@ -68,6 +77,7 @@ export type AssetPlan = {
   kind: AssetKind;
   scope: AssetScope;
   shotId: string | null;
+  shotIds: string[];
   fulfilledByAssetId: string | null;
   state: "draft" | "ready" | "satisfied" | "stale";
   width: number;
@@ -130,16 +140,35 @@ export type H3PromptRevision = {
   assetIds: string[];
   seed: number;
   harnessRevision: number | null;
+  harnessManifestSha256?: string | null;
+  route?: string | null;
+  assetRoles?: Array<Record<string, unknown>>;
+  assumptions?: string[];
+  stageTrace?: Array<{ stage: string; status: string; attempt?: number; findings?: string[] }>;
   locked: boolean;
   revision: number;
   legacy: boolean;
   review: PromptReviewResult;
 };
 
+export type H3PromptTranslation = {
+  prompt_revision_id: string;
+  source_sha256: string;
+  language: string;
+  translation: string;
+  executable: false;
+};
+
 export type PromptSet = {
   imagePrompts: ImagePromptRevision[];
   h3Prompts: H3PromptRevision[];
   generatedAt: string | null;
+  generationSummary?: {
+    total: number;
+    succeeded: number;
+    failed: number;
+    failedSegmentIds: string[];
+  };
 };
 
 export type PostProcessingSettings = {
@@ -150,6 +179,9 @@ export type PostProcessingSettings = {
   normalizeAudio: boolean;
   seedvr: {
     enabled: boolean;
+    workflowTemplateId?: string | null;
+    workflowRevision?: number | null;
+    upscaleFactor?: number | null;
     profileId: string | null;
     profileRevision: number | null;
     modelId: string | null;
@@ -169,9 +201,13 @@ export type PostProcessingSettings = {
     modelId: string | null;
     modelSha256: string | null;
     targetFps: 48 | 60 | 120;
+    workflowTemplateId?: string | null;
+    workflowRevision?: number | null;
   };
   whisper: {
     enabled: boolean;
+    workflowTemplateId?: string | null;
+    workflowRevision?: number | null;
     profileId: string | null;
     profileRevision: number | null;
     modelId: string | null;
@@ -196,8 +232,8 @@ export type ProjectDraft = {
   executionMode: "guided" | "batch";
   paused: boolean;
   reviewPolicy: {
-    configuredMode: "human_ai" | "ai_only" | "none";
-    effectiveMode: "human_ai" | "ai_only" | "none";
+    configuredMode: "human_ai" | "ai_only" | "manual" | "none";
+    effectiveMode: "human_ai" | "ai_only" | "manual" | "none";
     humanTimeoutSeconds: number;
     aiTakeoverAt: string | null;
   };
@@ -301,10 +337,11 @@ export type ProjectRunState = {
   pending_mode: "guided" | "batch" | null;
   paused: boolean;
   outline_approved: boolean;
+  generation_revision: number;
   current_stage: string;
   review_policy: {
-    configured_mode: "human_ai" | "ai_only" | "none";
-    effective_mode: "human_ai" | "ai_only" | "none";
+    configured_mode: "human_ai" | "ai_only" | "manual" | "none";
+    effective_mode: "human_ai" | "ai_only" | "manual" | "none";
     human_timeout_seconds: number;
     ai_takeover_at: string | null;
     takeover_reason: string | null;
@@ -343,7 +380,7 @@ export type HarnessBundle = {
 };
 
 export type HarnessRevision = {
-  schema_version: "1.0";
+  schema_version: "1.0" | "2.0";
   harness_id: string;
   revision: number;
   markdown: string;
@@ -404,7 +441,7 @@ export type Binding = {
   nodeId: string;
   inputName: string;
   title: string;
-  valueType: "string" | "integer" | "number" | "image_path";
+  valueType: "string" | "integer" | "number" | "image_path" | "video_path";
 };
 
 export type WorkflowBindingSemantic =
@@ -416,13 +453,19 @@ export type WorkflowBindingSemantic =
   | "cfg"
   | "seed"
   | "batch_size"
-  | "reference_image";
+  | "reference_image"
+  | "source_video"
+  | "model"
+  | "interpolation_factor"
+  | "upscale_factor"
+  | "language";
 
 export type WorkflowDraft = {
   fileName: string;
   nodes: ApiWorkflow;
   bindings: Binding[];
   outputNodeId: string | null;
+  kind?: "image" | "interpolation" | "restoration" | "transcription";
   inspection?: BackendInspection;
 };
 
@@ -459,7 +502,8 @@ export type WorkflowTemplateSummary = {
   revision: number;
   name: string;
   approval: "draft" | "needs_confirmation" | "approved" | "rejected";
-  built_in: boolean;
+  built_in?: boolean;
+  kind?: "image" | "interpolation" | "restoration" | "transcription";
 };
 
 export type ProjectExecutionStatus = {
@@ -470,6 +514,77 @@ export type ProjectExecutionStatus = {
   generation_complete: boolean;
   review_complete: boolean;
   delivery_complete: boolean;
+  batches: GenerationBatch[];
+  versions: SegmentGenerationVersion[];
+  rework_markers: ReworkMarker[];
+  hierarchy: Array<{
+    shot_id: string;
+    segments: Array<{
+      segment_id: string;
+      segment_index: number;
+      active_version: SegmentGenerationVersion | null;
+      versions: SegmentGenerationVersion[];
+      task: TaskSpec | null;
+      frozen: boolean;
+      freeze_reason: string | null;
+    }>;
+  }>;
+  active_chain_complete: boolean;
+  delivery_blocked_reason: string | null;
+};
+
+export type GenerationBatch = {
+  batch_id: string;
+  project_id: string;
+  kind: "initial" | "rework";
+  state: "preparing" | "sealed" | "running" | "completed" | "cancelled";
+  generation_number: number;
+  segment_ids: string[];
+  task_ids: string[];
+  encoding_task_ids: string[];
+  model_switch_task_id: string | null;
+  dispatch_requested: boolean;
+  sealed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SegmentGenerationVersion = {
+  version_id: string;
+  project_id: string;
+  shot_id: string;
+  segment_id: string;
+  runtime_segment_id: string;
+  segment_index: number;
+  generation_number: number;
+  batch_id: string;
+  task_id: string;
+  parent_version_id: string | null;
+  predecessor_version_id: string | null;
+  prompt_revision_id: string | null;
+  seed: number;
+  state: "planned" | "running" | "active" | "superseded" | "discarded";
+  artifact_id: string | null;
+  discard_reason: string | null;
+  created_at: string;
+  activated_at: string | null;
+};
+
+export type ReworkMarker = {
+  marker_id: string;
+  project_id: string;
+  shot_id: string;
+  segment_id: string;
+  segment_index: number;
+  source_version_id: string;
+  action: "retry" | "change_seed" | "revise_prompt";
+  feedback: string;
+  replacement_seed: number | null;
+  state: "draft" | "preparing" | "sealed" | "resolved" | "cancelled";
+  batch_id: string | null;
+  source: "human" | "ai";
+  created_at: string;
+  updated_at: string;
 };
 
 export type ArtifactDescriptor = {

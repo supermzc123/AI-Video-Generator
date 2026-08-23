@@ -10,6 +10,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ai_video_generator.domain.artifacts import ConditioningArtifact
+from ai_video_generator.domain.generation import (
+    GenerationBatch,
+    ReworkMarker,
+    SegmentGenerationVersion,
+)
 from ai_video_generator.domain.h3_workflow import H3WorkflowProfile
 from ai_video_generator.domain.orchestration import (
     BatchRun,
@@ -468,6 +473,15 @@ class SQLiteTaskStore:
                 CREATE INDEX IF NOT EXISTS idx_h3_prompts_segment
                     ON h3_prompt_revisions(project_id, segment_id, revision DESC);
 
+                CREATE TABLE IF NOT EXISTS h3_prompt_translations (
+                    prompt_revision_id TEXT NOT NULL,
+                    prompt_sha256 TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    translation TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(prompt_revision_id, prompt_sha256, language)
+                );
+
                 CREATE TABLE IF NOT EXISTS prompt_set_revisions (
                     prompt_set_id TEXT NOT NULL,
                     project_id TEXT NOT NULL,
@@ -492,6 +506,46 @@ class SQLiteTaskStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_project_time
                     ON stage_generation_checkpoints(project_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS generation_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    generation_number INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_generation_batches_project
+                    ON generation_batches(project_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS segment_generation_versions (
+                    version_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    generation_number INTEGER NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+                    state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_segment_active_version
+                    ON segment_generation_versions(project_id, segment_id)
+                    WHERE state = 'active';
+                CREATE INDEX IF NOT EXISTS idx_segment_versions_project
+                    ON segment_generation_versions(project_id, segment_id, generation_number DESC);
+                CREATE TABLE IF NOT EXISTS rework_markers (
+                    marker_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    shot_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    batch_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_rework_markers_project
+                    ON rework_markers(project_id, state, created_at);
                 """
             )
             task_columns = {
@@ -520,8 +574,119 @@ class SQLiteTaskStore:
                     "ALTER TABLE project_run_states ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
                 )
             connection.execute(
-                "UPDATE schema_metadata SET value = '4' WHERE key = 'schema_version'"
+                "UPDATE schema_metadata SET value = '5' WHERE key = 'schema_version'"
             )
+
+    def put_generation_batch(self, batch: GenerationBatch) -> GenerationBatch:
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO generation_batches(
+                    batch_id, project_id, state, generation_number, payload_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(batch_id) DO UPDATE SET state=excluded.state,
+                    payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                (
+                    batch.batch_id,
+                    batch.project_id,
+                    batch.state.value,
+                    batch.generation_number,
+                    batch.model_dump_json(),
+                    _timestamp(batch.created_at),
+                    _timestamp(batch.updated_at),
+                ),
+            )
+        return batch
+
+    def list_generation_batches(self, project_id: str) -> tuple[GenerationBatch, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM generation_batches "
+                "WHERE project_id=? ORDER BY created_at",
+                (project_id,),
+            ).fetchall()
+        return tuple(GenerationBatch.model_validate_json(row[0]) for row in rows)
+
+    def list_generation_batches_all(self) -> tuple[GenerationBatch, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM generation_batches ORDER BY created_at"
+            ).fetchall()
+        return tuple(GenerationBatch.model_validate_json(row[0]) for row in rows)
+
+    def put_segment_generation_version(
+        self, version: SegmentGenerationVersion
+    ) -> SegmentGenerationVersion:
+        with self._transaction(immediate=True) as connection:
+            if version.state.value == "active":
+                connection.execute(
+                    """UPDATE segment_generation_versions SET state='superseded',
+                       payload_json=json_set(payload_json, '$.state', 'superseded')
+                       WHERE project_id=? AND segment_id=? AND state='active'""",
+                    (version.project_id, version.segment_id),
+                )
+            connection.execute(
+                """INSERT INTO segment_generation_versions(
+                    version_id, project_id, segment_id, generation_number, task_id,
+                    state, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(version_id) DO UPDATE SET state=excluded.state,
+                    payload_json=excluded.payload_json""",
+                (
+                    version.version_id,
+                    version.project_id,
+                    version.segment_id,
+                    version.generation_number,
+                    version.task_id,
+                    version.state.value,
+                    version.model_dump_json(),
+                    _timestamp(version.created_at),
+                ),
+            )
+        return version
+
+    def list_segment_generation_versions(
+        self, project_id: str
+    ) -> tuple[SegmentGenerationVersion, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT payload_json FROM segment_generation_versions
+                   WHERE project_id=? ORDER BY created_at""",
+                (project_id,),
+            ).fetchall()
+        return tuple(SegmentGenerationVersion.model_validate_json(row[0]) for row in rows)
+
+    def put_rework_marker(self, marker: ReworkMarker) -> ReworkMarker:
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO rework_markers(
+                    marker_id, project_id, shot_id, segment_id, state, batch_id,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(marker_id) DO UPDATE SET state=excluded.state,
+                    batch_id=excluded.batch_id, payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    marker.marker_id,
+                    marker.project_id,
+                    marker.shot_id,
+                    marker.segment_id,
+                    marker.state.value,
+                    marker.batch_id,
+                    marker.model_dump_json(),
+                    _timestamp(marker.created_at),
+                    _timestamp(marker.updated_at),
+                ),
+            )
+        return marker
+
+    def list_rework_markers(self, project_id: str) -> tuple[ReworkMarker, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM rework_markers WHERE project_id=? ORDER BY created_at",
+                (project_id,),
+            ).fetchall()
+        return tuple(ReworkMarker.model_validate_json(row[0]) for row in rows)
 
     def journal_mode(self) -> str:
         with self._connect() as connection:
@@ -686,6 +851,146 @@ class SQLiteTaskStore:
                 ).fetchall()
             return tuple(self._task_from_row(connection, row) for row in rows)
 
+    def clear_project_tasks(self, project_id: str) -> int:
+        """Remove execution state while retaining project content and media."""
+        with self._transaction(immediate=True) as connection:
+            running = connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id=? AND state IN ('queued','running') LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if running is not None:
+                raise StoreConflictError("项目仍有正在执行的任务，请先取消后再清除")
+            self._detach_project_from_active_batches(connection, project_id)
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE project_id=?", (project_id,)
+                ).fetchone()[0]
+            )
+            connection.execute("DELETE FROM review_decisions WHERE project_id=?", (project_id,))
+            connection.execute("DELETE FROM rework_requests WHERE project_id=?", (project_id,))
+            connection.execute("DELETE FROM rework_markers WHERE project_id=?", (project_id,))
+            connection.execute("DELETE FROM generation_batches WHERE project_id=?", (project_id,))
+            connection.execute(
+                "DELETE FROM segment_generation_versions WHERE project_id=?", (project_id,)
+            )
+            connection.execute("DELETE FROM review_deadlines WHERE project_id=?", (project_id,))
+            connection.execute(
+                "DELETE FROM task_result_reports WHERE task_id IN "
+                "(SELECT task_id FROM tasks WHERE project_id=?)",
+                (project_id,),
+            )
+            connection.execute(
+                "DELETE FROM task_reviews WHERE task_id IN "
+                "(SELECT task_id FROM tasks WHERE project_id=?)",
+                (project_id,),
+            )
+            connection.execute(
+                "UPDATE artifacts SET producer_task_id=NULL WHERE producer_task_id IN "
+                "(SELECT task_id FROM tasks WHERE project_id=?)",
+                (project_id,),
+            )
+            connection.execute(
+                "DELETE FROM task_dependencies WHERE task_id IN "
+                "(SELECT task_id FROM tasks WHERE project_id=?) OR dependency_task_id IN "
+                "(SELECT task_id FROM tasks WHERE project_id=?)",
+                (project_id, project_id),
+            )
+            connection.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
+            return count
+
+    def _detach_project_from_active_batches(
+        self, connection: sqlite3.Connection, project_id: str
+    ) -> None:
+        """Detach a project while clearing tasks, inside the same transaction."""
+        rows = connection.execute(
+            "SELECT batch_id, payload_json, state FROM batch_runs "
+            "WHERE state IN ('draft', 'running', 'paused')"
+        ).fetchall()
+        now = _timestamp(_utc_now())
+        for row in rows:
+            batch = BatchRun.model_validate_json(row["payload_json"])
+            if not any(item.project_id == project_id for item in batch.items):
+                continue
+            remaining = tuple(item for item in batch.items if item.project_id != project_id)
+            if remaining:
+                updated = batch.model_copy(update={"items": remaining, "updated_at": _utc_now()})
+            else:
+                # Keep one empty audit member because BatchRun requires a non-empty tuple.
+                detached = next(item for item in batch.items if item.project_id == project_id)
+                updated = batch.model_copy(
+                    update={
+                        "state": BatchState.CANCELLED,
+                        "items": (detached.model_copy(update={"task_ids": ()}),),
+                        "updated_at": _utc_now(),
+                    }
+                )
+            connection.execute(
+                "UPDATE batch_runs SET state=?, payload_json=?, updated_at=? WHERE batch_id=?",
+                (
+                    updated.state.value,
+                    updated.model_dump_json(),
+                    now,
+                    row["batch_id"],
+                ),
+            )
+
+    def delete_project(self, project_id: str) -> int:
+        """Delete project records; content-addressed media files remain recoverable."""
+        removed = self.clear_project_tasks(project_id)
+        with self._transaction(immediate=True) as connection:
+            event_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT event_id FROM project_memory_events WHERE project_id=?", (project_id,)
+                ).fetchall()
+            ]
+            prompt_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT prompt_revision_id FROM h3_prompt_revisions WHERE project_id=?",
+                    (project_id,),
+                ).fetchall()
+            ]
+            if event_ids:
+                connection.executemany(
+                    "DELETE FROM project_memory_fts WHERE event_id=?",
+                    ((item,) for item in event_ids),
+                )
+            if prompt_ids:
+                connection.executemany(
+                    "DELETE FROM h3_prompt_translations WHERE prompt_revision_id=?",
+                    ((item,) for item in prompt_ids),
+                )
+            for table in (
+                "asset_candidate_acceptance_claims",
+                "asset_generation_candidates",
+                "stage_generation_checkpoints",
+                "prompt_set_revisions",
+                "h3_prompt_revisions",
+                "image_prompt_revisions",
+                "asset_plan_revisions",
+                "project_asset_revisions",
+                "decision_ledger",
+                "project_memory_events",
+                "project_run_states",
+                "project_workspace_revisions",
+                "project_revisions",
+            ):
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if exists is None:
+                    continue
+                if table == "asset_candidate_acceptance_claims":
+                    connection.execute(
+                        "DELETE FROM asset_candidate_acceptance_claims WHERE candidate_id IN "
+                        "(SELECT candidate_id FROM asset_generation_candidates WHERE project_id=?)",
+                        (project_id,),
+                    )
+                else:
+                    connection.execute(f"DELETE FROM {table} WHERE project_id=?", (project_id,))
+        return removed
+
     def set_task_priority(self, task_id: str, priority: int) -> TaskSpec:
         if priority < -100 or priority > 100:
             raise ValueError("task priority must be between -100 and 100")
@@ -721,9 +1026,7 @@ class SQLiteTaskStore:
                     raise StoreConflictError("task already has a different review decision")
                 # Clean up deadlines left by versions that did not resolve them
                 # atomically with the human decision.
-                connection.execute(
-                    "DELETE FROM review_deadlines WHERE task_id = ?", (task_id,)
-                )
+                connection.execute("DELETE FROM review_deadlines WHERE task_id = ?", (task_id,))
                 return self._task_from_row(connection, row)
 
             current = TaskState(row["state"])
@@ -757,9 +1060,7 @@ class SQLiteTaskStore:
                     task_id,
                 ),
             )
-            connection.execute(
-                "DELETE FROM review_deadlines WHERE task_id = ?", (task_id,)
-            )
+            connection.execute("DELETE FROM review_deadlines WHERE task_id = ?", (task_id,))
             if accepted:
                 self._promote_ready_tasks(connection, changed_at)
             updated = self._require_task_row(connection, task_id)
@@ -877,18 +1178,22 @@ class SQLiteTaskStore:
                 raise InvalidTaskTransitionError("a task cannot succeed before its dependencies")
             if state == TaskState.READY:
                 self._assert_can_be_ready(connection, row)
+            if state == TaskState.RUNNING and int(row["attempt"]) >= int(row["max_attempts"]):
+                raise InvalidTaskTransitionError("task has exhausted its attempts")
 
             clear_lease = state != TaskState.RUNNING
+            increment_attempt = int(state == TaskState.RUNNING)
             connection.execute(
                 """
                 UPDATE tasks
                 SET state = ?, lease_expires_at = CASE WHEN ? THEN NULL ELSE lease_expires_at END,
-                    error_code = ?, error_message = ?, updated_at = ?
+                    attempt = attempt + ?, error_code = ?, error_message = ?, updated_at = ?
                 WHERE task_id = ?
                 """,
                 (
                     state.value,
                     int(clear_lease),
+                    increment_attempt,
                     error_code,
                     error_message,
                     _timestamp(changed_at),
@@ -897,6 +1202,44 @@ class SQLiteTaskStore:
             )
             if state == TaskState.SUCCEEDED:
                 self._promote_ready_tasks(connection, changed_at)
+            return self._task_from_row(connection, self._require_task_row(connection, task_id))
+
+    def prepare_task_retry(self, task_id: str, *, now: datetime | None = None) -> TaskSpec:
+        """Reset a failed task, retaining a completed job when only collection failed."""
+        changed_at = _ensure_utc(now or _utc_now())
+        with self._transaction(immediate=True) as connection:
+            row = self._require_task_row(connection, task_id)
+            current = TaskState(row["state"])
+            if current not in {TaskState.FAILED, TaskState.STALE, TaskState.PAUSED}:
+                raise InvalidTaskTransitionError(f"task {task_id} is not at a retryable boundary")
+            if not self._dependencies_succeeded(connection, task_id):
+                raise InvalidTaskTransitionError("task dependencies have not succeeded")
+
+            # Collection is a resumable boundary: ComfyUI has already completed
+            # successfully, so retrying must read that job instead of running it again.
+            transport_timeout = str(row["error_message"] or "").strip() in {
+                "ReadTimeout",
+                "ConnectTimeout",
+                "PoolTimeout",
+                "WriteTimeout",
+            }
+            retain_comfyui_job = row["error_code"] == "local_output_collection_failed" or (
+                bool(row["comfyui_prompt_id"]) and transport_timeout
+            )
+            attempt = min(int(row["attempt"]), int(row["max_attempts"]) - 1)
+            if not retain_comfyui_job:
+                connection.execute("DELETE FROM comfyui_prompts WHERE task_id = ?", (task_id,))
+            connection.execute(
+                """
+                UPDATE tasks
+                SET state = 'ready', attempt = ?, lease_expires_at = NULL,
+                    comfyui_prompt_id = CASE WHEN ? THEN comfyui_prompt_id ELSE NULL END,
+                    error_code = NULL, error_message = NULL,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (attempt, int(retain_comfyui_job), _timestamp(changed_at), task_id),
+            )
             return self._task_from_row(connection, self._require_task_row(connection, task_id))
 
     def refresh_ready_tasks(self, *, now: datetime | None = None) -> tuple[str, ...]:
@@ -1440,6 +1783,40 @@ class SQLiteTaskStore:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(WorkflowTemplate.model_validate_json(row["payload_json"]) for row in rows)
 
+    def delete_workflow_template(self, template_id: str) -> int:
+        """Delete every revision and the template-owned prompting harness."""
+        with self._transaction(immediate=True) as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM workflow_revisions WHERE template_id=?",
+                (template_id,),
+            ).fetchall()
+            if not rows:
+                raise KeyError(template_id)
+            harness_ids = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT harness_id FROM harness_revisions "
+                    "WHERE workflow_template_id=?",
+                    (template_id,),
+                ).fetchall()
+            )
+            connection.execute(
+                "DELETE FROM harness_revisions WHERE workflow_template_id=?", (template_id,)
+            )
+            for harness_id in harness_ids:
+                remaining = connection.execute(
+                    "SELECT 1 FROM harness_revisions WHERE harness_id=? LIMIT 1",
+                    (harness_id,),
+                ).fetchone()
+                if remaining is None:
+                    connection.execute(
+                        "DELETE FROM harness_bundles WHERE harness_id=?", (harness_id,)
+                    )
+            connection.execute(
+                "DELETE FROM workflow_revisions WHERE template_id=?", (template_id,)
+            )
+            return len(rows)
+
     def put_h3_workflow_profile_revision(
         self,
         profile: H3WorkflowProfile,
@@ -1645,8 +2022,7 @@ class SQLiteTaskStore:
                 (project_id,),
             ).fetchall()
         return tuple(
-            ProjectWorkspaceRevision.model_validate_json(row["payload_json"])
-            for row in rows
+            ProjectWorkspaceRevision.model_validate_json(row["payload_json"]) for row in rows
         )
 
     def put_project_run_state(self, state: ProjectRunState) -> ProjectRunState:
@@ -1677,9 +2053,29 @@ class SQLiteTaskStore:
             row = connection.execute(
                 "SELECT payload_json FROM project_run_states WHERE project_id = ?", (project_id,)
             ).fetchone()
+            workspace_row = connection.execute(
+                "SELECT payload_json FROM project_workspace_revisions "
+                "WHERE project_id = ? ORDER BY revision DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(project_id)
-        return ProjectRunState.model_validate_json(row["payload_json"])
+        state = ProjectRunState.model_validate_json(row["payload_json"])
+        if workspace_row is None:
+            return state
+        workspace = ProjectWorkspaceRevision.model_validate_json(
+            workspace_row["payload_json"]
+        ).payload
+        approvals = workspace.get("stageApprovals")
+        active_stage = workspace.get("activeStage")
+        update: dict[str, object] = {}
+        if isinstance(approvals, dict):
+            update["outline_approved"] = "outline" in approvals
+        if isinstance(active_stage, str) and active_stage:
+            update["current_stage"] = (
+                "generation" if active_stage == "review" else active_stage
+            )
+        return state.model_copy(update=update) if update else state
 
     def request_project_mode(
         self, project_id: str, mode: ExecutionMode, *, now: datetime | None = None
@@ -1953,6 +2349,57 @@ class SQLiteTaskStore:
             ).fetchall()
         return tuple(BatchRun.model_validate_json(row["payload_json"]) for row in rows)
 
+    def expand_running_batch_project_tasks(
+        self,
+        *,
+        batch_id: str,
+        project_id: str,
+        orchestration_task_id: str,
+        task_ids: tuple[str, ...],
+        now: datetime | None = None,
+    ) -> BatchRun:
+        """Atomically attach a DAG produced by a batch orchestration task."""
+        changed_at = _ensure_utc(now or _utc_now())
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM batch_runs WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreConflictError(f"batch {batch_id} does not exist")
+            batch = BatchRun.model_validate_json(row["payload_json"])
+            if batch.state != BatchState.RUNNING:
+                raise StoreConflictError("only a running batch can expand compiled tasks")
+            item = next((value for value in batch.items if value.project_id == project_id), None)
+            if item is None or orchestration_task_id not in item.task_ids:
+                raise StoreConflictError("batch project does not contain the orchestration task")
+            expanded_ids = tuple(dict.fromkeys((orchestration_task_id, *task_ids)))
+            if expanded_ids:
+                placeholders = ",".join("?" for _ in expanded_ids)
+                rows = connection.execute(
+                    f"SELECT task_id, project_id FROM tasks WHERE task_id IN ({placeholders})",
+                    expanded_ids,
+                ).fetchall()
+                found = {str(value["task_id"]): str(value["project_id"]) for value in rows}
+                missing = set(expanded_ids) - set(found)
+                if missing:
+                    raise StoreConflictError(
+                        f"compiled batch tasks do not exist: {', '.join(sorted(missing))}"
+                    )
+                if any(value != project_id for value in found.values()):
+                    raise StoreConflictError("compiled batch tasks belong to another project")
+            items = tuple(
+                value.model_copy(update={"task_ids": expanded_ids})
+                if value.project_id == project_id
+                else value
+                for value in batch.items
+            )
+            updated = batch.model_copy(update={"items": items, "updated_at": changed_at})
+            connection.execute(
+                "UPDATE batch_runs SET payload_json = ?, updated_at = ? WHERE batch_id = ?",
+                (updated.model_dump_json(), _timestamp(changed_at), batch_id),
+            )
+        return updated
+
     def replace_active_batch_tasks_for_rework(
         self,
         *,
@@ -1988,9 +2435,7 @@ class SQLiteTaskStore:
                     changed = True
                 if not changed:
                     continue
-                updated = batch.model_copy(
-                    update={"items": tuple(items), "updated_at": changed_at}
-                )
+                updated = batch.model_copy(update={"items": tuple(items), "updated_at": changed_at})
                 connection.execute(
                     "UPDATE batch_runs SET payload_json = ?, updated_at = ? WHERE batch_id = ?",
                     (updated.model_dump_json(), _timestamp(changed_at), updated.batch_id),
@@ -2063,9 +2508,7 @@ class SQLiteTaskStore:
                     ai_takeover_at=changed_at,
                     takeover_reason=f"human review timed out at task {row['task_id']}",
                 )
-                state = state.model_copy(
-                    update={"review_policy": policy, "updated_at": changed_at}
-                )
+                state = state.model_copy(update={"review_policy": policy, "updated_at": changed_at})
                 connection.execute(
                     """
                     UPDATE project_run_states
@@ -2422,6 +2865,44 @@ class SQLiteTaskStore:
             revision=revision,
             model=H3PromptRevision,
         )
+
+    def get_h3_prompt_translation(
+        self, prompt_revision_id: str, prompt_sha256: str, language: str = "zh-CN"
+    ) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT translation FROM h3_prompt_translations "
+                "WHERE prompt_revision_id = ? AND prompt_sha256 = ? AND language = ?",
+                (prompt_revision_id, prompt_sha256, language),
+            ).fetchone()
+        return str(row["translation"]) if row is not None else None
+
+    def put_h3_prompt_translation(
+        self,
+        prompt_revision_id: str,
+        prompt_sha256: str,
+        translation: str,
+        language: str = "zh-CN",
+    ) -> str:
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO h3_prompt_translations("
+                "prompt_revision_id, prompt_sha256, language, translation, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    prompt_revision_id,
+                    prompt_sha256,
+                    language,
+                    translation,
+                    _timestamp(datetime.now(UTC)),
+                ),
+            )
+            row = connection.execute(
+                "SELECT translation FROM h3_prompt_translations "
+                "WHERE prompt_revision_id = ? AND prompt_sha256 = ? AND language = ?",
+                (prompt_revision_id, prompt_sha256, language),
+            ).fetchone()
+        return str(row["translation"])
 
     def put_prompt_set(self, prompt_set: PromptSet) -> PromptSet:
         return self._put_immutable_revision(

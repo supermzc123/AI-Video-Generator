@@ -18,6 +18,8 @@ import type {
   ArtifactDescriptor,
   ReviewDecision,
   ReworkRequest,
+  ReworkMarker,
+  GenerationBatch,
   AssetGenerationCandidate,
   SetupStatus,
   PostProcessingCapabilities,
@@ -67,6 +69,81 @@ async function requestForm<T>(path: string, body: FormData): Promise<T> {
   return (await response.json()) as T;
 }
 
+async function requestEventStream<T>(
+  path: string,
+  options: {
+    body?: unknown;
+    signal?: AbortSignal;
+    onDelta: (delta: string) => void;
+    parseResult: (value: unknown) => T;
+    errorMessage: string;
+  },
+): Promise<T> {
+  const origin = await resolveApiOrigin();
+  const response = await fetch(`${origin}${path}`, {
+    method: "POST",
+    headers: {
+      Accept: "text/event-stream",
+      ...(options.body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: options.signal,
+  });
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(() => null) as { detail?: unknown } | null;
+    const detail = payload?.detail;
+    const message = typeof detail === "string" ? detail : detail === undefined ? "" : JSON.stringify(detail);
+    throw new ApiError(response.status, message || `${options.errorMessage}：${response.status} ${response.statusText}`, detail);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completed = false;
+  let result: T;
+  const handleEvent = (block: string) => {
+    const lines = block.replace(/\r\n/g, "\n").split("\n");
+    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+    const data = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!event || !data || data === "[DONE]") return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data) as unknown;
+    } catch {
+      throw new ApiError(502, `${options.errorMessage}返回了无效 JSON`, data);
+    }
+    if (event === "delta" && typeof parsed === "string") options.onDelta(parsed);
+    if (event === "result") {
+      result = options.parseResult(parsed);
+      completed = true;
+    }
+    if (event === "error") {
+      const error = isRecord(parsed) ? parsed : {};
+      const status = typeof error.status === "number" ? error.status : 500;
+      const detail = error.detail;
+      const message = typeof detail === "string" ? detail : JSON.stringify(detail);
+      throw new ApiError(status, message || options.errorMessage, detail);
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+    const events = buffer.split("\n\n");
+    buffer = events.pop() ?? "";
+    events.forEach(handleEvent);
+    if (done) {
+      if (buffer.trim()) handleEvent(buffer);
+      break;
+    }
+  }
+  if (!completed) throw new ApiError(502, `${options.errorMessage}结束但没有返回结果`, null);
+  return result!;
+}
+
 type BackendProjectAsset = {
   asset_id: string;
   name: string;
@@ -75,8 +152,12 @@ type BackendProjectAsset = {
   sha256?: string | null;
   blob_sha256?: string | null;
   mime_type: string | null;
+  media_kind?: AssetDraft["mediaKind"];
   width: number | null;
   height: number | null;
+  duration_seconds?: number | null;
+  frame_rate?: number | null;
+  has_audio?: boolean | null;
   byte_size: number | null;
   kind?: AssetDraft["kind"];
   purpose?: "reference" | "character" | "scene" | "prop" | "style" | "keyframe";
@@ -95,8 +176,12 @@ function mapProjectAsset(asset: BackendProjectAsset): AssetDraft {
     originalFileName: asset.original_file_name ?? asset.original_name ?? asset.name,
     sha256: asset.sha256 ?? asset.blob_sha256 ?? null,
     mimeType: asset.mime_type,
+    mediaKind: asset.media_kind ?? (asset.mime_type?.startsWith("video/") ? "video" : asset.mime_type?.startsWith("audio/") ? "audio" : "image"),
     width: asset.width,
     height: asset.height,
+    durationSeconds: asset.duration_seconds ?? null,
+    frameRate: asset.frame_rate ?? null,
+    hasAudio: asset.has_audio ?? null,
     byteSize: asset.byte_size,
     kind: asset.kind ?? (asset.purpose === "reference" || asset.purpose === "keyframe" ? "character" : asset.purpose ?? "character"),
     scope: asset.scope === "common" ? "public" : asset.scope,
@@ -109,6 +194,10 @@ function mapProjectAsset(asset: BackendProjectAsset): AssetDraft {
 
 export function projectAssetPreviewUrl(projectId: string, assetId: string): string {
   return `${apiOrigin}/api/v1/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/preview`;
+}
+
+export function projectAssetMediaUrl(projectId: string, assetId: string): string {
+  return `${apiOrigin}/api/v1/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/media`;
 }
 
 export function artifactMediaUrl(artifact: ArtifactDescriptor): string {
@@ -186,6 +275,36 @@ export async function regenerateH3Prompt(
   return response.payload;
 }
 
+export async function streamRegenerateH3Prompt(
+  projectId: string,
+  segmentId: string,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal,
+): Promise<ProjectDraft> {
+  return requestEventStream(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/h3/${encodeURIComponent(segmentId)}/regenerate/stream`,
+    {
+      signal,
+      onDelta,
+      errorMessage: "H3 流式生成失败",
+      parseResult: (value) => {
+        if (!isRecord(value) || !isRecord(value.payload)) throw new ApiError(502, "H3 最终结果缺少项目数据", value);
+        return value.payload as ProjectDraft;
+      },
+    },
+  );
+}
+
+export function translateH3Prompt(
+  projectId: string,
+  promptRevisionId: string,
+): Promise<import("./types").H3PromptTranslation> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/h3/${encodeURIComponent(promptRevisionId)}/translate`,
+    { method: "POST" },
+  );
+}
+
 export async function generateImagePrompt(
   projectId: string,
   assetPlanId: string,
@@ -197,6 +316,29 @@ export async function generateImagePrompt(
     { method: "POST", body: JSON.stringify({ instruction, workflow_template_id: workflowTemplateId }) },
   );
   return response.payload;
+}
+
+export async function streamGenerateImagePrompt(
+  projectId: string,
+  assetPlanId: string,
+  instruction: string | null,
+  workflowTemplateId: string | null,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal,
+): Promise<ProjectDraft> {
+  return requestEventStream(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/images/${encodeURIComponent(assetPlanId)}/generate/stream`,
+    {
+      body: { instruction, workflow_template_id: workflowTemplateId },
+      signal,
+      onDelta,
+      errorMessage: "图片提示词流式生成失败",
+      parseResult: (value) => {
+        if (!isRecord(value) || !isRecord(value.payload)) throw new ApiError(502, "图片提示词最终结果缺少项目数据", value);
+        return value.payload as ProjectDraft;
+      },
+    },
+  );
 }
 
 export function runProjectImagePrompt(projectId: string, assetPlanId: string): Promise<TaskSpec> {
@@ -279,6 +421,7 @@ export type RuntimeSettings = {
   llmModel: string;
   llmApiKeyConfigured: boolean;
   llmTimeoutSeconds: number;
+  llmFirstTokenTimeoutSeconds: number;
   llmVideoCapable: boolean;
   networkProxy: string;
   h3DiffusionModel: string;
@@ -312,6 +455,7 @@ type BackendRuntimeSettings = {
   llm_model: string | null;
   llm_api_key_configured: boolean;
   llm_timeout_seconds: number;
+  llm_first_token_timeout_seconds: number;
   llm_video_capable: boolean;
   network_proxy: string | null;
   h3_diffusion_model: string;
@@ -334,6 +478,7 @@ function mapRuntimeSettings(value: BackendRuntimeSettings): RuntimeSettings {
     llmModel: value.llm_model ?? "",
     llmApiKeyConfigured: value.llm_api_key_configured,
     llmTimeoutSeconds: value.llm_timeout_seconds,
+    llmFirstTokenTimeoutSeconds: value.llm_first_token_timeout_seconds ?? value.llm_timeout_seconds,
     llmVideoCapable: value.llm_video_capable ?? false,
     networkProxy: value.network_proxy ?? "",
     h3DiffusionModel: value.h3_diffusion_model,
@@ -378,6 +523,7 @@ export async function updateRuntimeSettings(
       ...(apiKey ? { llm_api_key: apiKey } : {}),
       clear_llm_api_key: clearApiKey,
       llm_timeout_seconds: settings.llmTimeoutSeconds,
+      llm_first_token_timeout_seconds: settings.llmFirstTokenTimeoutSeconds,
       llm_video_capable: settings.llmVideoCapable,
       network_proxy: settings.networkProxy.trim() || null,
       h3_diffusion_model: settings.h3DiffusionModel,
@@ -425,18 +571,76 @@ export function createTask(task: TaskSpec): Promise<TaskSpec> {
   return requestJson("/api/v1/tasks", { method: "POST", body: JSON.stringify(task) });
 }
 
-export function compileProjectTasks(projectId: string): Promise<{
+export function compileProjectTasks(projectId: string, restartH3 = false): Promise<{
   fingerprint: string;
   workspace_revision: number;
+  h3_execution_profile: {
+    generation_revision: number;
+    diffusion_model: string;
+    turbo_enabled: boolean;
+    steps: number;
+  } | null;
   tasks: TaskSpec[];
 }> {
-  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/tasks/compile`, {
+  const query = restartH3 ? "?restart_h3=true" : "";
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/tasks/compile${query}`, {
     method: "POST",
   });
 }
 
+export function compileProjectDeliveryTasks(projectId: string): Promise<{
+  fingerprint: string;
+  workspace_revision: number;
+  tasks: TaskSpec[];
+}> {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/delivery/tasks/compile`, { method: "POST" });
+}
+
+export function clearProjectTasks(projectId: string): Promise<{ removed_tasks: number; media_retained: boolean }> {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/tasks/clear`, { method: "POST" });
+}
+
+export function deleteProject(projectId: string): Promise<{ deleted: boolean; removed_tasks: number; media_files_retained: boolean }> {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" });
+}
+
 export function getProjectExecutionStatus(projectId: string): Promise<ProjectExecutionStatus> {
   return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/execution-status`);
+}
+
+export function startProjectGeneration(projectId: string): Promise<GenerationBatch> {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/generation/start`, {
+    method: "POST",
+  });
+}
+
+export function createReworkMarker(
+  projectId: string,
+  request: {
+    version_id: string;
+    action: ReworkMarker["action"];
+    feedback: string;
+    replacement_seed: number | null;
+    source?: "human" | "ai";
+  },
+): Promise<ReworkMarker> {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/rework-markers`, {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export function withdrawReworkMarker(projectId: string, markerId: string): Promise<ReworkMarker> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/rework-markers/${encodeURIComponent(markerId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function confirmProjectReworks(projectId: string): Promise<GenerationBatch> {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/rework-markers/confirm`, {
+    method: "POST",
+  });
 }
 
 export function cancelTask(taskId: string): Promise<TaskSpec> {
@@ -569,7 +773,7 @@ export function setProjectPaused(projectId: string, paused: boolean): Promise<Pr
 
 export function setReviewMode(
   projectId: string,
-  mode: "human_ai" | "ai_only" | "none",
+  mode: "human_ai" | "ai_only" | "manual" | "none",
   humanTimeoutSeconds: number,
 ): Promise<ProjectRunState> {
   return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/review-policy`, {
@@ -584,6 +788,7 @@ export function requestProjectAgentProposal(
     operationId: string;
     operation: string;
     instruction: string;
+    displayInstruction?: string;
     allowedPaths: string[];
     lockedPaths: string[];
   },
@@ -599,6 +804,7 @@ export function requestProjectAgentProposal(
       operation_id: request.operationId,
       operation: request.operation,
       instruction: request.instruction,
+      display_instruction: request.displayInstruction,
       allowed_paths: request.allowedPaths,
       locked_paths: request.lockedPaths,
       commit: false,
@@ -612,6 +818,7 @@ export async function streamProjectAgentProposal(
     operationId: string;
     operation: string;
     instruction: string;
+    displayInstruction?: string;
     allowedPaths: string[];
     lockedPaths: string[];
   },
@@ -622,69 +829,23 @@ export async function streamProjectAgentProposal(
   output_sha256: string;
   committed_revision: number | null;
 }> {
-  const origin = await resolveApiOrigin();
-  const response = await (isTauri ? tauriFetch : fetch)(
-    `${origin}/api/v1/projects/${encodeURIComponent(projectId)}/agent/operate/stream`,
+  return requestEventStream(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/agent/operate/stream`,
     {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({
+      body: {
         operation_id: request.operationId,
         operation: request.operation,
         instruction: request.instruction,
+        display_instruction: request.displayInstruction,
         allowed_paths: request.allowedPaths,
         locked_paths: request.lockedPaths,
         commit: false,
-      }),
+      },
+      onDelta,
+      errorMessage: "LLM 流式请求失败",
+      parseResult: normalizeAgentStreamResult,
     },
   );
-  if (!response.ok || !response.body) {
-    throw new ApiError(response.status, `LLM 流式请求失败：${response.status} ${response.statusText}`, null);
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let result: Awaited<ReturnType<typeof requestProjectAgentProposal>> | null = null;
-  const handleEvent = (block: string) => {
-    const normalized = block.replace(/\r\n/g, "\n");
-    const lines = normalized.split("\n");
-    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
-    const dataLines = lines
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart());
-    if (!event || !dataLines.length) return;
-    const data = dataLines.join("\n");
-    if (data === "[DONE]") return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(data) as unknown;
-    } catch {
-      throw new ApiError(502, "LLM 流返回了无效 JSON", data);
-    }
-    if (event === "delta" && typeof parsed === "string") onDelta(parsed);
-    if (event === "result") result = normalizeAgentStreamResult(parsed);
-    if (event === "error") {
-      const error = isRecord(parsed) ? parsed : {};
-      const status = typeof error.status === "number" ? error.status : 500;
-      const detail = error.detail;
-      const message = typeof detail === "string" ? detail : JSON.stringify(detail);
-      throw new ApiError(status, message || "LLM 流式生成失败", detail);
-    }
-  };
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    buffer = buffer.replace(/\r\n/g, "\n");
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
-    for (const block of events) handleEvent(block);
-    if (done) {
-      if (buffer.trim()) handleEvent(buffer);
-      break;
-    }
-  }
-  if (!result) throw new ApiError(502, "LLM 流结束但没有返回可应用结果", null);
-  return result;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -784,6 +945,8 @@ export function suggestWorkflowBindings(
   workflowId: string,
   rawWorkflow: ApiWorkflow,
   project: ProjectDraft,
+  requestedSemantics?: string[],
+  instructions?: string,
 ): Promise<{ bindings: BackendInspection["bindings"] }> {
   return requestJson("/api/v1/llm/workflows/map", {
     method: "POST",
@@ -801,6 +964,8 @@ export function suggestWorkflowBindings(
         audio_policy: project.audioPolicy,
       },
       raw_workflow: rawWorkflow,
+      requested_semantics: requestedSemantics,
+      instructions,
     }),
   });
 }
@@ -814,4 +979,13 @@ export function registerWorkflow(template: Record<string, unknown>): Promise<unk
 
 export function listWorkflowTemplates(): Promise<WorkflowTemplateSummary[]> {
   return requestJson("/api/v1/workflows/templates");
+}
+
+export function deleteWorkflowTemplate(templateId: string): Promise<{
+  deleted: boolean;
+  removed_revisions: number;
+}> {
+  return requestJson(`/api/v1/workflows/templates/${encodeURIComponent(templateId)}`, {
+    method: "DELETE",
+  });
 }

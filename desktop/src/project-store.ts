@@ -74,9 +74,9 @@ export function newProject(): ProjectDraft {
       outputHeight: 608,
       crf: 18,
       normalizeAudio: true,
-      seedvr: { enabled: false, profileId: null, profileRevision: null, modelId: null, modelSha256: null, vaeId: null, vaeSha256: null, steps: 4, processingWidth: 1280, processingHeight: 720, previewSeconds: 1, previewApproved: false },
-      rife: { enabled: false, profileId: null, profileRevision: null, modelId: null, modelSha256: null, targetFps: 48 },
-      whisper: { enabled: false, profileId: null, profileRevision: null, modelId: null, modelSha256: null, device: "auto", precision: "auto", language: "zh", burnIn: false },
+      seedvr: { enabled: false, workflowTemplateId: null, workflowRevision: null, upscaleFactor: null, profileId: null, profileRevision: null, modelId: null, modelSha256: null, vaeId: null, vaeSha256: null, steps: 4, processingWidth: 1280, processingHeight: 720, previewSeconds: 1, previewApproved: false },
+      rife: { enabled: false, profileId: null, profileRevision: null, modelId: null, modelSha256: null, targetFps: 48, workflowTemplateId: null, workflowRevision: null },
+      whisper: { enabled: false, workflowTemplateId: null, workflowRevision: null, profileId: null, profileRevision: null, modelId: null, modelSha256: null, device: "auto", precision: "auto", language: "zh", burnIn: false },
     },
     updatedAt: new Date().toISOString(),
   };
@@ -108,6 +108,7 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
   const hydrated: ProjectDraft = {
     ...defaults,
     ...value,
+    activeStage: (value.activeStage as string) === "review" ? "generation" : value.activeStage ?? defaults.activeStage,
     idea: {
       ...defaults.idea,
       ...value.idea,
@@ -116,7 +117,12 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         nodes: hydratedConceptNodes.length ? hydratedConceptNodes : [{ type: "text" as const, text: concept }],
       },
     },
-    stageApprovals: { ...value.stageApprovals },
+    stageApprovals: {
+      ...value.stageApprovals,
+      ...((value.stageApprovals as Record<string, string> | undefined)?.review
+        ? { generation: (value.stageApprovals as Record<string, string>).review }
+        : {}),
+    },
     outline: rawOutline.map<ProjectDraft["outline"][number]>((item, index) => {
       const beat = record(item);
       return {
@@ -136,6 +142,14 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         camera: text(shot.camera) || "固定机位",
         seed: typeof shot.seed === "number" && Number.isInteger(shot.seed) && shot.seed >= 0 ? shot.seed : 0,
         durationSeconds: positiveNumber(shot.durationSeconds, shot.targetDurationSeconds) ?? 1,
+        motionSegments: (Array.isArray(shot.motionSegments) ? shot.motionSegments : []).map((segment, segmentIndex) => {
+          const motionSegment = record(segment);
+          return {
+            id: text(motionSegment.id) || `motion-${segmentIndex + 1}-${crypto.randomUUID()}`,
+            durationSeconds: positiveNumber(motionSegment.durationSeconds) ?? 1,
+            summary: text(motionSegment.summary, motionSegment.description),
+          };
+        }),
         locked: typeof shot.locked === "boolean" ? shot.locked : false,
       };
     }),
@@ -152,8 +166,16 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         originalFileName: text(asset.originalFileName, asset.original_file_name, asset.name),
         sha256: text(asset.sha256) || null,
         mimeType: text(asset.mimeType, asset.mime_type) || null,
+        mediaKind: ["image", "video", "audio"].includes(text(asset.mediaKind, asset.media_kind))
+          ? text(asset.mediaKind, asset.media_kind) as ProjectDraft["assets"][number]["mediaKind"]
+          : text(asset.mimeType, asset.mime_type).startsWith("video/") ? "video"
+            : text(asset.mimeType, asset.mime_type).startsWith("audio/") ? "audio" : "image",
         width: positiveNumber(asset.width),
         height: positiveNumber(asset.height),
+        durationSeconds: positiveNumber(asset.durationSeconds, asset.duration_seconds),
+        frameRate: positiveNumber(asset.frameRate, asset.frame_rate),
+        hasAudio: typeof asset.hasAudio === "boolean" ? asset.hasAudio
+          : typeof asset.has_audio === "boolean" ? asset.has_audio : null,
         byteSize: positiveNumber(asset.byteSize, asset.byte_size),
         kind,
         scope,
@@ -170,6 +192,10 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
       const kind = ["character", "scene", "prop", "style"].includes(text(plan.kind))
         ? text(plan.kind) as ProjectDraft["assetPlans"][number]["kind"] : "character";
       const scope = text(plan.scope) === "shot" ? "shot" : "public";
+      const legacyShotId = text(plan.shotId, plan.shot_id) || null;
+      const shotIds = Array.isArray(plan.shotIds)
+        ? plan.shotIds.map((value) => text(value)).filter(Boolean)
+        : legacyShotId ? [legacyShotId] : [];
       const state = ["draft", "ready", "satisfied", "stale"].includes(text(plan.state))
         ? text(plan.state) as ProjectDraft["assetPlans"][number]["state"] : "draft";
       const [defaultWidth, defaultHeight] = defaultAssetResolution(kind);
@@ -182,7 +208,8 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         description: text(plan.description),
         kind,
         scope,
-        shotId: scope === "shot" ? text(plan.shotId, plan.shot_id) || null : null,
+        shotId: scope === "shot" ? legacyShotId : null,
+        shotIds: scope === "shot" ? shotIds : [],
         fulfilledByAssetId: text(plan.fulfilledByAssetId, plan.fulfilled_by_asset_id) || null,
         state,
         width: imageDimension(plan.width, defaultWidth),
@@ -201,6 +228,11 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
           negativePrompt: text(prompt.negativePrompt, prompt.negative_prompt),
           workflowTemplateId: text(prompt.workflowTemplateId, prompt.workflow_template_id) || null,
           harnessRevision: positiveNumber(prompt.harnessRevision, prompt.harness_revision),
+          harnessManifestSha256: text(prompt.harnessManifestSha256, prompt.harness_manifest_sha256) || null,
+          route: text(prompt.route) || null,
+          assetRoles: Array.isArray(prompt.assetRoles) ? prompt.assetRoles as Array<Record<string, unknown>> : [],
+          assumptions: Array.isArray(prompt.assumptions) ? prompt.assumptions.map(text) : [],
+          stageTrace: Array.isArray(prompt.stageTrace) ? prompt.stageTrace as ProjectDraft["prompts"]["h3Prompts"][number]["stageTrace"] : [],
           referenceAssetIds: Array.isArray(prompt.referenceAssetIds) ? prompt.referenceAssetIds.filter((id): id is string => typeof id === "string") : [],
           locked: prompt.locked === true,
           revision: positiveNumber(prompt.revision) ?? 1,
@@ -283,12 +315,6 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         review: { ready: false, issues: [{ severity: "warning" as const, code: "legacy_prompt", message: "旧版提示词需要通过 H3 Reviewer 重新校验" }], reviewedAt: null },
       }));
     });
-  }
-  if (hydrated.activeStage === "generation" && !hydrated.stageApprovals.prompts) {
-    hydrated.activeStage = "prompts";
-  }
-  if (!("config" in (value.stageApprovals ?? {}))) {
-    hydrated.activeStage = "config";
   }
   return hydrated;
 }

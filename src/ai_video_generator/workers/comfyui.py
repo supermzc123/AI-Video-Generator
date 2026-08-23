@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -255,9 +256,26 @@ class ComfyUIAdapter:
     async def get_object_info(self, node_type: str | None = None) -> ComfyUIObjectInfo:
         """Fetch and validate the node schema used to type-check API workflows."""
         path = "/object_info" if node_type is None else f"/object_info/{node_type}"
-        async with self._client() as client:
-            response = await client.get(path)
-            response.raise_for_status()
+        response: httpx.Response | None = None
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with self._client() as client:
+                    response = await client.get(path)
+                    response.raise_for_status()
+                break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        if response is None:
+            if isinstance(last_error, httpx.TimeoutException):
+                raise httpx.ReadTimeout(
+                    f"ComfyUI {path} did not respond after 3 attempts"
+                ) from last_error
+            if last_error is not None:
+                raise last_error
+            raise httpx.NetworkError(f"ComfyUI {path} request failed")
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("ComfyUI object_info response must be an object")
@@ -302,9 +320,18 @@ class ComfyUIAdapter:
     async def get_history(self, prompt_id: str) -> dict[str, Any] | None:
         if not prompt_id.strip():
             raise ValueError("prompt_id must not be empty")
-        async with self._client() as client:
-            response = await client.get(f"/history/{prompt_id}")
-            response.raise_for_status()
+        response: httpx.Response | None = None
+        for attempt in range(3):
+            try:
+                async with self._client() as client:
+                    response = await client.get(f"/history/{prompt_id}")
+                    response.raise_for_status()
+                break
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
+        assert response is not None
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("ComfyUI history response must be an object")
@@ -326,12 +353,25 @@ class ComfyUIAdapter:
     ) -> bytes:
         if not filename.strip():
             raise ValueError("output filename must not be empty")
-        async with self._client() as client:
-            response = await client.get(
-                "/view",
-                params={"filename": filename, "subfolder": subfolder, "type": storage_type},
-            )
-            response.raise_for_status()
+        response: httpx.Response | None = None
+        for attempt in range(3):
+            try:
+                async with self._client() as client:
+                    response = await client.get(
+                        "/view",
+                        params={
+                            "filename": filename,
+                            "subfolder": subfolder,
+                            "type": storage_type,
+                        },
+                    )
+                    response.raise_for_status()
+                break
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
+        assert response is not None
         if not response.content:
             raise ValueError("ComfyUI returned an empty image output")
         return response.content

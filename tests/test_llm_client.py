@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -12,6 +13,51 @@ from ai_video_generator.llm import (
     TextContentPart,
 )
 from ai_video_generator.llm.client import is_retryable_llm_error, llm_delta_callback
+
+
+class _FakeStreamResponse:
+    is_error = False
+    status_code = 200
+
+    def __init__(self, lines: list[tuple[float, str]]) -> None:
+        self._lines = iter(lines)
+
+    def aiter_lines(self) -> "_FakeStreamResponse":
+        return self
+
+    def __aiter__(self) -> "_FakeStreamResponse":
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            delay, line = next(self._lines)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+        if delay:
+            await asyncio.sleep(delay)
+        return line
+
+    async def aread(self) -> bytes:
+        return b""
+
+
+class _FakeStreamContext:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> _FakeStreamResponse:
+        return self.response
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
+class _FakeStreamingHttp:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self.response = response
+
+    def stream(self, *_: object, **__: object) -> _FakeStreamContext:
+        return _FakeStreamContext(self.response)
 
 
 def test_retryable_llm_errors_only_include_transient_failures() -> None:
@@ -244,3 +290,115 @@ async def test_openai_compatible_client_streams_json_deltas() -> None:
 
     assert result == '{"ok":true}'
     assert deltas == ['{"ok":', "true}"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_client_applies_first_token_timeout() -> None:
+    response = _FakeStreamResponse([(0.02, 'data: {"choices":[{"delta":{"content":"x"}}]}')])
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example/v1",
+        model="test-model",
+        timeout_seconds=30,
+        first_token_timeout_seconds=0.001,
+        http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
+    )
+    with pytest.raises(LLMClientError, match="first token timed out"):
+        await client._complete_json_stream({}, lambda _: None)
+
+
+@pytest.mark.asyncio
+async def test_streaming_client_stops_first_token_timeout_after_first_delta() -> None:
+    response = _FakeStreamResponse(
+        [
+            (0, 'data: {"choices":[{"delta":{"content":"x"}}]}'),
+            (0.02, 'data: {"choices":[{"delta":{"content":"y"}}]}'),
+            (0, "data: [DONE]"),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example/v1",
+        model="test-model",
+        timeout_seconds=30,
+        first_token_timeout_seconds=0.001,
+        http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
+    )
+    assert await client._complete_json_stream({}, lambda _: None) == "xy"
+
+
+@pytest.mark.asyncio
+async def test_streaming_client_applies_idle_timeout_after_first_delta() -> None:
+    response = _FakeStreamResponse(
+        [
+            (0, 'data: {"choices":[{"delta":{"content":"x"}}]}'),
+            (0.02, 'data: {"choices":[{"delta":{"content":"y"}}]}'),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example/v1",
+        model="test-model",
+        timeout_seconds=0.001,
+        first_token_timeout_seconds=1,
+        http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
+    )
+    with pytest.raises(LLMClientError, match="stream idle timeout"):
+        await client._complete_json_stream({}, lambda _: None)
+
+
+@pytest.mark.asyncio
+async def test_streaming_client_finishes_without_done_frame() -> None:
+    response = _FakeStreamResponse(
+        [
+            (0, 'data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"}}]}'),
+            (0, 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'),
+            (10, "connection remains open"),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example/v1",
+        model="test-model",
+        timeout_seconds=0.001,
+        first_token_timeout_seconds=1,
+        http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
+    )
+
+    assert await client._complete_json_stream({}, lambda _: None) == '{"ok":true}'
+
+
+@pytest.mark.asyncio
+async def test_streaming_client_accepts_complete_json_when_gateway_stays_open() -> None:
+    response = _FakeStreamResponse(
+        [
+            (0, 'data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"}}]}'),
+            (0.02, "connection remains open"),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example/v1",
+        model="test-model",
+        timeout_seconds=0.001,
+        first_token_timeout_seconds=1,
+        http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
+    )
+
+    assert await client._complete_json_stream({}, lambda _: None) == '{"ok":true}'
+
+
+@pytest.mark.asyncio
+async def test_plain_text_completion_accepts_received_text_when_gateway_stays_open() -> None:
+    response = _FakeStreamResponse(
+        [
+            (0, 'data: {"choices":[{"delta":{"content":"image prompt"}}]}'),
+            (0.02, "connection remains open"),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example/v1",
+        model="test-model",
+        timeout_seconds=0.001,
+        first_token_timeout_seconds=1,
+        http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
+    )
+
+    assert await client._complete_json_stream(
+        {}, lambda _: None, accept_started_text_on_idle=True
+    ) == "image prompt"

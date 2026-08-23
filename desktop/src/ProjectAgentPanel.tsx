@@ -1,5 +1,5 @@
 import { Bot, Check, CircleAlert, Maximize2, Minimize2, Send, Sparkles, UserRound, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { listProjectMemory, streamProjectAgentProposal } from "./api";
 import { applyAgentPatches } from "./agent-patches";
 import type { AgentProposal, PipelineStageId, ProjectDraft } from "./types";
@@ -18,7 +18,6 @@ const stageScopes: Record<AgentStage, string[]> = {
   storyboard: ["/shots"],
   assets: ["/assetPlans"],
   generation: [],
-  review: ["/reviewNotes"],
   delivery: ["/postProcessing"],
 };
 
@@ -28,22 +27,19 @@ const stageNames: Record<AgentStage, string> = {
   storyboard: "电影分镜",
   assets: "素材规划",
   generation: "生成执行计划",
-  review: "审核标准",
   delivery: "后处理与交付",
 };
 
 const automaticDraftInstructions: Partial<Record<AgentStage, string>> = {
   outline: "根据已批准的创意和项目时长，直接生成完整故事大纲。段落时长总和应接近项目目标时长。",
-  storyboard: "根据已批准的大纲，直接生成完整电影分镜。每个分镜要包含标题、画面摘要、运镜和时长；需要超过15秒的连续镜头可以保留为一个电影分镜。系统会为长镜头分别编写提示词并用 Motion Context 拼接；续段的15秒模型预算中必须预留至少2秒继承上一段末尾潜空间并在输出时裁掉，所以不要机械规划15+15。30秒可以是10+10+10。请优先建议在密集信息或关键动作完成之后、人物运动与机位相对稳定且不易暴露接缝的位置分段。",
-  assets: "根据已批准的创意、大纲和电影分镜，生成完整素材需求计划。先查看 project_assets 清单和随请求提供的图片：这些是已经上传并命名的真实素材，不要为已满足的职责重复创建需求；只规划仍缺少的角色、场景、道具和风格素材，不虚构素材文件。每项需求必须独立决定图片 width、height 和构图方向，不得照搬视频分辨率；宽高使用8的倍数，总像素建议控制在1280×1280（1,638,400像素）左右，并将 resolutionSource 设为 ai。",
-  review: "根据项目创意、分镜、连续镜头和音频策略，直接生成可执行的项目审核标准。",
+  storyboard: "根据当前项目内容直接生成完整电影分镜。每个分镜要包含标题、画面摘要、运镜和时长。需要 Motion Context 连续生成时，在同一分镜的 motionSegments 中明确列出每段 durationSeconds 和 summary；分段时长之和必须等于分镜时长，每段至少4秒，首段最多15秒，续段最多12秒。不要机械规划15+15；30秒可以是10+10+10。接缝优先放在密集信息或关键动作完成之后、人物运动与机位相对稳定处，并在 summary 中写清本段内容及交给下一段继承的结束状态。",
+  assets: "根据已批准的创意、大纲和电影分镜，生成完整素材需求计划。先查看 project_assets 清单和随请求提供的图片：这些是已经上传并命名的真实素材，不要为已满足的职责重复创建需求；只规划仍缺少的角色、场景、道具和风格素材，不虚构素材文件。每项需求必须通过 shotIds 明确列出实际使用它的所有镜头（单镜头也使用长度为1的 shotIds）；同一素材被多个镜头引用时只创建一个集中素材需求，不要复制需求。scope=shot 仅作为旧数据兼容字段，新的多镜头引用统一使用 scope=public + shotIds；真正全片复用时 scope=public、shotIds=[]。不得填写不存在的 shotId。每项需求必须独立决定图片 width、height 和构图方向，不得照搬视频分辨率；宽高使用8的倍数，总像素建议控制在1280×1280（1,638,400像素）左右，并将 resolutionSource 设为 ai。",
 };
 
 function needsAutomaticDraft(stage: AgentStage, project: ProjectDraft) {
   if (stage === "outline") return project.outline.length === 0;
   if (stage === "storyboard") return project.shots.length === 0;
   if (stage === "assets") return project.assetPlans.length === 0;
-  if (stage === "review") return !project.reviewNotes.trim();
   return false;
 }
 
@@ -64,7 +60,6 @@ export function ProjectAgentPanel({ stage, project, prepareProject, applyProject
   const [pending, setPending] = useState<{ proposal: AgentProposal; base: ProjectDraft } | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [streamPreview, setStreamPreview] = useState("");
-  const automaticStarted = useRef(new Set<string>());
   const messages = conversations[stage] ?? [];
 
   useEffect(() => {
@@ -77,33 +72,27 @@ export function ProjectAgentPanel({ stage, project, prepareProject, applyProject
     const operations = [`refine_${stage}`, `initialize_${stage}`];
     void listProjectMemory(project.projectId).then((events) => {
       if (!active) return;
-      const restored = events
+      const relevant = events
         .filter((event) => operations.some((operation) => event.role === `dialog_${operation}_user` || event.role === `dialog_${operation}_assistant`))
-        .reverse()
+        .reverse();
+      const automaticRole = `dialog_initialize_${stage}_user`;
+      let latestAutomaticIndex = -1;
+      relevant.forEach((event, index) => {
+        if (event.role === automaticRole) latestAutomaticIndex = index;
+      });
+      const restored = relevant
+        .filter((event, index) => event.role !== automaticRole || index === latestAutomaticIndex)
         .map<ChatMessage>((event) => ({
           id: event.event_id,
           role: event.role.endsWith("_user") ? "user" : "assistant",
-          text: event.content,
+          text: event.role === automaticRole
+            ? `自动生成${stageNames[stage]}初稿`
+            : event.content,
         }));
       setConversations((current) => ({ ...current, [stage]: restored }));
-      const automaticInstruction = automaticDraftInstructions[stage];
-      const automaticKey = `${project.projectId}:${project.revision}:${stage}`;
-      if (automaticInstruction && needsAutomaticDraft(stage, project) && !automaticStarted.current.has(automaticKey)) {
-        automaticStarted.current.add(automaticKey);
-        void runInstruction(automaticInstruction, {
-          operation: `initialize_${stage}`,
-          automatic: true,
-        });
-      }
     }).catch((cause) => {
       if (!active) return;
-      setError(`项目记忆读取失败，将继续生成新初稿：${cause instanceof Error ? cause.message : "未知错误"}`);
-      const automaticInstruction = automaticDraftInstructions[stage];
-      const automaticKey = `${project.projectId}:${project.revision}:${stage}`;
-      if (automaticInstruction && needsAutomaticDraft(stage, project) && !automaticStarted.current.has(automaticKey)) {
-        automaticStarted.current.add(automaticKey);
-        void runInstruction(automaticInstruction, { operation: `initialize_${stage}`, automatic: true });
-      }
+      setError(`项目记忆读取失败：${cause instanceof Error ? cause.message : "未知错误"}`);
     });
     return () => { active = false; };
   }, [project.projectId, stage]);
@@ -140,6 +129,7 @@ export function ProjectAgentPanel({ stage, project, prepareProject, applyProject
         operationId: crypto.randomUUID(),
         operation: options.operation,
         instruction: `你是本视频项目的专属负责人。当前阶段是“${stageNames[stage]}”。请结合完整项目记忆，${options.automatic ? "直接生成并返回将由系统校验后立即应用的完整初稿" : "根据用户消息直接修改对应内容；有效修改会由系统校验后立即应用，无需用户再次审批"}：${text}`,
+        displayInstruction: options.automatic ? `自动生成${stageNames[stage]}初稿` : text,
         allowedPaths: stageScopes[stage],
         lockedPaths,
       }, (delta) => setStreamPreview((current) => (current + delta).slice(-1800)));
@@ -207,7 +197,7 @@ export function ProjectAgentPanel({ stage, project, prepareProject, applyProject
   return <div className={`agent-panel ${expanded ? "expanded" : ""}`}>
     <div className="agent-heading"><div className="agent-avatar"><Bot size={18} /></div><div><strong>项目负责人</strong><span>已读取项目记忆 · 当前可修改：{stageNames[stage]}</span></div><span className="agent-online"><i />LLM</span><button className="icon-button" title={expanded ? "收起对话" : "展开对话"} onClick={() => setExpanded(!expanded)}>{expanded ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button></div>
     <div className="agent-thread">
-      {!messages.length && <div className="agent-empty"><Sparkles size={18} /><span>可以讨论方案、询问意见，或要求生成和修改本阶段内容。</span></div>}
+      {!messages.length && <div className="agent-empty"><Sparkles size={18} /><span>可以讨论方案、询问意见，或要求生成和修改本阶段内容。</span>{automaticDraftInstructions[stage] && needsAutomaticDraft(stage, project) ? <button className="secondary-button" disabled={busy} onClick={() => void runInstruction(automaticDraftInstructions[stage]!, { operation: `initialize_${stage}`, automatic: true })}>生成初稿</button> : null}</div>}
       {messages.map((message) => <div className={`agent-message ${message.role}`} key={message.id}><span>{message.role === "user" ? <UserRound size={14} /> : <Bot size={14} />}</span><p>{message.text}</p></div>)}
       {busy && <div className="agent-message assistant streaming"><span><Bot size={14} /></span><p>{streamPreview || (automaticBusy ? `正在生成${stageNames[stage]}初稿...` : "正在结合项目记忆分析...")}</p></div>}
     </div>

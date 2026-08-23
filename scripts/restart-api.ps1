@@ -6,11 +6,12 @@ param(
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
 $apiExecutable = Join-Path $projectRoot ".venv\Scripts\aivideo-api.exe"
+$apiPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $healthUrl = "http://127.0.0.1:8000/api/v1/health"
 $logRoot = Join-Path $projectRoot "data\logs"
 
-if (-not (Test-Path -LiteralPath $apiExecutable -PathType Leaf)) {
-    throw "Backend executable does not exist: $apiExecutable. Run scripts\setup.ps1 first."
+if (-not (Test-Path -LiteralPath $apiPython -PathType Leaf) -and -not (Test-Path -LiteralPath $apiExecutable -PathType Leaf)) {
+    throw "Backend runtime does not exist. Run scripts\setup.ps1 first."
 }
 
 function Test-ProjectBackendProcess {
@@ -27,6 +28,10 @@ function Test-ProjectBackendProcess {
         $apiExecutable,
         [System.StringComparison]::OrdinalIgnoreCase
     ) -ge 0
+    $usesSourceLauncher = $commandLine.IndexOf(
+        "ai_video_generator.main",
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -ge 0
     $usesProjectVenv = (
         $executablePath.StartsWith($venvRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
         (
@@ -35,7 +40,7 @@ function Test-ProjectBackendProcess {
             $commandLine.Contains("aivideo-api")
         )
     )
-    return $usesExactProjectLauncher -or $usesProjectVenv
+    return $usesExactProjectLauncher -or $usesSourceLauncher -or $usesProjectVenv
 }
 
 $listeners = @(
@@ -43,6 +48,19 @@ $listeners = @(
         -ErrorAction SilentlyContinue
 )
 $ownerIds = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+
+# The launcher can leave a Python reloader/child process listening after its
+# parent exits. Stop every project-owned control-plane process, not only the
+# process reported by the socket, so a restart cannot silently keep old code.
+$projectProcessIds = @(
+    Get-CimInstance Win32_Process |
+        Where-Object {
+            (Test-ProjectBackendProcess -ProcessId ([int]$_.ProcessId)) -and
+            ([string]$_.CommandLine).Contains("ai_video_generator.main")
+        } |
+        Select-Object -ExpandProperty ProcessId -Unique
+)
+$ownerIds = @($ownerIds + $projectProcessIds | Sort-Object -Unique)
 
 foreach ($ownerId in $ownerIds) {
     if (-not (Test-ProjectBackendProcess -ProcessId $ownerId)) {
@@ -75,13 +93,18 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $stdoutLog = Join-Path $logRoot "control-plane-$timestamp.stdout.log"
 $stderrLog = Join-Path $logRoot "control-plane-$timestamp.stderr.log"
 
-$process = Start-Process `
-    -FilePath $apiExecutable `
-    -WorkingDirectory $projectRoot `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $stdoutLog `
-    -RedirectStandardError $stderrLog `
-    -PassThru
+$startArguments = @{
+    WorkingDirectory = $projectRoot
+    WindowStyle = "Hidden"
+    RedirectStandardOutput = $stdoutLog
+    RedirectStandardError = $stderrLog
+    PassThru = $true
+}
+if (Test-Path -LiteralPath $apiPython -PathType Leaf) {
+    $process = Start-Process -FilePath $apiPython -ArgumentList @("-m", "ai_video_generator.main") @startArguments
+} else {
+    $process = Start-Process -FilePath $apiExecutable @startArguments
+}
 
 Write-Output "Starting AI Video Generator backend (PID $($process.Id))..."
 $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)

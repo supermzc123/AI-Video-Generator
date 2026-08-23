@@ -15,6 +15,7 @@ RESOURCE_ROOT = Path(__file__).resolve().parent.parent / "resources" / "h3"
 H3_NATIVE_FPS = 24
 H3_MAX_SAMPLE_SECONDS = 15
 MOTION_CONTEXT_FRAMES = 56
+AssetBlob = tuple[str, str, str] | tuple[str, str, str, str]
 
 
 def compile_h3_segment_manifests(
@@ -24,7 +25,7 @@ def compile_h3_segment_manifests(
     prompt: dict[str, Any],
     width: int,
     height: int,
-    asset_blobs: tuple[tuple[str, str, str], ...],
+    asset_blobs: tuple[AssetBlob, ...],
     node_schema_sha256: str,
 ) -> tuple[TaskWorkloadManifest, TaskWorkloadManifest]:
     """Compile the tested H3 cache/diffusion graphs with typed deployment values."""
@@ -41,7 +42,7 @@ def compile_h3_segment_manifests(
         )
     fingerprint_payload = {
         "prompt": prompt.get("prompt", ""),
-        "assets": [sha for _asset_id, sha, _suffix in asset_blobs],
+        "assets": [_asset_blob_parts(item)[1] for item in asset_blobs],
         "width": width,
         "height": height,
         "frames": frame_count,
@@ -164,7 +165,7 @@ def _configure_reference_source(
     height: int,
     frames: int,
     settings: Settings,
-    asset_blobs: tuple[tuple[str, str, str], ...],
+    asset_blobs: tuple[AssetBlob, ...],
     workload_blobs: list[WorkloadBlob],
 ) -> dict[str, dict[str, Any]]:
     configured = copy.deepcopy(workflow)
@@ -173,30 +174,75 @@ def _configure_reference_source(
     configured["120"]["inputs"]["vae_name"] = settings.h3_audio_vae
     inputs = configured["131"]["inputs"]
     inputs.update({"prompt": prompt_text, "width": width, "height": height, "length": frames})
+    reference_prefixes = (
+        "ref_images.",
+        "ref_videos.",
+        "ref_video_audios.",
+        "ref_audios.",
+    )
     for input_name in tuple(inputs):
-        if input_name.startswith("ref_images.ref_image_"):
+        if input_name.startswith(reference_prefixes):
             inputs.pop(input_name)
     for node_id in tuple(configured):
         if node_id.startswith("ref-"):
             configured.pop(node_id)
-    for index, (asset_id, sha256_value, suffix) in enumerate(asset_blobs[:9]):
-        node_id = f"avg-ref-{index}"
+    counts = {"image": 0, "video": 0, "audio": 0}
+    limits = {"image": 9, "video": 3, "audio": 3}
+    for asset_blob in asset_blobs:
+        asset_id, sha256_value, suffix, media_type = _asset_blob_parts(asset_blob)
+        media_kind = media_type.split("/", 1)[0]
+        if media_kind not in counts:
+            raise ValueError(f"unsupported H3 reference media type: {media_type}")
+        index = counts[media_kind]
+        if index >= limits[media_kind]:
+            raise ValueError(f"H3 supports at most {limits[media_kind]} {media_kind} references")
+        counts[media_kind] += 1
+        node_id = f"avg-ref-{index}" if media_kind == "image" else f"avg-ref-{media_kind}-{index}"
         mount_path = f"ai-video-generator/{project_id}/{sha256_value}{suffix}"
-        configured[node_id] = {
-            "class_type": "LoadImage",
-            "inputs": {"image": mount_path},
-            "_meta": {"title": f"AVG_REFERENCE_{index + 1}"},
-        }
-        inputs[f"ref_images.ref_image_{index}"] = [node_id, 0]
+        if media_kind == "image":
+            configured[node_id] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": mount_path},
+                "_meta": {"title": f"AVG_PICTURE_REFERENCE_{index + 1}"},
+            }
+            inputs[f"ref_images.ref_image_{index}"] = [node_id, 0]
+        elif media_kind == "video":
+            components_id = f"{node_id}-components"
+            configured[node_id] = {
+                "class_type": "LoadVideo",
+                "inputs": {"file": mount_path},
+                "_meta": {"title": f"AVG_VIDEO_REFERENCE_{index + 1}"},
+            }
+            configured[components_id] = {
+                "class_type": "GetVideoComponents",
+                "inputs": {"video": [node_id, 0]},
+                "_meta": {"title": f"AVG_VIDEO_COMPONENTS_{index + 1}"},
+            }
+            inputs[f"ref_videos.ref_video_{index}"] = [components_id, 0]
+            inputs[f"ref_video_audios.ref_video_audio_{index}"] = [components_id, 1]
+        else:
+            configured[node_id] = {
+                "class_type": "LoadAudio",
+                "inputs": {"audio": mount_path},
+                "_meta": {"title": f"AVG_AUDIO_REFERENCE_{index + 1}"},
+            }
+            inputs[f"ref_audios.ref_audio_{index}"] = [node_id, 0]
         workload_blobs.append(
             WorkloadBlob(
                 sha256=sha256_value,
-                media_type="image/*",
+                media_type=media_type,
                 mount_path=mount_path,
                 role=f"reference:{asset_id}",
             )
         )
     return configured
+
+
+def _asset_blob_parts(asset_blob: AssetBlob) -> tuple[str, str, str, str]:
+    if len(asset_blob) == 3:
+        asset_id, sha256_value, suffix = asset_blob
+        return asset_id, sha256_value, suffix, "image/*"
+    return asset_blob
 
 
 def _configure_diffusion(

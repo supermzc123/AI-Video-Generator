@@ -3,6 +3,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -22,7 +23,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from ai_video_generator import __version__
@@ -40,6 +41,8 @@ from ai_video_generator.api_models import (
     ProjectPauseRequest,
     ReviewDeadlineRequest,
     ReviewModeRequest,
+    ReworkMarkerRequest,
+    ReworkMarkerUpdateRequest,
     RuntimeSettingsUpdateRequest,
     SegmentReworkRequest,
     TaskReviewRequest,
@@ -76,6 +79,8 @@ from ai_video_generator.domain import (
     DryRunPlan,
     ExecutionMode,
     ExecutionTarget,
+    GenerationBatch,
+    GenerationBatchState,
     H3WorkflowProfile,
     HarnessBundle,
     HarnessRevision,
@@ -97,6 +102,8 @@ from ai_video_generator.domain import (
     ReviewMode,
     ReviewPolicy,
     ReworkAction,
+    ReworkMarker,
+    ReworkMarkerState,
     ReworkRequest,
     ReworkState,
     TaskCheckpoint,
@@ -118,7 +125,6 @@ from ai_video_generator.llm import (
     ImageURLContentPart,
     LLMClientError,
     LLMHarness,
-    OpenAICompatibleClient,
     StructuredOperationRequest,
     StructuredOperationResponse,
     TextContentPart,
@@ -126,9 +132,12 @@ from ai_video_generator.llm import (
     VideoURLContentPart,
     WorkflowMappingDraft,
     WorkflowMappingRequest,
+    complete_json,
     is_retryable_llm_error,
+    list_models,
+    open_client,
+    remote_config,
 )
-from ai_video_generator.llm.client import llm_delta_callback
 from ai_video_generator.persistence import (
     IdempotencyConflictError,
     InvalidTaskTransitionError,
@@ -147,6 +156,7 @@ from ai_video_generator.services.batch_runs import (
     batch_project_tasks,
     reconcile_batch_runs,
     resolve_batch_run,
+    resolve_batch_task_ids,
 )
 from ai_video_generator.services.comfy_node_installer import (
     ComfyNodeInstallValidationError,
@@ -160,24 +170,34 @@ from ai_video_generator.services.export import (
     order_segment_ids_for_export,
     run_export,
 )
+from ai_video_generator.services.generation_batches import (
+    cancel_rework_marker,
+    confirm_rework_markers,
+    create_rework_marker,
+    ensure_initial_generation_batch,
+    frozen_segment_ids,
+    motion_context_segments,
+    reconcile_generation_batches,
+)
 from ai_video_generator.services.h3_runtime import compile_h3_segment_manifests
 from ai_video_generator.services.harness_sources import (
     HarnessSourceInstallError,
     InstalledHarnessSource,
     install_h3_harness_source,
 )
+from ai_video_generator.services.llm_streaming import stream_llm_operation
 from ai_video_generator.services.media_review import (
     automatic_rework_policy,
     inspect_video_media,
 )
 from ai_video_generator.services.postprocessing_profiles import inspect_postprocess_profiles
 from ai_video_generator.services.postprocessing_runtime import (
-    compile_rife_manifest,
     finalize_delivery,
     interpolation_plan,
     transcribe_to_srt,
 )
 from ai_video_generator.services.project_tasks import (
+    compile_delivery_task_plan,
     compile_project_task_plan,
     persist_project_task_plan,
 )
@@ -188,6 +208,9 @@ from ai_video_generator.services.remote import (
     WorkerRegistration,
 )
 from ai_video_generator.services.shot_compiler import ShotCompilationRequest, compile_shot
+from ai_video_generator.services.user_video_workflows import (
+    compile_user_video_workflow_manifest,
+)
 from ai_video_generator.workers import (
     PINNED_MOTION_CONTEXT_PROFILE,
     ComfyUIAdapter,
@@ -204,6 +227,8 @@ from ai_video_generator.workers import (
     inspect_h3_workflow_profile,
     validate_workflow_template,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _project_asset_llm_context(
@@ -350,6 +375,14 @@ def create_app(
         version=__version__,
         description="Local-first MiniMax H3 control plane",
     )
+    # The desktop shell reads local SSE streams with the browser Fetch API so
+    # deltas are not buffered by the Tauri HTTP plugin.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|tauri\.localhost)(:\d+)?$",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(create_project_assets_router(resolved_settings))
     app.include_router(create_prompting_router(resolved_settings))
     task_store: SQLiteTaskStore | None = None
@@ -365,6 +398,24 @@ def create_app(
             database_path = Path(resolved_settings.data_root) / "control-plane.db"
             task_store = SQLiteTaskStore(database_path)
         return task_store
+
+    def h3_execution_profile(run_state: ProjectRunState) -> dict[str, object] | None:
+        if run_state.generation_revision == 0:
+            return None
+        return {
+            "generation_revision": run_state.generation_revision,
+            "diffusion_model": runtime_settings.h3_diffusion_model,
+            "text_encoder": runtime_settings.h3_text_encoder,
+            "video_vae": runtime_settings.h3_video_vae,
+            "audio_vae": runtime_settings.h3_audio_vae,
+            "turbo_enabled": runtime_settings.h3_turbo_enabled,
+            "turbo_lora": (
+                runtime_settings.h3_turbo_lora if runtime_settings.h3_turbo_enabled else None
+            ),
+            "sage_attention_enabled": runtime_settings.h3_sage_attention_enabled,
+            "low_vram": runtime_settings.h3_low_vram,
+            "steps": runtime_settings.h3_steps,
+        }
 
     def ensure_default_h3_harness_bundle() -> HarnessBundle:
         bundle = HarnessBundle(
@@ -405,7 +456,12 @@ def create_app(
         if not runtime_settings.llm_base_url or not runtime_settings.llm_model:
             blockers.append("LLM provider is not configured")
         h3_revisions = get_task_store().list_harness_revisions("h3:default")
-        if not any(item.approval == ApprovalState.APPROVED for item in h3_revisions):
+        if not any(
+            item.approval == ApprovalState.APPROVED
+            and item.schema_version == "2.0"
+            and item.runtime_manifest is not None
+            for item in h3_revisions
+        ):
             blockers.append("approved pinned H3 Harness is not installed")
         payload = workspace.payload
         if not payload.get("assets"):
@@ -462,6 +518,40 @@ def create_app(
         for key in ("seedvr", "rife", "whisper"):
             selection = post.get(key, {}) if isinstance(post, dict) else {}
             if not isinstance(selection, dict) or selection.get("enabled") is not True:
+                continue
+            workflow_id = str(selection.get("workflowTemplateId") or "")
+            workflow_revision = int(selection.get("workflowRevision") or 0)
+            if workflow_id:
+                expected_kind = {
+                    "seedvr": "restoration",
+                    "rife": "interpolation",
+                    "whisper": "transcription",
+                }[key]
+                template = next(
+                    (
+                        item
+                        for item in get_task_store().list_workflow_revisions(workflow_id)
+                        if item.revision == workflow_revision
+                        and item.approval == WorkflowApproval.APPROVED
+                        and item.kind == expected_kind
+                    ),
+                    None,
+                )
+                if template is None:
+                    blockers.append(f"后处理 {key} 的用户工作流不存在或修订已失效")
+                else:
+                    required_nodes.update(template.required_node_types)
+                if key == "rife":
+                    try:
+                        interpolation_plan(
+                            int(workspace.payload.get("fps") or 24),
+                            int(selection.get("targetFps") or 0),
+                        )
+                    except ValueError as exc:
+                        blockers.append(str(exc))
+                continue
+            if key == "whisper":
+                blockers.append("后处理 whisper 必须选择用户语音识别工作流")
                 continue
             profile_id = str(selection.get("profileId") or "")
             profile = profiles.get(profile_id)
@@ -656,6 +746,7 @@ def create_app(
 
     async def execute_local_comfy_task(task_id: str) -> None:
         store = get_task_store()
+        workflow_completed = False
         try:
             task = store.get_task(task_id)
             if task.state == TaskState.QUEUED:
@@ -680,7 +771,7 @@ def create_app(
                     (item for item in revisions if item.revision == requested_revision),
                     max(revisions, key=lambda item: item.revision),
                 )
-            if task.kind in {TaskKind.SEEDVR2, TaskKind.RIFE}:
+            if task.kind in {TaskKind.SEEDVR2, TaskKind.RIFE, TaskKind.WHISPER}:
                 if runtime_settings.comfyui_root is None:
                     raise ValueError("ComfyUI 文件夹未配置，无法物化后处理输入")
                 source_task_id = manifest.context.get("source_task_id", "")
@@ -715,6 +806,9 @@ def create_app(
                         status_text = str(
                             status.get("status_str") if isinstance(status, dict) else status or ""
                         ).lower()
+                        workflow_completed = (
+                            isinstance(status, dict) and status.get("completed") is True
+                        )
                         if status_text in {"error", "failed"}:
                             raise ValueError("ComfyUI image workflow failed")
                         if task.kind == TaskKind.IMAGE_GENERATION and template is not None:
@@ -832,18 +926,72 @@ def create_app(
                                 )
                                 store.transition_task(task_id, TaskState.SUCCEEDED)
                                 return
+                        elif task.kind == TaskKind.WHISPER:
+                            media = _history_media_output(history, manifest.outputs[0].node_id)
+                            content = (
+                                await adapter.get_output_image(
+                                    media["filename"],
+                                    subfolder=media.get("subfolder", ""),
+                                    storage_type=media.get("type", "output"),
+                                )
+                                if media is not None
+                                else _history_text_output(history, manifest.outputs[0].node_id)
+                            )
+                            if content:
+                                subtitle_path = (
+                                    Path(resolved_settings.data_root)
+                                    / "deliveries"
+                                    / current.project_id
+                                    / "subtitles.srt"
+                                )
+                                subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+                                temporary = subtitle_path.with_suffix(".srt.tmp")
+                                temporary.write_bytes(content)
+                                temporary.replace(subtitle_path)
+                                store.put_task_checkpoint(
+                                    TaskCheckpoint(
+                                        checkpoint_id=f"{task_id}:subtitle",
+                                        task_id=task_id,
+                                        sequence=1,
+                                        phase="subtitle_saved",
+                                        payload={
+                                            "path": str(subtitle_path),
+                                            "sha256": hashlib.sha256(content).hexdigest(),
+                                            "workflow_template_id": (
+                                                manifest.workflow_template_id
+                                            ),
+                                        },
+                                        created_at=datetime.now(UTC),
+                                    )
+                                )
+                                store.transition_task(task_id, TaskState.SUCCEEDED)
+                                return
                         if isinstance(status, dict) and status.get("completed") is True:
                             raise ValueError("ComfyUI completed without the declared image output")
                     await asyncio.sleep(0.75)
         except Exception as exc:  # task failures are persisted for UI recovery
             try:
                 current = store.get_task(task_id)
-                if current.state not in {TaskState.CANCELLED, TaskState.SUCCEEDED}:
+                # Once ComfyUI has returned a prompt ID, a transport timeout only
+                # means this observer lost its connection. Leave the task running;
+                # the dispatcher will reattach to the same prompt and read again.
+                submitted_transport_failure = (
+                    isinstance(exc, httpx.TransportError)
+                    and bool(current.comfyui_prompt_id)
+                )
+                if (
+                    current.state not in {TaskState.CANCELLED, TaskState.SUCCEEDED}
+                    and not submitted_transport_failure
+                ):
                     store.transition_task(
                         task_id,
                         TaskState.FAILED,
-                        error_code="local_image_generation_failed",
-                        error_message=str(exc)[:2000],
+                        error_code=(
+                            "local_output_collection_failed"
+                            if workflow_completed
+                            else "local_comfy_execution_failed"
+                        ),
+                        error_message=(str(exc) or type(exc).__name__)[:2000],
                     )
             except (TaskNotFoundError, InvalidTaskTransitionError):
                 pass
@@ -1110,23 +1258,11 @@ def create_app(
             '"evidence":"...","suggested_action":"..."}]}。'
             "没有问题时 issues 为空。\n提示词：" + prompt_text
         )
-        api_key = (
-            runtime_settings.llm_api_key.get_secret_value()
-            if runtime_settings.llm_api_key
-            else None
-        )
-
         async def complete(parts: list[object]) -> dict[str, object]:
-            async with OpenAICompatibleClient(
-                base_url=runtime_settings.llm_base_url or "",
-                model=runtime_settings.llm_model or "",
-                api_key=api_key,
-                timeout_seconds=runtime_settings.llm_timeout_seconds,
-                proxy=runtime_settings.network_proxy,
-            ) as client:
-                raw = await client.complete_json(
-                    (ChatMessage(role="user", content=tuple(parts)),)  # type: ignore[arg-type]
-                )
+            raw = await complete_json(
+                remote_config(runtime_settings),
+                (ChatMessage(role="user", content=tuple(parts)),),  # type: ignore[arg-type]
+            )
             result = json.loads(raw)
             if not isinstance(result, dict) or not isinstance(result.get("accepted"), bool):
                 raise ValueError("AI Reviewer 返回结构无效")
@@ -1235,16 +1371,22 @@ def create_app(
         elif disposition == ReviewDisposition.NEEDS_HUMAN:
             get_task_store().transition_task(task.task_id, TaskState.NEEDS_REVIEW)
         else:
-            previous_reworks = get_task_store().list_rework_requests(
-                project_id=task.project_id, segment_id=segment_id
-            )
+            previous_reworks = [
+                item
+                for item in get_task_store().list_rework_markers(task.project_id)
+                if item.segment_id == segment_id and item.state != ReworkMarkerState.CANCELLED
+            ]
             action, reason = automatic_rework_policy(
                 issues,
                 effective_mode=run_state.review_policy.effective_mode,
                 previous_reworks=len(previous_reworks),
             )
+            if run_state.time_budget and run_state.time_budget.retry_budget_exhausted:
+                action = None
+                reason = "剩余时间预算不足，接受当前版本并保留审核证据"
 
-            rework: ReworkRequest | None = None
+            marker: ReworkMarker | None = None
+            batch: GenerationBatch | None = None
             if action is not None:
                 replacement_seed = None
                 if action == ReworkAction.CHANGE_SEED:
@@ -1255,20 +1397,31 @@ def create_app(
                         hashlib.sha256(seed_material).digest()[:8], "big"
                     ) & ((1 << 63) - 1)
                 try:
-                    rework = await create_segment_rework(
-                        task.project_id,
-                        segment_id,
-                        SegmentReworkRequest(
-                            source_h3_task_id=h3_task.task_id,
-                            review_task_id=task.task_id,
-                            action=action,
-                            feedback=reason,
-                            replacement_seed=replacement_seed,
-                        ),
+                    version = next(
+                        item
+                        for item in get_task_store().list_segment_generation_versions(
+                            task.project_id
+                        )
+                        if item.task_id == h3_task.task_id
                     )
-                except HTTPException as exc:
+                    marker = create_rework_marker(
+                        get_task_store(),
+                        project_id=task.project_id,
+                        version=version,
+                        action=action,
+                        feedback=reason,
+                        replacement_seed=replacement_seed,
+                        source="ai",
+                    )
+                    workspace = get_task_store().get_latest_project_workspace(task.project_id)
+                    batch = confirm_rework_markers(
+                        get_task_store(),
+                        project_id=task.project_id,
+                        payload=workspace.payload,
+                    )
+                except (KeyError, StopIteration, ValueError, StoreConflictError) as exc:
                     action = None
-                    reason = f"自动返工事务创建失败：{exc.detail}"
+                    reason = f"自动返工批次创建失败：{exc}"
 
             get_task_store().put_task_checkpoint(
                 TaskCheckpoint(
@@ -1279,32 +1432,25 @@ def create_app(
                     payload={
                         "action": action.value if action else None,
                         "reason": reason,
-                        "rework_request_id": rework.request_id if rework else None,
-                        "replacement_task_id": rework.replacement_task_id if rework else None,
-                        "attempts_used": len(previous_reworks) + (1 if rework else 0),
+                        "rework_marker_id": marker.marker_id if marker else None,
+                        "generation_batch_id": batch.batch_id if batch else None,
+                        "attempts_used": len(previous_reworks) + (1 if marker else 0),
                         "max_attempts": 2,
                     },
                     created_at=datetime.now(UTC),
                 )
             )
-            if rework is None or rework.replacement_task_id is None:
+            if marker is None:
                 get_task_store().transition_task(
                     task.task_id,
-                    TaskState.NEEDS_REVIEW,
-                    error_code=(
-                        "ai_review_needs_prompt_revision"
-                        if rework is not None
-                        else "ai_review_needs_human"
-                    ),
+                    TaskState.SUCCEEDED
+                    if run_state.review_policy.effective_mode == ReviewMode.AI_ONLY
+                    else TaskState.NEEDS_REVIEW,
+                    error_code="ai_review_no_rework",
                     error_message=reason,
                 )
             else:
-                get_task_store().transition_task(
-                    task.task_id,
-                    TaskState.FAILED,
-                    error_code="ai_review_rework_queued",
-                    error_message=reason,
-                )
+                get_task_store().transition_task(task.task_id, TaskState.SUCCEEDED)
 
     def register_generated_asset_candidate(
         project_id: str,
@@ -1415,12 +1561,8 @@ def create_app(
                     ExportSpec(
                         inputs=tuple(ExportInput(path=sources[value]) for value in ordered),
                         output_path=output_path,
-                        width=int(
-                            post.get("outputWidth") or workspace.payload.get("width") or 1024
-                        ),
-                        height=int(
-                            post.get("outputHeight") or workspace.payload.get("height") or 608
-                        ),
+                        width=int(workspace.payload.get("width") or 1024),
+                        height=int(workspace.payload.get("height") or 608),
                         fps=output_fps,
                     ),
                     work_directory=Path(resolved_settings.data_root) / "export-work",
@@ -1538,6 +1680,88 @@ def create_app(
     async def local_task_dispatch_loop() -> None:
         while True:
             try:
+                reconcile_generation_batches(get_task_store())
+                for generation_batch in get_task_store().list_generation_batches_all():
+                    if not generation_batch.dispatch_requested or generation_batch.state in {
+                        GenerationBatchState.COMPLETED,
+                        GenerationBatchState.CANCELLED,
+                    }:
+                        continue
+                    run_state = get_task_store().get_project_run_state(generation_batch.project_id)
+                    if run_state.paused:
+                        continue
+                    selected_ids = {
+                        *generation_batch.encoding_task_ids,
+                        *generation_batch.task_ids,
+                    }
+                    if generation_batch.model_switch_task_id:
+                        selected_ids.add(generation_batch.model_switch_task_id)
+                    selected = [
+                        task
+                        for task in get_task_store().list_tasks(
+                            project_id=generation_batch.project_id
+                        )
+                        if task.task_id in selected_ids
+                    ]
+                    if any(
+                        task.state in {TaskState.QUEUED, TaskState.RUNNING} for task in selected
+                    ):
+                        continue
+                    workspace = get_task_store().get_latest_project_workspace(
+                        generation_batch.project_id
+                    )
+                    frozen = frozen_segment_ids(
+                        motion_context_segments(workspace.payload),
+                        (
+                            marker
+                            for marker in get_task_store().list_rework_markers(
+                                generation_batch.project_id
+                            )
+                            if marker.batch_id != generation_batch.batch_id
+                        ),
+                    )
+                    versions_by_task = {
+                        version.task_id: version
+                        for version in get_task_store().list_segment_generation_versions(
+                            generation_batch.project_id
+                        )
+                    }
+                    ready_encodes = [
+                        task
+                        for task in selected
+                        if task.kind == TaskKind.CONDITIONING_ENCODING
+                        and task.state == TaskState.READY
+                    ]
+                    switch = next(
+                        (
+                            task
+                            for task in selected
+                            if task.task_id == generation_batch.model_switch_task_id
+                        ),
+                        None,
+                    )
+                    ready_videos = sorted(
+                        (
+                            task
+                            for task in selected
+                            if task.kind == TaskKind.H3_GENERATION
+                            and task.state == TaskState.READY
+                            and versions_by_task.get(task.task_id) is not None
+                            and versions_by_task[task.task_id].segment_id not in frozen
+                        ),
+                        key=lambda task: (-task.priority, task.task_id),
+                    )
+                    candidate = (
+                        min(ready_encodes, key=lambda task: task.task_id)
+                        if ready_encodes
+                        else switch
+                        if switch is not None and switch.state == TaskState.READY
+                        else ready_videos[0]
+                        if ready_videos
+                        else None
+                    )
+                    if candidate is not None:
+                        get_task_store().transition_task(candidate.task_id, TaskState.QUEUED)
                 takeover_states = get_task_store().apply_expired_review_deadlines()
                 takeover_projects = {state.project_id for state in takeover_states}
                 for project_id in takeover_projects:
@@ -1577,6 +1801,9 @@ def create_app(
                                     batch_task.task_id, TaskState.QUEUED
                                 )
                 for task in get_task_store().list_tasks():
+                    if task.kind == TaskKind.AI_REVIEW and task.state == TaskState.READY:
+                        get_task_store().transition_task(task.task_id, TaskState.QUEUED)
+                        task = get_task_store().get_task(task.task_id)
                     if (
                         task.kind
                         in {
@@ -1585,8 +1812,13 @@ def create_app(
                             TaskKind.H3_GENERATION,
                             TaskKind.SEEDVR2,
                             TaskKind.RIFE,
+                            TaskKind.WHISPER,
                         }
                         and task.execution_target == ExecutionTarget.LOCAL
+                        and (
+                            task.kind != TaskKind.WHISPER
+                            or task.workload_manifest_sha256 is not None
+                        )
                         and task.state in {TaskState.QUEUED, TaskState.RUNNING}
                         and task.task_id not in local_job_ids
                     ):
@@ -1605,6 +1837,10 @@ def create_app(
                             TaskKind.EXPORT,
                         }
                         and task.execution_target == ExecutionTarget.LOCAL
+                        and (
+                            task.kind != TaskKind.WHISPER
+                            or task.workload_manifest_sha256 is None
+                        )
                         and task.state == TaskState.QUEUED
                         and task.task_id not in local_job_ids
                     ):
@@ -1612,9 +1848,16 @@ def create_app(
                         job = asyncio.create_task(execute_local_control_task(task.task_id))
                         local_jobs.add(job)
                         job.add_done_callback(local_jobs.discard)
-            except Exception:
-                # Individual tasks persist their own failures; keep the dispatcher alive.
-                pass
+            except Exception as exc:
+                # Keep the dispatcher alive, but make scheduler faults observable and
+                # attach enough state to diagnose a stuck ready/queued task.
+                logger.exception(
+                    "local_dispatcher_iteration_failed",
+                    extra={
+                        "scheduler_error_type": type(exc).__name__,
+                        "active_local_jobs": len(local_job_ids),
+                    },
+                )
             await asyncio.sleep(1.0)
 
     async def cancel_task_execution(task_id: str) -> TaskSpec:
@@ -1667,7 +1910,10 @@ def create_app(
         ffprobe_ready = ffprobe.is_file() or shutil.which(str(ffprobe)) is not None
         h3_revisions = get_task_store().list_harness_revisions("h3:default")
         harness_ready = any(
-            revision.approval == ApprovalState.APPROVED for revision in h3_revisions
+            revision.approval == ApprovalState.APPROVED
+            and revision.schema_version == "2.0"
+            and revision.runtime_manifest is not None
+            for revision in h3_revisions
         )
         capabilities = await worker_adapter().capabilities()
         blockers: list[str] = []
@@ -1706,6 +1952,7 @@ def create_app(
             "llm_model": runtime_settings.llm_model,
             "llm_api_key_configured": runtime_settings.llm_api_key is not None,
             "llm_timeout_seconds": runtime_settings.llm_timeout_seconds,
+            "llm_first_token_timeout_seconds": runtime_settings.llm_first_token_timeout_seconds,
             "llm_video_capable": runtime_settings.llm_video_capable,
             "network_proxy": runtime_settings.network_proxy,
             "h3_diffusion_model": runtime_settings.h3_diffusion_model,
@@ -1723,20 +1970,10 @@ def create_app(
     async def list_llm_models() -> dict[str, object]:
         if not runtime_settings.llm_base_url:
             raise HTTPException(status_code=503, detail="LLM API URL is not configured")
-        api_key = (
-            runtime_settings.llm_api_key.get_secret_value()
-            if runtime_settings.llm_api_key
-            else None
-        )
         try:
-            async with OpenAICompatibleClient(
-                base_url=runtime_settings.llm_base_url,
-                model=runtime_settings.llm_model or "model-listing",
-                api_key=api_key,
-                timeout_seconds=runtime_settings.llm_timeout_seconds,
-                proxy=runtime_settings.network_proxy,
-            ) as client:
-                models = await client.list_models()
+            models = await list_models(
+                remote_config(runtime_settings, model="model-listing")
+            )
         except LLMClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {"models": models, "count": len(models)}
@@ -1805,6 +2042,7 @@ def create_app(
                 "llm_model": request.llm_model or None,
                 "llm_api_key": api_key,
                 "llm_timeout_seconds": request.llm_timeout_seconds,
+                "llm_first_token_timeout_seconds": request.llm_first_token_timeout_seconds,
                 "llm_video_capable": request.llm_video_capable,
                 "network_proxy": request.network_proxy or None,
                 "h3_diffusion_model": request.h3_diffusion_model,
@@ -1972,9 +2210,7 @@ def create_app(
         revisions = get_task_store().list_workflow_revisions(
             template_id, latest_only=not include_history
         )
-        # Pre-release builds registered a machine-specific built-in Z-Image graph.
-        # Keep those immutable rows for audit, but never advertise or execute them.
-        return tuple(item for item in revisions if not item.template_id.startswith("builtin:"))
+        return revisions
 
     @app.get("/api/v1/workflows/templates/{template_id}/{revision}")
     async def get_workflow_template(template_id: str, revision: int) -> WorkflowTemplate:
@@ -1982,6 +2218,42 @@ def create_app(
             return get_task_store().get_workflow_revision(template_id, revision)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="workflow template not found") from exc
+
+    @app.delete("/api/v1/workflows/templates/{template_id}")
+    async def delete_workflow_template(template_id: str) -> dict[str, object]:
+        store = get_task_store()
+        references: list[str] = []
+        for project in store.list_projects():
+            with suppress(KeyError):
+                workspace = store.get_latest_project_workspace(project.project_id)
+                if _payload_contains_value(workspace.payload, template_id):
+                    references.append(f"项目“{project.name}”")
+        for task in store.list_tasks():
+            if task.state in {
+                TaskState.SUCCEEDED,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+                TaskState.STALE,
+            } or not task.workload_manifest_sha256:
+                continue
+            manifest = store.get_workload_manifest(task.workload_manifest_sha256).manifest
+            if manifest.workflow_template_id == template_id:
+                references.append(f"未结束任务 {task.task_id}")
+        if references:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "工作流仍在使用中，请先从项目中取消选择或清除相关任务",
+                    "references": tuple(dict.fromkeys(references)),
+                },
+            )
+        try:
+            removed = store.delete_workflow_template(template_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="workflow template not found") from exc
+        except StoreConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"deleted": True, "removed_revisions": removed}
 
     @app.post("/api/v1/workflows/compile")
     async def compile_image_workflow(request: WorkflowCompileRequest) -> CompiledWorkflow:
@@ -2080,19 +2352,8 @@ def create_app(
     ) -> WorkflowMappingDraft:
         if not runtime_settings.llm_base_url or not runtime_settings.llm_model:
             raise HTTPException(status_code=503, detail="LLM provider is not configured")
-        api_key = (
-            runtime_settings.llm_api_key.get_secret_value()
-            if runtime_settings.llm_api_key
-            else None
-        )
         try:
-            async with OpenAICompatibleClient(
-                base_url=runtime_settings.llm_base_url,
-                model=runtime_settings.llm_model,
-                api_key=api_key,
-                timeout_seconds=runtime_settings.llm_timeout_seconds,
-                proxy=runtime_settings.network_proxy,
-            ) as client:
+            async with open_client(remote_config(runtime_settings)) as client:
                 return await LLMHarness(client).map_workflow(request)
         except LLMClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -2142,6 +2403,32 @@ def create_app(
             ],
             "project_assets": project_asset_context,
         }
+        if request.operation in {"initialize_assets", "refine_assets"}:
+            shots = workspace.payload.get("shots")
+            context["asset_binding_contract"] = {
+                "shot_catalog": [
+                    {
+                        "shotId": str(item.get("id")),
+                        "title": str(item.get("title") or ""),
+                        "summary": str(item.get("summary") or ""),
+                        "durationSeconds": item.get("durationSeconds"),
+                    }
+                    for item in shots
+                    if isinstance(item, dict) and item.get("id")
+                ] if isinstance(shots, list) else [],
+                    "rules": [
+                        "scope=shot requires an existing shotId from shot_catalog",
+                    "shotIds must list every shot that uses the material; one plan may serve many shots",
+                    "use scope=public with shotIds for a shared material used by a selected set of shots",
+                    "use scope=public with an empty shotIds only for genuinely project-wide reusable material",
+                    "do not duplicate a plan when the same material is reused by multiple shots",
+                    (
+                        "never leave shotId null merely because the binding is uncertain; "
+                        "infer it from shot summary"
+                    ),
+                ],
+                "existing_asset_plans": workspace.payload.get("assetPlans", []),
+            }
         instruction = (
             f"{request.instruction}\n\nAuthoritative project context:\n"
             f"{json.dumps(context, ensure_ascii=False, sort_keys=True)}"
@@ -2167,7 +2454,7 @@ def create_app(
                     kind=MemoryEventKind.MESSAGE,
                     source=DecisionSource.USER,
                     role=dialog_role,
-                    content=request.instruction,
+                    content=request.display_instruction or request.instruction,
                     input_sha256=input_sha256,
                     created_at=datetime.now(UTC),
                 )
@@ -2197,22 +2484,11 @@ def create_app(
                 detail="无法保存项目主管调用记录，请重试；LLM 尚未被调用",
             ) from exc
 
-        api_key = (
-            runtime_settings.llm_api_key.get_secret_value()
-            if runtime_settings.llm_api_key
-            else None
-        )
         max_repairs = (
             0 if run_state.time_budget and run_state.time_budget.retry_budget_exhausted else 3
         )
         try:
-            async with OpenAICompatibleClient(
-                base_url=runtime_settings.llm_base_url,
-                model=runtime_settings.llm_model,
-                api_key=api_key,
-                timeout_seconds=runtime_settings.llm_timeout_seconds,
-                proxy=runtime_settings.network_proxy,
-            ) as client:
+            async with open_client(remote_config(runtime_settings)) as client:
                 response = await LLMHarness(client, max_repair_attempts=max_repairs).propose_patch(
                     operation, asset_image_urls=asset_image_urls
                 )
@@ -2294,46 +2570,8 @@ def create_app(
         project_id: str, request: ProjectAgentOperationRequest
     ) -> StreamingResponse:
         """Stream provider deltas while preserving the validated final response."""
-
-        async def events():
-            queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
-
-            def publish(delta: str) -> None:
-                queue.put_nowait(("delta", delta))
-
-            async def run() -> None:
-                token = llm_delta_callback.set(publish)
-                try:
-                    result = await operate_project_with_agent(project_id, request)
-                    await queue.put(("result", result))
-                except HTTPException as exc:
-                    await queue.put(("error", {"status": exc.status_code, "detail": exc.detail}))
-                except Exception as exc:
-                    await queue.put(("error", {"status": 500, "detail": str(exc)}))
-                finally:
-                    llm_delta_callback.reset(token)
-
-            task = asyncio.create_task(run())
-            try:
-                while True:
-                    kind, value = await queue.get()
-                    payload = json.dumps(
-                        jsonable_encoder(value),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    yield f"event: {kind}\ndata: {payload}\n\n"
-                    if kind in {"result", "error"}:
-                        break
-            finally:
-                if not task.done():
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-        return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        return stream_llm_operation(
+            lambda: operate_project_with_agent(project_id, request)
         )
 
     async def run_batch_project_orchestration(task: TaskSpec) -> None:
@@ -2379,11 +2617,13 @@ def create_app(
                     operation_id=str(uuid.uuid4()),
                     operation="initialize_storyboard",
                     instruction=(
-                        "根据已批准大纲自动生成完整电影分镜。长镜头可超过15秒，但系统会"
-                        "分别编写提示词并通过 Motion Context 拼接；续段需在15秒预算中"
-                        "预留至少2秒末尾潜空间，所以不要机械拆成15+15。30秒可用10+10+10，"
-                        "并把接缝放在密集信息结束后、运动与机位较稳定处。"
+                        "根据当前项目内容自动生成完整电影分镜。需要连续生成的镜头在"
+                        "motionSegments 中逐段填写 durationSeconds 和 summary；分段合计须等于"
+                        "镜头时长，每段至少4秒，首段最多15秒，续段最多12秒。不要机械拆成"
+                        "15+15；30秒可用10+10+10，并把接缝放在密集信息结束后、运动与机位"
+                        "较稳定处，summary 写清交给下一段继承的结束状态。"
                     ),
+                    display_instruction="批量模式自动生成电影分镜",
                     allowed_paths=("/shots",),
                     commit=True,
                 ),
@@ -2404,6 +2644,7 @@ def create_app(
                         "根据已批准创意、大纲、分镜和现有项目图片规划仍缺少的素材。"
                         "不得重复已有素材；每项图片总像素约1280×1280并独立决定构图。"
                     ),
+                    display_instruction="批量模式自动规划缺失素材",
                     allowed_paths=("/assetPlans", "/referenceAssetMode"),
                     commit=True,
                 ),
@@ -2475,8 +2716,8 @@ def create_app(
             if compile_response.is_error:
                 raise ValueError(f"任务 DAG 编译失败：{compile_response.text[:2000]}")
 
-        compiled_ids = tuple(
-            item.task_id
+        compiled_tasks = tuple(
+            item
             for item in store.list_tasks(project_id=project_id)
             if item.task_id != task.task_id
             and item.state
@@ -2490,21 +2731,23 @@ def create_app(
         for batch in store.list_batch_runs():
             if batch.state != BatchState.RUNNING:
                 continue
-            changed_items = tuple(
-                item.model_copy(
-                    update={"task_ids": tuple(dict.fromkeys((task.task_id, *compiled_ids)))}
-                )
-                if item.project_id == project_id and task.task_id in item.task_ids
-                else item
-                for item in batch.items
+            member = next(
+                (
+                    item
+                    for item in batch.items
+                    if item.project_id == project_id and task.task_id in item.task_ids
+                ),
+                None,
             )
-            if changed_items != batch.items:
-                store.put_batch_run(
-                    batch.model_copy(
-                        update={"items": changed_items, "updated_at": datetime.now(UTC)}
-                    )
+            if member is not None:
+                compiled_ids = resolve_batch_task_ids(compiled_tasks, member.start_boundary)
+                store.expand_running_batch_project_tasks(
+                    batch_id=batch.batch_id,
+                    project_id=project_id,
+                    orchestration_task_id=task.task_id,
+                    task_ids=compiled_ids,
                 )
-        checkpoint(60, "dag_compiled", task_count=len(compiled_ids))
+        checkpoint(60, "dag_compiled", task_count=len(compiled_tasks))
 
     @app.get("/api/v1/harnesses")
     async def list_harnesses() -> tuple[HarnessBundle, ...]:
@@ -2566,6 +2809,7 @@ def create_app(
             raise HTTPException(status_code=422, detail="assembled H3 Harness has invalid size")
         revisions = get_task_store().list_harness_revisions("h3:default")
         revision = HarnessRevision(
+            schema_version="2.0",
             harness_id="h3:default",
             revision=(revisions[-1].revision + 1 if revisions else 1),
             markdown=markdown,
@@ -2583,13 +2827,13 @@ def create_app(
             output_schema={
                 "type": "object",
                 "required": [
-                    "execution_prompt_zh",
+                    "execution_prompt",
                     "generation_mode",
                     "review",
                     "duration_seconds",
                 ],
                 "properties": {
-                    "execution_prompt_zh": {
+                    "execution_prompt": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 7000,
@@ -2604,6 +2848,10 @@ def create_app(
                     "assumptions": {"type": "array", "items": {"type": "string"}},
                 },
             },
+            runtime_manifest=library.to_manifest(
+                official_commit=H3_OFFICIAL_SKILL_COMMIT,
+                community_commit=H3_COMMUNITY_SKILLS_COMMIT,
+            ),
             content_sha256="0" * 64,
             approval=ApprovalState.APPROVED if approve else ApprovalState.DRAFT,
             created_at=datetime.now(UTC),
@@ -2660,9 +2908,20 @@ def create_app(
         if selected is None:
             raise HTTPException(status_code=404, detail="harness revision not found")
         return {
-            "executable": selected.approval.value == "approved",
+            "executable": (
+                selected.approval.value == "approved"
+                and selected.schema_version == "2.0"
+                and selected.runtime_manifest is not None
+            ),
             "gpu_task_started": False,
-            "checks": ["content_hash", "input_schema", "output_schema", "workflow_binding"],
+            "checks": [
+                "content_hash",
+                "input_schema",
+                "output_schema",
+                "workflow_binding",
+                "runtime_manifest",
+                "stage_bindings",
+            ],
         }
 
     @app.post("/api/v1/tasks", status_code=201)
@@ -2721,6 +2980,28 @@ def create_app(
             return get_task_store().get_latest_project_revision(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
+
+    @app.post("/api/v1/projects/{project_id}/tasks/clear")
+    async def clear_project_tasks(project_id: str) -> dict[str, object]:
+        try:
+            get_task_store().get_latest_project_revision(project_id)
+            removed = get_task_store().clear_project_tasks(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except StoreConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"removed_tasks": removed, "media_retained": True}
+
+    @app.delete("/api/v1/projects/{project_id}")
+    async def delete_project(project_id: str) -> dict[str, object]:
+        try:
+            get_task_store().get_latest_project_revision(project_id)
+            removed = get_task_store().delete_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except StoreConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"deleted": True, "removed_tasks": removed, "media_files_retained": True}
 
     @app.post("/api/v1/projects/{project_id}/revisions", status_code=201)
     async def create_named_project_revision(project_id: str, project: ProjectSpec) -> ProjectSpec:
@@ -2788,7 +3069,11 @@ def create_app(
                         update={
                             "outline_approved": isinstance(approvals, dict)
                             and "outline" in approvals,
-                            "current_stage": str(request.payload.get("activeStage", "idea")),
+                            "current_stage": (
+                                "generation"
+                                if request.payload.get("activeStage") == "review"
+                                else str(request.payload.get("activeStage", "idea"))
+                            ),
                             "time_budget": budget,
                             "updated_at": datetime.now(UTC),
                         }
@@ -3088,16 +3373,57 @@ def create_app(
                 asset_store.release_generation_candidate_acceptance(candidate_id)
 
     @app.post("/api/v1/projects/{project_id}/tasks/compile", status_code=201)
-    async def compile_project_tasks(project_id: str) -> dict[str, object]:
+    async def compile_project_tasks(
+        project_id: str, restart_h3: bool = Query(default=False)
+    ) -> dict[str, object]:
+        nonlocal runtime_settings
         try:
             workspace = get_task_store().get_latest_project_workspace(project_id)
             run_state = get_task_store().get_project_run_state(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project workspace not found") from exc
+        if restart_h3:
+            runtime_settings = load_runtime_settings(resolved_settings)
+            restart_kinds = {
+                TaskKind.CONDITIONING_ENCODING,
+                TaskKind.MODEL_SWITCH,
+                TaskKind.H3_GENERATION,
+                TaskKind.AI_REVIEW,
+                TaskKind.SEEDVR2,
+                TaskKind.RIFE,
+                TaskKind.WHISPER,
+                TaskKind.MASTER_ASSEMBLY,
+                TaskKind.EXPORT,
+            }
+            active = [
+                task
+                for task in get_task_store().list_tasks(project_id=project_id)
+                if task.kind in restart_kinds
+                and task.state in {TaskState.QUEUED, TaskState.RUNNING}
+            ]
+            try:
+                for task in active:
+                    await cancel_task_execution(task.task_id)
+            except (httpx.HTTPError, ValueError, InvalidTaskTransitionError) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"无法取消旧 MiniMax H3 执行任务：{exc}",
+                ) from exc
+            run_state = get_task_store().put_project_run_state(
+                run_state.model_copy(
+                    update={
+                        "generation_revision": run_state.generation_revision + 1,
+                        "paused": False,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+            )
+        execution_profile = h3_execution_profile(run_state)
         workflows = {
             item.template_id
             for item in get_task_store().list_workflow_revisions()
             if item.approval == WorkflowApproval.APPROVED
+            and item.kind == "image"
             and not item.template_id.startswith("builtin:")
         }
         image_harnesses: dict[str, int] = {}
@@ -3118,6 +3444,7 @@ def create_app(
             run_state=run_state,
             approved_image_workflows=workflows,
             approved_image_harnesses=image_harnesses,
+            h3_execution_profile=execution_profile,
         )
         generation_inputs = {
             key: workspace.payload.get(key)
@@ -3144,6 +3471,7 @@ def create_app(
                     run_state=run_state,
                     approved_image_workflows=workflows,
                     approved_image_harnesses=image_harnesses,
+                    h3_execution_profile=execution_profile,
                 ).fingerprint
             )
         legacy_prefixes = tuple(
@@ -3171,6 +3499,7 @@ def create_app(
                 run_state=run_state,
                 approved_image_workflows=workflows,
                 approved_image_harnesses=image_harnesses,
+                h3_execution_profile=execution_profile,
                 reusable_tasks=legacy_reusable,
             )
         if plan.blockers:
@@ -3289,13 +3618,11 @@ def create_app(
                     update={"workload_manifest_sha256": record.sha256}
                 )
             h3_prompts = workspace.payload.get("prompts", {}).get("h3Prompts", [])
-            ready_h3_prompts = (
+            executable_h3_prompts = (
                 [
                     item
                     for item in h3_prompts
-                    if isinstance(item, dict)
-                    and isinstance(item.get("review"), dict)
-                    and item["review"].get("ready") is True
+                    if isinstance(item, dict) and str(item.get("prompt") or "").strip()
                 ]
                 if isinstance(h3_prompts, list)
                 else []
@@ -3309,14 +3636,27 @@ def create_app(
                 not encode_task.workload_manifest_sha256 or not h3_task.workload_manifest_sha256
                 for encode_task, h3_task in zip(encode_tasks, h3_tasks, strict=True)
             )
-            object_info = await worker_adapter().get_object_info() if needs_h3_manifests else None
+            try:
+                object_info = (
+                    await worker_adapter().get_object_info()
+                    if needs_h3_manifests
+                    else None
+                )
+            except (httpx.HTTPError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "ComfyUI 节点清单暂时不可用；任务尚未派发，请稍后重试。"
+                        f" ({exc})"
+                    ),
+                ) from exc
             for encode_task, h3_task, prompt in zip(
-                encode_tasks, h3_tasks, ready_h3_prompts, strict=True
+                encode_tasks, h3_tasks, executable_h3_prompts, strict=True
             ):
                 if encode_task.workload_manifest_sha256 and h3_task.workload_manifest_sha256:
                     continue
                 assert object_info is not None
-                asset_blobs: list[tuple[str, str, str]] = []
+                asset_blobs: list[tuple[str, str, str, str]] = []
                 for asset_id in prompt.get("assetIds", []):
                     try:
                         asset = asset_store.get_asset(project_id, str(asset_id))
@@ -3326,8 +3666,23 @@ def create_app(
                         "image/jpeg": ".jpg",
                         "image/png": ".png",
                         "image/webp": ".webp",
-                    }.get(asset.mime_type, ".img")
-                    asset_blobs.append((asset.asset_id, asset.sha256, suffix))
+                        "video/mp4": ".mp4",
+                        "video/quicktime": ".mov",
+                        "video/webm": ".webm",
+                        "audio/wav": ".wav",
+                        "audio/mpeg": ".mp3",
+                        "audio/flac": ".flac",
+                        "audio/ogg": ".ogg",
+                        "audio/mp4": ".m4a",
+                    }.get(asset.mime_type, Path(asset.original_name).suffix or ".bin")
+                    asset_blobs.append(
+                        (
+                            asset.asset_id,
+                            asset.sha256,
+                            suffix,
+                            asset.mime_type or "application/octet-stream",
+                        )
+                    )
                 encode_manifest, h3_manifest = compile_h3_segment_manifests(
                     settings=runtime_settings,
                     project_id=project_id,
@@ -3345,65 +3700,15 @@ def create_app(
                 task_values[task_values.index(h3_task)] = h3_task.model_copy(
                     update={"workload_manifest_sha256": h3_record.sha256}
                 )
-            rife_tasks = [task for task in task_values if task.kind == TaskKind.RIFE]
-            if any(not task.workload_manifest_sha256 for task in rife_tasks):
-                if object_info is None:
-                    object_info = await worker_adapter().get_object_info()
-                post = workspace.payload.get("postProcessing")
-                interpolation = post.get("rife") if isinstance(post, dict) else None
-                if not isinstance(interpolation, dict):
-                    raise ValueError("插帧任务缺少项目配置")
-                profile_id = str(interpolation.get("profileId") or "")
-                if profile_id != "interpolation:rife":
-                    raise ValueError(f"Profile {profile_id or '(未选择)'} 尚无可执行工作流")
-                for task in rife_tasks:
-                    if task.workload_manifest_sha256:
-                        continue
-                    if len(task.depends_on) != 1:
-                        raise ValueError("逐片段插帧任务必须只有一个视频输入")
-                    source_task_id = task.depends_on[0]
-                    source_task = next(
-                        (item for item in task_values if item.task_id == source_task_id), None
-                    )
-                    if source_task is None:
-                        raise ValueError("插帧任务的视频输入不存在")
-                    h3_sources = (
-                        [source_task]
-                        if source_task.kind == TaskKind.H3_GENERATION
-                        else [
-                            item
-                            for item in task_values
-                            if item.kind == TaskKind.H3_GENERATION
-                            and item.task_id in source_task.depends_on
-                        ]
-                    )
-                    if not h3_sources and source_task.kind == TaskKind.AI_REVIEW:
-                        h3_sources = [
-                            item
-                            for item in task_values
-                            if item.kind == TaskKind.H3_GENERATION
-                            and item.task_id in source_task.depends_on
-                        ]
-                    if len(h3_sources) != 1 or not h3_sources[0].workload_manifest_sha256:
-                        raise ValueError("无法确定插帧任务对应的 H3 片段")
-                    source_manifest = (
-                        get_task_store()
-                        .get_workload_manifest(h3_sources[0].workload_manifest_sha256)
-                        .manifest
-                    )
-                    manifest = compile_rife_manifest(
-                        project_id=project_id,
-                        segment_id=source_manifest.context.get("segment_id", ""),
-                        source_task_id=source_task_id,
-                        source_fps=int(workspace.payload.get("fps") or 24),
-                        target_fps=int(interpolation.get("targetFps") or 48),
-                        model_id=str(interpolation.get("modelId") or ""),
-                        node_schema_sha256=object_info.node_schema_sha256,
-                    )
-                    record = get_task_store().put_workload_manifest(manifest)
-                    task_values[task_values.index(task)] = task.model_copy(
-                        update={"workload_manifest_sha256": record.sha256}
-                    )
+            post = workspace.payload.get("postProcessing")
+            post = post if isinstance(post, dict) else {}
+            task_values = _attach_user_postprocessing_manifests(
+                store=get_task_store(),
+                task_values=task_values,
+                post=post,
+                project_id=project_id,
+                source_fps=float(workspace.payload.get("fps") or 24),
+            )
             plan = plan.__class__(
                 fingerprint=plan.fingerprint,
                 tasks=tuple(task_values),
@@ -3424,12 +3729,106 @@ def create_app(
             for task in old_tasks:
                 get_task_store().mark_stale(task.task_id, propagate=False)
             tasks = persist_project_task_plan(get_task_store(), plan)
+            generation_batch = ensure_initial_generation_batch(
+                get_task_store(),
+                project_id=project_id,
+                payload=workspace.payload,
+                tasks=tasks,
+            )
         except (IdempotencyConflictError, StoreConflictError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "fingerprint": plan.fingerprint,
             "workspace_revision": workspace.revision,
+            "h3_execution_profile": execution_profile,
             "tasks": tasks,
+            "generation_batch": generation_batch,
+        }
+
+    @app.post("/api/v1/projects/{project_id}/delivery/tasks/compile", status_code=201)
+    async def compile_project_delivery_tasks(project_id: str) -> dict[str, object]:
+        """Compile post-processing from the active segment chain only."""
+        store = get_task_store()
+        try:
+            workspace = store.get_latest_project_workspace(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project workspace not found") from exc
+        segments = motion_context_segments(workspace.payload)
+        active_versions = {
+            version.segment_id: version
+            for version in store.list_segment_generation_versions(project_id)
+            if version.state.value == "active"
+        }
+        expected_ids = [str(item.get("segmentId") or "") for item in segments]
+        if not expected_ids or any(
+            segment_id not in active_versions for segment_id in expected_ids
+        ):
+            raise HTTPException(status_code=409, detail="活动视频链不完整，无法创建后处理任务")
+        segment_outputs: dict[str, str] = {}
+        original_sources: dict[str, str] = {}
+        for segment_id in expected_ids:
+            version = active_versions[segment_id]
+            source = store.get_task(version.task_id)
+            if not version.artifact_id or not source.workload_manifest_sha256:
+                raise HTTPException(status_code=409, detail=f"片段 {segment_id} 没有可用的活动视频")
+            snapshot_fingerprint = hashlib.sha256(
+                f"{version.version_id}:{version.artifact_id}:{source.task_id}".encode()
+            ).hexdigest()
+            snapshot = store.add_task(
+                TaskSpec(
+                    task_id=f"delivery-source:{project_id}:{snapshot_fingerprint[:16]}",
+                    project_id=project_id,
+                    kind=TaskKind.H3_GENERATION,
+                    state=TaskState.SUCCEEDED,
+                    idempotency_key=snapshot_fingerprint,
+                    input_fingerprint=snapshot_fingerprint,
+                    workload_manifest_sha256=source.workload_manifest_sha256,
+                )
+            )
+            segment_outputs[segment_id] = snapshot.task_id
+            original_sources[snapshot.task_id] = source.task_id
+        existing = {task.task_id: task for task in store.list_tasks(project_id=project_id)}
+        plan = compile_delivery_task_plan(
+            project_id=project_id,
+            payload=workspace.payload,
+            segment_outputs=segment_outputs,
+            reusable_tasks=existing,
+        )
+        if plan.blockers:
+            raise HTTPException(
+                status_code=409, detail={"message": "后处理配置不完整", "blockers": plan.blockers}
+            )
+        task_values = list(plan.tasks)
+        post = workspace.payload.get("postProcessing")
+        post = post if isinstance(post, dict) else {}
+        task_values = _attach_user_postprocessing_manifests(
+            store=store,
+            task_values=task_values,
+            post=post,
+            project_id=project_id,
+            source_fps=float(workspace.payload.get("fps") or 24),
+            source_overrides=original_sources,
+        )
+        new_ids = {task.task_id for task in task_values}
+        obsolete = [
+            task.task_id
+            for task in existing.values()
+            if task.task_id.startswith(f"delivery:{project_id}:")
+            and task.task_id not in new_ids
+            and task.state not in {TaskState.CANCELLED, TaskState.STALE}
+        ]
+        if any(existing[task_id].state == TaskState.RUNNING for task_id in obsolete):
+            raise HTTPException(status_code=409, detail="旧后处理计划仍有运行中任务")
+        for task_id in obsolete:
+            store.mark_stale(task_id, propagate=False)
+        stored = persist_project_task_plan(
+            store,
+            plan.__class__(fingerprint=plan.fingerprint, tasks=tuple(task_values), blockers=()),
+        )
+        return {
+            "fingerprint": plan.fingerprint,
+            "workspace_revision": workspace.revision,
+            "tasks": stored,
         }
 
     @app.get("/api/v1/projects/{project_id}/execution-status")
@@ -3443,6 +3842,7 @@ def create_app(
             item.template_id
             for item in get_task_store().list_workflow_revisions()
             if item.approval == WorkflowApproval.APPROVED
+            and item.kind == "image"
             and not item.template_id.startswith("builtin:")
         }
         image_harnesses: dict[str, int] = {}
@@ -3463,6 +3863,7 @@ def create_app(
             run_state=run_state,
             approved_image_workflows=workflows,
             approved_image_harnesses=image_harnesses,
+            h3_execution_profile=h3_execution_profile(run_state),
         )
         project_tasks = get_task_store().list_tasks(project_id=project_id)
         generation_inputs = {
@@ -3487,6 +3888,7 @@ def create_app(
                     run_state=run_state,
                     approved_image_workflows=workflows,
                     approved_image_harnesses=image_harnesses,
+                    h3_execution_profile=h3_execution_profile(run_state),
                 ).fingerprint
             )
         legacy_prefixes = tuple(
@@ -3514,10 +3916,20 @@ def create_app(
                 run_state=run_state,
                 approved_image_workflows=workflows,
                 approved_image_harnesses=image_harnesses,
+                h3_execution_profile=h3_execution_profile(run_state),
                 reusable_tasks=legacy_reusable,
             )
         current_task_ids = {task.task_id for task in current_plan.tasks}
         base_tasks = tuple(task for task in project_tasks if task.task_id in current_task_ids)
+        plan_is_current = bool(current_plan.tasks) and len(base_tasks) == len(current_plan.tasks)
+        if base_tasks:
+            with suppress(ValueError):
+                ensure_initial_generation_batch(
+                    get_task_store(),
+                    project_id=project_id,
+                    payload=workspace.payload,
+                    tasks=base_tasks,
+                )
         base_video_tasks = tuple(task for task in base_tasks if task.kind == TaskKind.H3_GENERATION)
         known_h3_task_ids = {task.task_id for task in base_video_tasks}
         related_reworks: list[ReworkRequest] = []
@@ -3542,7 +3954,27 @@ def create_app(
             for task in project_tasks
             if any(task.task_id.startswith(value) for value in rework_prefixes)
         )
-        tasks = (*base_tasks, *rework_tasks)
+        generation_task_ids = {
+            task_id
+            for batch in get_task_store().list_generation_batches(project_id)
+            for task_id in (
+                *batch.encoding_task_ids,
+                *batch.task_ids,
+                *((batch.model_switch_task_id,) if batch.model_switch_task_id else ()),
+            )
+        }
+        generation_batch_tasks = tuple(
+            task
+            for task in project_tasks
+            if task.task_id in generation_task_ids
+            and task.task_id not in {item.task_id for item in (*base_tasks, *rework_tasks)}
+        )
+        delivery_only_tasks = tuple(
+            task
+            for task in project_tasks
+            if task.task_id.startswith(f"delivery:{project_id}:") and task.state != TaskState.STALE
+        )
+        tasks = (*base_tasks, *rework_tasks, *generation_batch_tasks, *delivery_only_tasks)
 
         base_reviews = tuple(task for task in base_tasks if task.kind == TaskKind.AI_REVIEW)
         latest_rework_by_segment = {rework.segment_id: rework for rework in related_reworks}
@@ -3575,7 +4007,10 @@ def create_app(
                 effective_review_tasks.append(review)
 
         base_export_tasks = tuple(task for task in base_tasks if task.kind == TaskKind.EXPORT)
-        effective_export_tasks = base_export_tasks
+        effective_export_tasks = (
+            tuple(task for task in delivery_only_tasks if task.kind == TaskKind.EXPORT)
+            or base_export_tasks
+        )
         for rework in reversed(related_reworks):
             branch_exports = tuple(
                 task
@@ -3586,21 +4021,70 @@ def create_app(
                 effective_export_tasks = branch_exports
                 break
         terminal_ok = {TaskState.SUCCEEDED, TaskState.NEEDS_REVIEW}
+        batches = get_task_store().list_generation_batches(project_id)
+        versions = get_task_store().list_segment_generation_versions(project_id)
+        markers = get_task_store().list_rework_markers(project_id)
+        segments = motion_context_segments(workspace.payload)
+        frozen = frozen_segment_ids(segments, markers)
+        active_versions = {
+            version.segment_id: version for version in versions if version.state.value == "active"
+        }
+        hierarchy: list[dict[str, object]] = []
+        shots: dict[str, list[dict[str, object]]] = {}
+        for segment in segments:
+            shot_id = str(segment.get("shotId") or str(segment.get("segmentId")).split(".")[0])
+            segment_id = str(segment.get("segmentId") or "")
+            history = [item for item in versions if item.segment_id == segment_id]
+            active = active_versions.get(segment_id)
+            task = tasks_by_id.get(active.task_id) if active else None
+            shots.setdefault(shot_id, []).append(
+                {
+                    "segment_id": segment_id,
+                    "segment_index": int(segment.get("segmentIndex") or 0),
+                    "active_version": active,
+                    "versions": history,
+                    "task": task,
+                    "frozen": segment_id in frozen,
+                    "freeze_reason": "等待返工" if segment_id in frozen else None,
+                }
+            )
+        for shot_id, shot_segments in shots.items():
+            hierarchy.append({"shot_id": shot_id, "segments": shot_segments})
+        unresolved_markers = [
+            marker
+            for marker in markers
+            if marker.state
+            in {
+                ReworkMarkerState.DRAFT,
+                ReworkMarkerState.PREPARING,
+                ReworkMarkerState.SEALED,
+            }
+        ]
+        active_chain_complete = bool(segments) and all(
+            str(segment.get("segmentId") or "") in active_versions for segment in segments
+        )
         return {
             "workspace_revision": workspace.revision,
-            "compiled": bool(tasks),
+            "compiled": plan_is_current,
             "task_count": len(tasks),
             "tasks": tasks,
             "generation_complete": bool(effective_video_tasks)
             and all(task.state in terminal_ok for task in effective_video_tasks),
-            "review_complete": bool(effective_video_tasks)
-            and (
-                all(task.state == TaskState.SUCCEEDED for task in effective_review_tasks)
-                if effective_review_tasks
-                else all(task.state in terminal_ok for task in effective_video_tasks)
-            ),
+            "review_complete": active_chain_complete and not unresolved_markers,
             "delivery_complete": bool(effective_export_tasks)
             and all(task.state == TaskState.SUCCEEDED for task in effective_export_tasks),
+            "batches": batches,
+            "versions": versions,
+            "rework_markers": markers,
+            "hierarchy": hierarchy,
+            "active_chain_complete": active_chain_complete,
+            "delivery_blocked_reason": (
+                "存在未决返工"
+                if unresolved_markers
+                else "活动视频链不完整"
+                if not active_chain_complete
+                else None
+            ),
         }
 
     @app.post("/api/v1/projects/{project_id}/mode")
@@ -3609,6 +4093,98 @@ def create_app(
             return get_task_store().request_project_mode(project_id, request.mode)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project run state not found") from exc
+
+    @app.post("/api/v1/projects/{project_id}/generation/start")
+    async def start_project_generation(project_id: str) -> GenerationBatch:
+        batches = get_task_store().list_generation_batches(project_id)
+        batch = next(
+            (item for item in reversed(batches) if item.state != GenerationBatchState.COMPLETED),
+            None,
+        )
+        if batch is None:
+            raise HTTPException(status_code=409, detail="项目没有可派发的生成批次")
+        updated = batch.model_copy(
+            update={"dispatch_requested": True, "updated_at": datetime.now(UTC)}
+        )
+        return get_task_store().put_generation_batch(updated)
+
+    @app.post("/api/v1/projects/{project_id}/rework-markers", status_code=201)
+    async def add_rework_marker(project_id: str, request: ReworkMarkerRequest) -> ReworkMarker:
+        version = next(
+            (
+                item
+                for item in get_task_store().list_segment_generation_versions(project_id)
+                if item.version_id == request.version_id
+            ),
+            None,
+        )
+        if version is None:
+            raise HTTPException(status_code=404, detail="视频版本不存在")
+        try:
+            return create_rework_marker(
+                get_task_store(),
+                project_id=project_id,
+                version=version,
+                action=request.action,
+                feedback=request.feedback,
+                replacement_seed=request.replacement_seed,
+                source=request.source,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/projects/{project_id}/rework-markers/{marker_id}")
+    async def update_rework_marker(
+        project_id: str, marker_id: str, request: ReworkMarkerUpdateRequest
+    ) -> ReworkMarker:
+        marker = next(
+            (
+                item
+                for item in get_task_store().list_rework_markers(project_id)
+                if item.marker_id == marker_id
+            ),
+            None,
+        )
+        if marker is None:
+            raise HTTPException(status_code=404, detail="返工标记不存在")
+        if marker.state not in {ReworkMarkerState.DRAFT, ReworkMarkerState.PREPARING}:
+            raise HTTPException(status_code=409, detail="当前返工批次已经封存")
+        values = request.model_dump(exclude_unset=True)
+        try:
+            return get_task_store().put_rework_marker(
+                marker.model_copy(update={**values, "updated_at": datetime.now(UTC)})
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.delete("/api/v1/projects/{project_id}/rework-markers/{marker_id}")
+    async def withdraw_rework_marker(project_id: str, marker_id: str) -> ReworkMarker:
+        marker = next(
+            (
+                item
+                for item in get_task_store().list_rework_markers(project_id)
+                if item.marker_id == marker_id
+            ),
+            None,
+        )
+        if marker is None:
+            raise HTTPException(status_code=404, detail="返工标记不存在")
+        try:
+            return cancel_rework_marker(get_task_store(), marker)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/projects/{project_id}/rework-markers/confirm")
+    async def confirm_project_reworks(project_id: str) -> GenerationBatch:
+        try:
+            workspace = get_task_store().get_latest_project_workspace(project_id)
+            return confirm_rework_markers(
+                get_task_store(), project_id=project_id, payload=workspace.payload
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="项目不存在") from exc
+        except (ValueError, StoreConflictError, IdempotencyConflictError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/projects/{project_id}/pause")
     async def set_project_paused(project_id: str, request: ProjectPauseRequest) -> ProjectRunState:
@@ -3694,7 +4270,9 @@ def create_app(
     async def run_task(task_id: str) -> TaskSpec:
         try:
             task = get_task_store().get_task(task_id)
-            if task.state in {TaskState.FAILED, TaskState.STALE, TaskState.PAUSED}:
+            if task.state in {TaskState.FAILED, TaskState.STALE}:
+                task = get_task_store().prepare_task_retry(task_id)
+            elif task.state == TaskState.PAUSED:
                 task = get_task_store().transition_task(task_id, TaskState.READY)
             if task.state == TaskState.READY:
                 return get_task_store().transition_task(task_id, TaskState.QUEUED)
@@ -3732,7 +4310,7 @@ def create_app(
                 get_task_store().mark_stale(task_id, propagate=False)
             task = get_task_store().get_task(task_id)
             if task.state in {TaskState.STALE, TaskState.FAILED, TaskState.PAUSED}:
-                task = get_task_store().transition_task(task_id, TaskState.READY)
+                task = get_task_store().prepare_task_retry(task_id)
             return get_task_store().transition_task(task.task_id, TaskState.QUEUED)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="task not found") from exc
@@ -4493,6 +5071,11 @@ def _harness_revision_hash(revision: HarnessRevision) -> str:
         "output_schema": revision.output_schema,
         "workflow_template_id": revision.workflow_template_id,
         "workflow_revision": revision.workflow_revision,
+        "runtime_manifest": (
+            revision.runtime_manifest.model_dump(mode="json")
+            if revision.runtime_manifest is not None
+            else None
+        ),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -4506,6 +5089,102 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _payload_contains_value(value: object, expected: str) -> bool:
+    if isinstance(value, dict):
+        return any(_payload_contains_value(item, expected) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_payload_contains_value(item, expected) for item in value)
+    return value == expected
+
+
+def _attach_user_postprocessing_manifests(
+    *,
+    store: SQLiteTaskStore,
+    task_values: list[TaskSpec],
+    post: dict[str, object],
+    project_id: str,
+    source_fps: float,
+    source_overrides: dict[str, str] | None = None,
+) -> list[TaskSpec]:
+    source_overrides = source_overrides or {}
+    definitions = (
+        (TaskKind.SEEDVR2, "seedvr", "restoration"),
+        (TaskKind.RIFE, "rife", "interpolation"),
+        (TaskKind.WHISPER, "whisper", "transcription"),
+    )
+    for task_kind, config_key, template_kind in definitions:
+        config = post.get(config_key)
+        pending = [
+            task
+            for task in task_values
+            if task.kind == task_kind and not task.workload_manifest_sha256
+        ]
+        if not pending:
+            continue
+        if not isinstance(config, dict):
+            raise ValueError(f"{template_kind} 任务缺少项目配置")
+        template_id = str(config.get("workflowTemplateId") or "")
+        template_revision = int(config.get("workflowRevision") or 0)
+        template = next(
+            (
+                item
+                for item in store.list_workflow_revisions(template_id)
+                if item.revision == template_revision
+                and item.approval == WorkflowApproval.APPROVED
+                and item.kind == template_kind
+            ),
+            None,
+        )
+        if template is None:
+            raise ValueError(f"用户{template_kind}工作流未批准、类型错误或版本不存在")
+        for task in pending:
+            if len(task.depends_on) != 1:
+                raise ValueError("用户后处理任务必须只有一个视频输入")
+            source = next(
+                (item for item in task_values if item.task_id == task.depends_on[0]), None
+            ) or store.get_task(task.depends_on[0])
+            if task_kind == TaskKind.WHISPER:
+                segment_id = "master"
+            else:
+                if not source.workload_manifest_sha256:
+                    raise ValueError("后处理任务的视频输入不存在或尚未编译")
+                source_manifest = store.get_workload_manifest(
+                    source.workload_manifest_sha256
+                ).manifest
+                segment_id = str(source_manifest.context.get("segment_id") or "")
+                if not segment_id:
+                    raise ValueError("后处理输入缺少片段标识")
+            factor = (
+                float(config.get("targetFps") or 48) / source_fps
+                if task_kind == TaskKind.RIFE
+                else float(config["upscaleFactor"])
+                if task_kind == TaskKind.SEEDVR2
+                and config.get("upscaleFactor") is not None
+                else None
+            )
+            mount_path = (
+                f"AI-Video-Generator/postprocessing/{project_id}/"
+                f"{task_kind.value}/{segment_id}.mp4"
+            )
+            manifest = compile_user_video_workflow_manifest(
+                template=template,
+                task_kind=task_kind,
+                expected_kind=template_kind,
+                project_id=project_id,
+                segment_id=segment_id,
+                source_task_id=source_overrides.get(source.task_id, source.task_id),
+                input_mount_path=mount_path,
+                model=str(config.get("modelId") or "") or None,
+                factor=factor,
+                language=str(config.get("language") or "auto"),
+            )
+            record = store.put_workload_manifest(manifest)
+            task_values[task_values.index(task)] = task.model_copy(
+                update={"workload_manifest_sha256": record.sha256}
+            )
+    return task_values
 
 
 def _history_media_output(history: dict[str, object], node_id: str) -> dict[str, str] | None:
@@ -4524,6 +5203,22 @@ def _history_media_output(history: dict[str, object], node_id: str) -> dict[str,
                     "subfolder": str(value.get("subfolder") or ""),
                     "type": str(value.get("type") or "output"),
                 }
+    return None
+
+
+def _history_text_output(history: dict[str, object], node_id: str) -> bytes | None:
+    outputs = history.get("outputs")
+    node_output = outputs.get(node_id) if isinstance(outputs, dict) else None
+    if not isinstance(node_output, dict):
+        return None
+    for key in ("text", "texts", "string", "strings", "result"):
+        value = node_output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.encode("utf-8")
+        if isinstance(value, list):
+            text = "\n".join(str(item) for item in value if str(item).strip())
+            if text:
+                return text.encode("utf-8")
     return None
 
 

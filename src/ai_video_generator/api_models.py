@@ -122,6 +122,7 @@ class RuntimeSettingsUpdateRequest(BaseModel):
     llm_api_key: SecretStr | None = None
     clear_llm_api_key: bool = False
     llm_timeout_seconds: float = Field(gt=0, le=300)
+    llm_first_token_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     llm_video_capable: bool = False
     network_proxy: str | None = None
     h3_diffusion_model: str = Field(
@@ -194,6 +195,7 @@ class ProjectAgentOperationRequest(BaseModel):
     operation_id: str = Field(min_length=1)
     operation: str = Field(min_length=1)
     instruction: str = Field(min_length=1, max_length=50_000)
+    display_instruction: str | None = Field(default=None, min_length=1, max_length=1000)
     allowed_paths: tuple[str, ...] = Field(min_length=1)
     locked_paths: tuple[str, ...] = ()
     commit: bool = False
@@ -206,4 +208,22 @@ class SegmentReworkRequest(BaseModel):
     review_task_id: str | None = None
     action: ReworkAction
     feedback: str = Field(min_length=1, max_length=4000)
+    replacement_seed: int | None = Field(default=None, ge=0)
+
+
+class ReworkMarkerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version_id: str = Field(min_length=1)
+    action: ReworkAction
+    feedback: str = Field(min_length=1, max_length=4000)
+    replacement_seed: int | None = Field(default=None, ge=0)
+    source: str = Field(default="human", pattern="^(human|ai)$")
+
+
+class ReworkMarkerUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: ReworkAction | None = None
+    feedback: str | None = Field(default=None, min_length=1, max_length=4000)
     replacement_seed: int | None = Field(default=None, ge=0)

@@ -20,6 +20,10 @@ class H3AssetPromptRole(StrEnum):
     OBJECT = "object"
     SCENE = "scene"
     STYLE = "style"
+    COSTUME = "costume"
+    ACTION = "action"
+    CAMERA = "camera"
+    SOUND = "sound"
     FIRST_FRAME = "first_frame"
     LAST_FRAME = "last_frame"
 
@@ -34,8 +38,50 @@ class H3AssetInput(FrozenModel):
     asset_id: str = Field(min_length=1)
     label: str = Field(pattern=r"^<(Picture|Video|Audio) [1-9][0-9]*>$")
     kind: H3AssetKind
+    companion_audio_label: str | None = Field(
+        default=None, pattern=r"^<Audio [1-9][0-9]*>$"
+    )
     role: H3AssetPromptRole
     preservation: str = Field(min_length=1)
+    preserve_attributes: tuple[str, ...] = ()
+    mutable_attributes: tuple[str, ...] = ()
+    forbidden_propagation_targets: tuple[str, ...] = ()
+    active_shots: tuple[int, ...] = ()
+
+
+class H3CreativeBrief(FrozenModel):
+    visual_style: str = ""
+    action_arc: str = ""
+    composition: str = ""
+    camera_strategy: str = ""
+    sound_plan: str = ""
+    dialogue: tuple[str, ...] = ()
+    visible_text: tuple[str, ...] = ()
+    desired_end_state: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return all(
+            value.strip()
+            for value in (
+                self.visual_style,
+                self.action_arc,
+                self.composition,
+                self.camera_strategy,
+                self.sound_plan,
+                self.desired_end_state,
+            )
+        )
+
+
+class H3RuntimeLimits(FrozenModel):
+    min_duration_seconds: float = Field(default=4, ge=0.1)
+    max_duration_seconds: float = Field(default=15, ge=4)
+    fps: int = Field(default=24, ge=1)
+    max_prompt_characters: int = Field(default=7000, ge=100)
+    supports_image_reference: bool = True
+    supports_video_reference: bool = True
+    supports_audio_reference: bool = True
 
 
 class H3PromptRequest(FrozenModel):
@@ -48,14 +94,33 @@ class H3PromptRequest(FrozenModel):
     shot_strategy: H3ShotStrategy = H3ShotStrategy.AUTO
     project_memory: str = ""
     constraints: tuple[str, ...] = ()
+    creative: H3CreativeBrief | None = None
+    prior_continuity_state: str | None = None
+    runtime_limits: H3RuntimeLimits = H3RuntimeLimits()
 
     @model_validator(mode="after")
     def validate_request(self) -> H3PromptRequest:
         if self.fps != 24:
             raise ValueError("MiniMax H3 prompts require 24 FPS")
+        if self.fps != self.runtime_limits.fps:
+            raise ValueError("request FPS must match the selected H3 runtime")
+        if not self.runtime_limits.min_duration_seconds <= self.duration_seconds <= (
+            self.runtime_limits.max_duration_seconds
+        ):
+            raise ValueError("duration is outside the selected H3 runtime limits")
         labels = [asset.label for asset in self.assets]
+        labels.extend(
+            asset.companion_audio_label
+            for asset in self.assets
+            if asset.companion_audio_label is not None
+        )
         if len(labels) != len(set(labels)):
             raise ValueError("asset labels must be unique")
+        if any(
+            asset.companion_audio_label is not None and asset.kind != H3AssetKind.VIDEO
+            for asset in self.assets
+        ):
+            raise ValueError("only video references may define a companion audio label")
         ids = [asset.asset_id for asset in self.assets]
         if len(ids) != len(set(ids)):
             raise ValueError("asset IDs must be unique")
@@ -81,6 +146,10 @@ class H3ShotBeat(FrozenModel):
     camera: str = Field(min_length=2)
     sound: str = Field(min_length=2)
     end_state: str = Field(min_length=2)
+    narrative_function: str = ""
+    entering_state: str = ""
+    transition: str = ""
+    active_asset_labels: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_interval(self) -> H3ShotBeat:
@@ -160,6 +229,13 @@ class H3ReviewerDecision(FrozenModel):
         return self
 
 
+class H3StageTrace(FrozenModel):
+    stage: str = Field(min_length=1, max_length=100)
+    status: str = Field(min_length=1, max_length=50)
+    attempt: int = Field(default=0, ge=0)
+    findings: tuple[str, ...] = ()
+
+
 class H3PromptResult(FrozenModel):
     request: H3PromptRequest
     director: H3DirectorDecision
@@ -168,3 +244,8 @@ class H3PromptResult(FrozenModel):
     review_history: tuple[H3ReviewerDecision, ...]
     repair_passes: int = Field(ge=0, le=2)
     execution_prompt: str = Field(min_length=1, max_length=7000)
+    creative_brief: H3CreativeBrief | None = None
+    assumptions: tuple[str, ...] = ()
+    validator_findings: tuple[str, ...] = ()
+    stage_trace: tuple[H3StageTrace, ...] = ()
+    harness_manifest_sha256: str | None = None

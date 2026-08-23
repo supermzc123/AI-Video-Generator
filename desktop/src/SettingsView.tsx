@@ -18,6 +18,7 @@ const fallback: RuntimeSettings = {
   llmModel: "",
   llmApiKeyConfigured: false,
   llmTimeoutSeconds: 30,
+  llmFirstTokenTimeoutSeconds: 30,
   llmVideoCapable: false,
   networkProxy: "",
   h3DiffusionModel: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -234,6 +235,7 @@ export function SettingsView() {
         <label className="field field-wide"><span>API URL</span><input value={settings.llmBaseUrl} placeholder="https://example.com/v1" onChange={(event) => setSettings({ ...settings, llmBaseUrl: event.target.value })} /></label>
         <label className="field"><span>模型</span><input list="llm-model-options" value={settings.llmModel} placeholder="输入或从列表选择" onChange={(event) => setSettings({ ...settings, llmModel: event.target.value })} /><datalist id="llm-model-options">{llmModels.map((model) => <option value={model} key={model} />)}</datalist><small>{llmModels.length ? `${llmModels.length} 个服务端模型已载入` : "保存连接后刷新模型列表"}</small></label>
         <label className="field"><span>请求超时（秒）</span><input type="number" min="1" max="300" value={settings.llmTimeoutSeconds} onChange={(event) => setSettings({ ...settings, llmTimeoutSeconds: Number(event.target.value) })} /></label>
+        <label className="field"><span>首字超时（秒）</span><input type="number" min="1" max="300" value={settings.llmFirstTokenTimeoutSeconds} onChange={(event) => setSettings({ ...settings, llmFirstTokenTimeoutSeconds: Number(event.target.value) })} /><small>流式请求收到第一个有效字符后停止计时</small></label>
         <label className="check-field field-wide"><input type="checkbox" checked={settings.llmVideoCapable} onChange={(event) => setSettings({ ...settings, llmVideoCapable: event.target.checked })} />当前模型支持直接读取视频</label>
         <small className="field-wide">开启后审核会优先发送压缩视频；服务明确拒绝视频输入时会记录原因并自动回退到抽帧审核。</small>
         <label className="field field-wide"><span>API Key</span><div className="secret-input"><input type={showApiKey ? "text" : "password"} value={apiKey} disabled={clearApiKey} placeholder={settings.llmApiKeyConfigured ? "已保存，留空保持不变" : "尚未配置"} onChange={(event) => setApiKey(event.target.value)} /><button className="icon-button" title={showApiKey ? "隐藏密钥" : "显示密钥"} onClick={() => setShowApiKey(!showApiKey)}>{showApiKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>

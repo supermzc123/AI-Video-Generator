@@ -252,6 +252,99 @@ def test_structured_prompt_contains_exact_workspace_contracts() -> None:
     assert "image_prompt_item" in payload["contract"]["workspace_value_contracts"]
     asset_contract = payload["contract"]["workspace_value_contracts"]["asset_plan_item"]
     assert {"width", "height", "resolutionSource"}.issubset(asset_contract["required"])
+    motion = payload["contract"]["motion_context_contract"]
+    assert motion["segment_duration_sum"] == "must equal shot.durationSeconds"
+    assert motion["first_segment_seconds"] == {"minimum": 4, "maximum": 15}
+    assert "motionSegments" not in shot_contract["required"]
+    assert "motionSegments" in shot_contract["properties"]
+    assert motion["optional_when"] == "ordinary single-segment shots"
+
+
+def test_storyboard_contract_allows_single_segment_shot_without_motion_context() -> None:
+    request = patch_request().model_copy(
+        update={
+            "operation": "initialize_storyboard",
+            "source_document": {"shots": []},
+            "allowed_paths": ("/shots",),
+            "locked_paths": (),
+        }
+    )
+    shot = {
+        "id": "shot-1",
+        "title": "Arrival",
+        "summary": "A person arrives.",
+        "camera": "wide shot",
+        "seed": 1,
+        "durationSeconds": 8,
+        "locked": False,
+    }
+    response = {
+        "operation_id": "edit-1",
+        "patches": [{"op": "replace", "path": "/shots", "value": [shot]}],
+        "rationale": "Create a single continuous shot",
+        "warnings": [],
+    }
+    parsed = parse_structured_operation(json.dumps(response), request)
+    assert parsed.patches[0].value == [shot]
+
+
+def test_storyboard_contract_allows_empty_motion_context_array() -> None:
+    request = patch_request().model_copy(
+        update={
+            "operation": "initialize_storyboard",
+            "source_document": {"shots": []},
+            "allowed_paths": ("/shots",),
+            "locked_paths": (),
+        }
+    )
+    shot = {
+        "id": "shot-1",
+        "title": "Arrival",
+        "summary": "A person arrives.",
+        "camera": "wide shot",
+        "seed": 1,
+        "durationSeconds": 8,
+        "motionSegments": [],
+        "locked": False,
+    }
+    response = {
+        "operation_id": "edit-1",
+        "patches": [{"op": "replace", "path": "/shots", "value": [shot]}],
+        "rationale": "Create a single continuous shot",
+        "warnings": [],
+    }
+    parse_structured_operation(json.dumps(response), request)
+
+
+def test_storyboard_contract_rejects_invalid_motion_context_segments() -> None:
+    request = patch_request().model_copy(
+        update={
+            "operation": "initialize_storyboard",
+            "source_document": {"shots": []},
+            "allowed_paths": ("/shots",),
+            "locked_paths": (),
+        }
+    )
+    shot = {
+        "id": "shot-1",
+        "title": "Arrival",
+        "summary": "A person arrives.",
+        "camera": "wide shot",
+        "seed": 1,
+        "durationSeconds": 16,
+        "motionSegments": [
+            {"id": "m1", "durationSeconds": 16, "summary": "arrives"}
+        ],
+        "locked": False,
+    }
+    response = {
+        "operation_id": "edit-1",
+        "patches": [{"op": "replace", "path": "/shots", "value": [shot]}],
+        "rationale": "Create the storyboard",
+        "warnings": [],
+    }
+    with pytest.raises(HarnessValidationError, match="invalid structured operation"):
+        parse_structured_operation(json.dumps(response), request)
 
 
 def test_structured_prompt_can_include_untrusted_project_images() -> None:

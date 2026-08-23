@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from typing import Annotated, Any, Literal
@@ -10,7 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class LLMClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, response_started: bool = False) -> None:
+        super().__init__(message)
+        self.response_started = response_started
 
 
 llm_delta_callback: ContextVar[Callable[[str], None] | None] = ContextVar(
@@ -86,6 +90,7 @@ class OpenAICompatibleClient:
         model: str,
         api_key: str | None = None,
         timeout_seconds: float = 30,
+        first_token_timeout_seconds: float | None = None,
         proxy: str | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -93,6 +98,14 @@ class OpenAICompatibleClient:
         self._model = model
         self._owns_client = http_client is None
         self._api_key = api_key
+        self._first_token_timeout_seconds = (
+            first_token_timeout_seconds
+            if first_token_timeout_seconds is not None
+            else timeout_seconds
+        )
+        # The first-token budget ends after the first delta, but a half-open
+        # stream still needs a bounded inter-token read.
+        self._stream_idle_timeout_seconds = timeout_seconds
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         self._http = http_client or httpx.AsyncClient(
             headers=self._headers,
@@ -108,8 +121,37 @@ class OpenAICompatibleClient:
             "response_format": {"type": "json_object"},
         }
         callback = llm_delta_callback.get()
+        for attempt in range(2):
+            try:
+                if callback is not None:
+                    return await self._complete_json_stream(payload, callback)
+                return await self._complete_json_nonstream(payload)
+            except LLMClientError as exc:
+                if (
+                    attempt == 0
+                    and not exc.response_started
+                    and is_retryable_llm_error(exc)
+                ):
+                    # Gateways behind a local proxy occasionally reset an
+                    # otherwise healthy connection. A single short retry
+                    # avoids surfacing these transient failures to the harness.
+                    await asyncio.sleep(0.2)
+                    continue
+                raise
+        raise AssertionError("LLM completion retry loop must return or raise")
+
+    async def complete_text(self, messages: Sequence[ChatMessage]) -> str:
+        """Complete a plain-text task without JSON/schema retry overhead."""
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [message.model_dump() for message in messages],
+            "temperature": 0,
+        }
+        callback = llm_delta_callback.get()
         if callback is not None:
-            return await self._complete_json_stream(payload, callback)
+            return await self._complete_json_stream(
+                payload, callback, accept_started_text_on_idle=True
+            )
         return await self._complete_json_nonstream(payload)
 
     async def _complete_json_nonstream(self, payload: dict[str, Any]) -> str:
@@ -146,9 +188,14 @@ class OpenAICompatibleClient:
         return content
 
     async def _complete_json_stream(
-        self, payload: dict[str, Any], on_delta: Callable[[str], None]
+        self,
+        payload: dict[str, Any],
+        on_delta: Callable[[str], None],
+        *,
+        accept_started_text_on_idle: bool = False,
     ) -> str:
         chunks: list[str] = []
+        first_token_received = False
         try:
             async with self._http.stream(
                 "POST",
@@ -161,29 +208,82 @@ class OpenAICompatibleClient:
                     if response.status_code in {400, 404, 422}:
                         return await self._complete_json_nonstream(payload)
                     raise LLMClientError(self._format_provider_error(response))
-                async for line in response.aiter_lines():
+                line_iterator = response.aiter_lines().__aiter__()
+                first_token_deadline = (
+                    time.monotonic() + self._first_token_timeout_seconds
+                )
+                while True:
+                    try:
+                        if first_token_received:
+                            line = await asyncio.wait_for(
+                                line_iterator.__anext__(),
+                                timeout=self._stream_idle_timeout_seconds,
+                            )
+                        else:
+                            remaining = first_token_deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError
+                            line = await asyncio.wait_for(
+                                line_iterator.__anext__(), timeout=remaining
+                            )
+                    except StopAsyncIteration:
+                        break
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
-                    if not data or data == "[DONE]":
+                    if not data:
                         continue
+                    if data == "[DONE]":
+                        break
                     try:
                         event = json.loads(data)
                         choice = event["choices"][0]
-                        content = choice.get("delta", {}).get("content")
+                        delta = choice.get("delta")
+                        message = choice.get("message")
+                        content = (
+                            delta.get("content")
+                            if isinstance(delta, dict) and delta.get("content") is not None
+                            else message.get("content")
+                            if isinstance(message, dict)
+                            else None
+                        )
                         text = _message_text(content) if content is not None else ""
                     except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                         continue
                     if text:
                         chunks.append(text)
                         on_delta(text)
+                        first_token_received = True
+                    if choice.get("finish_reason") is not None:
+                        break
         except LLMClientError:
             raise
+        except TimeoutError as exc:
+            result = "".join(chunks)
+            if _is_complete_json_object(result) or (
+                accept_started_text_on_idle and result.strip()
+            ):
+                return result
+            message = (
+                "OpenAI-compatible stream idle timeout"
+                if first_token_received
+                else "OpenAI-compatible first token timed out"
+            )
+            raise LLMClientError(message, response_started=first_token_received) from exc
         except httpx.TimeoutException as exc:
-            raise LLMClientError("OpenAI-compatible request timed out") from exc
+            result = "".join(chunks)
+            if _is_complete_json_object(result) or (
+                accept_started_text_on_idle and result.strip()
+            ):
+                return result
+            raise LLMClientError(
+                "OpenAI-compatible request timed out",
+                response_started=first_token_received,
+            ) from exc
         except httpx.RequestError as exc:
             raise LLMClientError(
-                f"OpenAI-compatible transport failed: {type(exc).__name__}"
+                f"OpenAI-compatible transport failed: {type(exc).__name__}",
+                response_started=first_token_received,
             ) from exc
         result = "".join(chunks)
         if not result.strip():
@@ -270,3 +370,12 @@ def _message_text(content: object) -> str:
         ]
         return "".join(text_parts)
     raise TypeError("message content must be a string or text content list")
+
+
+def _is_complete_json_object(content: str) -> bool:
+    if not content.strip():
+        return False
+    try:
+        return isinstance(json.loads(content), dict)
+    except json.JSONDecodeError:
+        return False

@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_api_key: SecretStr | None = None
     llm_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    llm_first_token_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     llm_video_capable: bool = False
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
@@ -93,6 +94,7 @@ RUNTIME_SETTING_FIELDS = (
     "llm_model",
     "llm_api_key",
     "llm_timeout_seconds",
+    "llm_first_token_timeout_seconds",
     "llm_video_capable",
     "network_proxy",
     "h3_diffusion_model",

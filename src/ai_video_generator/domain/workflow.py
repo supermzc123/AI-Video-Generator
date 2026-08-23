@@ -27,6 +27,11 @@ class BindingSemantic(StrEnum):
     SEED = "seed"
     BATCH_SIZE = "batch_size"
     REFERENCE_IMAGE = "reference_image"
+    SOURCE_VIDEO = "source_video"
+    MODEL = "model"
+    INTERPOLATION_FACTOR = "interpolation_factor"
+    UPSCALE_FACTOR = "upscale_factor"
+    LANGUAGE = "language"
 
 
 class BindingValueType(StrEnum):
@@ -34,10 +39,13 @@ class BindingValueType(StrEnum):
     INTEGER = "integer"
     NUMBER = "number"
     IMAGE_PATH = "image_path"
+    VIDEO_PATH = "video_path"
 
 
 class WorkflowOutputType(StrEnum):
     IMAGE = "image"
+    VIDEO = "video"
+    SUBTITLE = "subtitle"
 
 
 class WorkflowBinding(FrozenModel):
@@ -65,6 +73,11 @@ class WorkflowBinding(FrozenModel):
             BindingSemantic.SEED: BindingValueType.INTEGER,
             BindingSemantic.BATCH_SIZE: BindingValueType.INTEGER,
             BindingSemantic.REFERENCE_IMAGE: BindingValueType.IMAGE_PATH,
+            BindingSemantic.SOURCE_VIDEO: BindingValueType.VIDEO_PATH,
+            BindingSemantic.MODEL: BindingValueType.STRING,
+            BindingSemantic.INTERPOLATION_FACTOR: BindingValueType.NUMBER,
+            BindingSemantic.UPSCALE_FACTOR: BindingValueType.NUMBER,
+            BindingSemantic.LANGUAGE: BindingValueType.STRING,
         }
         if self.value_type != expected_types[self.semantic]:
             required_type = expected_types[self.semantic].value
@@ -97,6 +110,9 @@ class WorkflowTemplate(FrozenModel):
     template_id: str = Field(min_length=1)
     revision: int = Field(default=1, ge=1)
     name: str = Field(min_length=1, max_length=200)
+    kind: str = Field(
+        default="image", pattern="^(image|interpolation|restoration|transcription)$"
+    )
     workflow_sha256: str = Field(pattern=SHA256_PATTERN)
     node_schema_sha256: str = Field(pattern=SHA256_PATTERN)
     raw_workflow: dict[str, dict[str, Any]]

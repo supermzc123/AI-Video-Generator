@@ -37,6 +37,15 @@ from .models import (
     enforce_patch_scope,
     validate_workflow_mapping,
 )
+from .remote import (
+    LLMRemoteConfig,
+    complete_json,
+    complete_text,
+    exception_messages,
+    list_models,
+    open_client,
+    remote_config,
+)
 
 __all__ = [
     "ChatMessage",
@@ -50,6 +59,7 @@ __all__ = [
     "MAX_REPAIR_ATTEMPTS",
     "MAX_H3_REPAIR_PASSES",
     "OpenAICompatibleClient",
+    "LLMRemoteConfig",
     "H3HarnessLibrary",
     "H3PromptHarness",
     "H3PromptHarnessError",
@@ -67,6 +77,12 @@ __all__ = [
     "parse_structured_operation",
     "parse_workflow_mapping",
     "validate_workflow_mapping",
+    "complete_json",
+    "complete_text",
+    "exception_messages",
+    "list_models",
+    "open_client",
+    "remote_config",
     "render_h3_prompt",
     "route_h3_mode",
     "validate_h3_candidate",

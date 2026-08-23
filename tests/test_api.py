@@ -110,6 +110,7 @@ async def test_runtime_settings_are_persisted_and_api_key_is_redacted(tmp_path: 
             "llm_api_key": "secret-value",
             "clear_llm_api_key": False,
             "llm_timeout_seconds": 45,
+            "llm_first_token_timeout_seconds": 12,
             "network_proxy": "mixed:10808",
         }
 
@@ -123,6 +124,7 @@ async def test_runtime_settings_are_persisted_and_api_key_is_redacted(tmp_path: 
         assert fetched.status_code == 200
         assert fetched.json()["comfyui_base_url"] == "http://127.0.0.1:8288"
         assert fetched.json()["llm_api_key_configured"] is True
+        assert fetched.json()["llm_first_token_timeout_seconds"] == 12
         assert "secret-value" not in fetched.text
 
         persisted = (tmp_path / "runtime-settings.json").read_text(encoding="utf-8")
@@ -135,6 +137,7 @@ async def test_runtime_settings_are_persisted_and_api_key_is_redacted(tmp_path: 
             after_restart = await client.get("/api/v1/settings")
         assert after_restart.json()["llm_model"] == "example-model"
         assert after_restart.json()["network_proxy"] == "http://127.0.0.1:10808"
+        assert after_restart.json()["llm_first_token_timeout_seconds"] == 12
     finally:
         config_module.store_secret = original_store
         config_module.load_secret = original_load
@@ -408,11 +411,13 @@ async def test_project_agent_stream_serializes_proposal_as_an_object(
                 "operation_id": "stream-outline",
                 "operation": "initialize_outline",
                 "instruction": "生成大纲。",
+                "display_instruction": "自动生成故事大纲初稿",
                 "allowed_paths": ["/outline"],
                 "locked_paths": [],
                 "commit": False,
             },
         )
+        memory = await client.get("/api/v1/projects/stream-project/memory")
 
     assert response.status_code == 200
     result_line = next(
@@ -426,3 +431,9 @@ async def test_project_agent_stream_serializes_proposal_as_an_object(
     assert isinstance(result["proposal"], dict)
     assert result["proposal"]["patches"] == []
     assert result["proposal"]["warnings"] == []
+    dialog = next(
+        event
+        for event in memory.json()
+        if event["role"] == "dialog_initialize_outline_user"
+    )
+    assert dialog["content"] == "自动生成故事大纲初稿"

@@ -297,14 +297,13 @@ def extract_workflow_outputs(
         node_output = raw_outputs.get(declared.node_id, {})
         if not isinstance(node_output, Mapping):
             continue
-        if declared.output_type != WorkflowOutputType.IMAGE:
-            continue
-        images = node_output.get("images", [])
-        if not isinstance(images, list):
+        field = "images" if declared.output_type == WorkflowOutputType.IMAGE else "gifs"
+        media = node_output.get(field, node_output.get("images", []))
+        if not isinstance(media, list):
             raise WorkflowContractError(
-                f"ComfyUI history node {declared.node_id} images must be a list"
+                f"ComfyUI history node {declared.node_id} output must be a list"
             )
-        for image in images:
+        for image in media:
             if not isinstance(image, Mapping) or not str(image.get("filename") or ""):
                 raise WorkflowContractError(
                     f"ComfyUI history node {declared.node_id} contains an invalid image"
@@ -353,14 +352,30 @@ def _schema_input(schema: Mapping[str, Any], input_name: str) -> Any:
 
 
 def _dynamic_schema_input(definition: Any, child_name: str) -> Any:
-    if not (
-        isinstance(definition, (list, tuple))
-        and len(definition) > 1
-        and definition[0] == "COMFY_AUTOGROW_V3"
-        and isinstance(definition[1], Mapping)
-    ):
+    if not isinstance(definition, (list, tuple)) or len(definition) < 2:
         return None
-    template = definition[1].get("template")
+    kind, options = definition[0], definition[1]
+    if not isinstance(options, Mapping):
+        return None
+    if kind == "COMFY_DYNAMICCOMBO_V3":
+        candidates = []
+        for option in options.get("options", []):
+            if not isinstance(option, Mapping):
+                continue
+            inputs = option.get("inputs", {})
+            if not isinstance(inputs, Mapping):
+                continue
+            for section in ("required", "optional"):
+                fields = inputs.get(section, {})
+                if isinstance(fields, Mapping) and child_name in fields:
+                    candidates.append(fields[child_name])
+        if not candidates:
+            return None
+        first = candidates[0]
+        return first if all(value == first for value in candidates) else None
+    if kind != "COMFY_AUTOGROW_V3":
+        return None
+    template = options.get("template")
     if not isinstance(template, Mapping):
         return None
     prefix = template.get("prefix")
@@ -449,11 +464,24 @@ def _workflow_schema_issues(
                 else definition
             )
             actual = outputs[link[1]]
-            if isinstance(expected, str) and isinstance(actual, str) and expected != actual:
+            if (
+                isinstance(expected, str)
+                and isinstance(actual, str)
+                and not _comfy_types_compatible(expected, actual)
+            ):
                 issues.append(
                     f"node {node_id}.{input_name}: expected {expected}, source provides {actual}"
                 )
     return issues
+
+
+def _comfy_types_compatible(expected: str, actual: str) -> bool:
+    wildcard = "COMFY_MATCHTYPE_V3"
+    if expected == wildcard or actual == wildcard:
+        return True
+    expected_types = {value.strip() for value in expected.split(",")}
+    actual_types = {value.strip() for value in actual.split(",")}
+    return bool(expected_types & actual_types)
 
 
 def _required_input_present(
@@ -513,10 +541,11 @@ def _validate_schema_input(
     )
     actual = type_spec.upper() if isinstance(type_spec, str) else "COMBO"
     allowed = {
-        BindingValueType.STRING: {"STRING"},
+        BindingValueType.STRING: {"STRING", "COMBO"},
         BindingValueType.INTEGER: {"INT"},
         BindingValueType.NUMBER: {"FLOAT", "INT"},
         BindingValueType.IMAGE_PATH: {"STRING", "COMBO"},
+        BindingValueType.VIDEO_PATH: {"STRING", "COMBO"},
     }[value_type]
     issue = (
         None if actual in allowed else f"expected {value_type.value}, object_info reports {actual}"
@@ -531,10 +560,14 @@ def _validate_schema_input(
 
 
 def _coerce_binding_value(binding: WorkflowBinding, value: Any) -> Any:
-    if binding.value_type in {BindingValueType.STRING, BindingValueType.IMAGE_PATH}:
+    if binding.value_type in {
+        BindingValueType.STRING,
+        BindingValueType.IMAGE_PATH,
+        BindingValueType.VIDEO_PATH,
+    }:
         if not isinstance(value, str):
             raise WorkflowContractError(f"binding {binding.binding_id!r} requires a string")
-        if binding.value_type == BindingValueType.IMAGE_PATH:
+        if binding.value_type in {BindingValueType.IMAGE_PATH, BindingValueType.VIDEO_PATH}:
             _validate_relative_media_path(value)
         coerced: Any = value
     elif binding.value_type == BindingValueType.INTEGER:

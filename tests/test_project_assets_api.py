@@ -93,6 +93,72 @@ async def test_upload_lists_real_image_metadata_and_serves_preview(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "content", "metadata", "expected_kind", "expected_mime"),
+    [
+        (
+            "reference.mp4",
+            b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64,
+            {
+                "width": 1280,
+                "height": 720,
+                "duration_seconds": 4.0,
+                "frame_rate": 24.0,
+                "has_audio": True,
+            },
+            "video",
+            "video/mp4",
+        ),
+        (
+            "reference.wav",
+            b"RIFF\x24\x00\x00\x00WAVE" + b"\x00" * 64,
+            {
+                "width": None,
+                "height": None,
+                "duration_seconds": 6.0,
+                "frame_rate": None,
+                "has_audio": True,
+            },
+            "audio",
+            "audio/wav",
+        ),
+    ],
+)
+async def test_upload_serves_video_and_audio_reference_media(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content: bytes,
+    metadata: dict[str, object],
+    expected_kind: str,
+    expected_mime: str,
+) -> None:
+    monkeypatch.setattr(ProjectAssetStore, "_probe_av", lambda *args: metadata)
+    app = _app(tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        uploaded = await _upload(
+            client, name=f"{expected_kind} reference", filename=filename, content=content
+        )
+        body = uploaded.json()
+        media = await client.get(
+            f"/api/v1/projects/project-1/assets/{body['asset_id']}/media"
+        )
+        preview = await client.get(
+            f"/api/v1/projects/project-1/assets/{body['asset_id']}/preview"
+        )
+
+    assert uploaded.status_code == 201
+    assert body["media_kind"] == expected_kind
+    assert body["mime_type"] == expected_mime
+    assert body["duration_seconds"] == metadata["duration_seconds"]
+    assert media.status_code == 200
+    assert media.content == content
+    assert preview.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_upload_rejects_fake_images_and_case_insensitive_duplicate_names(
     tmp_path: Path,
 ) -> None:

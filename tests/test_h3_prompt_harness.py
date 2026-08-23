@@ -51,6 +51,24 @@ def library() -> H3HarnessLibrary:
     )
 
 
+def test_v2_manifest_is_frozen_and_rejects_tampered_documents() -> None:
+    manifest = library().to_manifest(official_commit="a" * 40, community_commit="b" * 40)
+    restored = H3HarnessLibrary.from_manifest(manifest)
+    first = manifest.documents[0]
+    tampered = manifest.model_copy(
+        update={
+            "documents": (
+                first.model_copy(update={"content": first.content + " changed"}),
+                *manifest.documents[1:],
+            )
+        }
+    )
+
+    assert restored == library()
+    with pytest.raises(H3PromptHarnessError, match="hash mismatch"):
+        H3HarnessLibrary.from_manifest(tampered)
+
+
 def request(*, assets=()) -> H3PromptRequest:
     return H3PromptRequest(
         operation_id="op-1",
@@ -78,32 +96,36 @@ def beat() -> dict[str, object]:
 
 def valid_base_candidate() -> dict[str, object]:
     description = (
-        "[Shot 1] 中景构图中，穿深色风衣的侦探位于画面左侧，霓虹灯在雨夜街道和积水中形成清晰倒影。"
-        "他沿人行道稳步前行，摄影机与他保持平行横移，雨滴打在衣领和路面上。"
-        "两秒后他注意到路边闪光的金属线索，镜头缓慢推进，他停下、蹲身并伸手靠近，最后保持警觉地看清线索。"
-        "同期保留每一步落地、布料摩擦和雨水溅落的空间关系，动作连续且没有剪切。"
+        "[Shot 1] A cinematic medium shot places a detective in a dark trench coat "
+        "on the left side of a rain-soaked street, where saturated neon signs form "
+        "sharp reflections across the pavement. He walks forward at a measured pace "
+        "while the camera tracks parallel to him with restrained, steady movement. "
+        "Raindrops strike his collar and splash around each footstep. After two seconds, "
+        "a metallic clue flashes beside the curb. The camera slowly pushes closer as he "
+        "stops, crouches, and reaches toward it without breaking spatial continuity. "
+        "He ends alert and motionless, studying the clue while rain, fabric movement, "
+        "footsteps, and distant traffic remain synchronized with the visible action."
     )
     return {
         "operation_id": "op-1",
         "mode": "t2va",
         "timeline": [beat()],
         "integrated_multimodal_description": description,
-        "overall_soundscape": "连续立体声雨幕、由远及近的脚步声、衣料摩擦声和远处稀疏车辆声。",
-        "non_diegetic_music": "低音弦乐保持克制的悬疑脉冲，不遮盖环境细节。",
+        "overall_soundscape": (
+            "Continuous stereo rain surrounds approaching footsteps, subtle fabric "
+            "movement, curbside splashes, and sparse traffic in the distance."
+        ),
+        "non_diegetic_music": (
+            "Low strings maintain a restrained suspense pulse beneath the physical sounds."
+        ),
     }
 
 
 @pytest.mark.asyncio
-async def test_h3_harness_routes_deterministically_then_runs_writer_reviewer() -> None:
+async def test_h3_harness_routes_deterministically_without_llm_reviewer() -> None:
     client = QueueClient(
         [
             valid_base_candidate(),
-            {
-                "operation_id": "op-1",
-                "approved": True,
-                "findings": [],
-                "rationale": "结构、时间线、画面和声音完整。",
-            },
         ]
     )
 
@@ -111,11 +133,14 @@ async def test_h3_harness_routes_deterministically_then_runs_writer_reviewer() -
 
     assert result.repair_passes == 0
     assert result.execution_prompt.startswith("integrated_multimodal_description:")
-    assert "雨夜街道" in result.execution_prompt
+    assert "rain-soaked street" in result.execution_prompt
     assert result.director.mode == GenerationMode.T2VA
     assert result.director.use_multishot is False
-    assert len(client.messages) == 2
-    assert "描述性内容必须使用中文" in client.messages[0][0].content
+    assert len(client.messages) == 1
+    assert "执行描述使用英文" in client.messages[0][0].content
+    assert "350-500 个英文单词" in client.messages[0][0].content
+    assert "分段契约（segment contract）" in client.messages[0][0].content
+    assert "continuationOf" in client.messages[0][0].content
     assert "基础字段规范" in client.messages[0][0].content
 
 
@@ -125,12 +150,6 @@ async def test_h3_stage_repairs_malformed_json_without_shortening_content() -> N
         [
             '{"operation_id":"op-1","mode":"t2va"',
             valid_base_candidate(),
-            {
-                "operation_id": "op-1",
-                "approved": True,
-                "findings": [],
-                "rationale": "修复后结构与内容完整。",
-            },
         ]
     )
 
@@ -140,24 +159,17 @@ async def test_h3_stage_repairs_malformed_json_without_shortening_content() -> N
     repair_request = json.loads(client.messages[1][-1].content)
     assert repair_request["task"] == "repair_invalid_h3_stage_json"
     assert "不要缩写提示词" in repair_request["instruction"]
+    assert "官方英文规范" in repair_request["instruction"]
 
 
 @pytest.mark.asyncio
 async def test_h3_harness_never_accepts_short_prompt_and_stops_after_one_repair() -> None:
     short = valid_base_candidate()
-    short["integrated_multimodal_description"] = "[Shot 1] 侦探走过街道。"
-    approved = {
-        "operation_id": "op-1",
-        "approved": True,
-        "findings": [],
-        "rationale": "看起来可用。",
-    }
+    short["integrated_multimodal_description"] = "[Shot 1] The detective crosses the street."
     client = QueueClient(
         [
             short,
-            approved,
-            short,
-            approved,
+        short,
         ]
     )
 
@@ -165,7 +177,36 @@ async def test_h3_harness_never_accepts_short_prompt_and_stops_after_one_repair(
         await H3PromptHarness(client, library()).generate(request())
 
     assert "too short" in " ".join(exc_info.value.errors)
-    assert len(client.messages) == 4
+    assert len(client.messages) == 2
+
+
+def test_h3_candidate_rejects_chinese_descriptive_prose() -> None:
+    candidate_data = valid_base_candidate()
+    candidate_data["integrated_multimodal_description"] = (
+        "[Shot 1] 侦探沿着雨夜街道前行，镜头平稳跟随，他发现路边线索后停下查看。"
+    )
+    candidate = H3PromptCandidate.model_validate(candidate_data)
+
+    errors = validate_h3_candidate(
+        request(), deterministic_director_decision(request()), None, candidate
+    )
+
+    assert any("must use English descriptive content" in error for error in errors)
+
+
+def test_h3_candidate_allows_original_language_inside_dialogue_tags() -> None:
+    candidate_data = valid_base_candidate()
+    candidate_data["integrated_multimodal_description"] += (
+        " The detective (S1) whispers, <d>[Chinese] 我找到线索了。</d> "
+        "His lips close before he returns his attention to the object."
+    )
+    candidate = H3PromptCandidate.model_validate(candidate_data)
+
+    errors = validate_h3_candidate(
+        request(), deterministic_director_decision(request()), None, candidate
+    )
+
+    assert not any("must use English descriptive content" in error for error in errors)
 
 
 @pytest.mark.asyncio
@@ -179,16 +220,12 @@ async def test_only_writer_receives_reference_images_and_reviewer_has_occlusion_
     )
     candidate = valid_base_candidate()
     candidate["mode"] = "i2va"
-    candidate["integrated_multimodal_description"] += " <Picture 1> 仅作为首帧边界。"
+    candidate["integrated_multimodal_description"] += (
+        " <Picture 1> is used only as the opening frame anchor."
+    )
     client = QueueClient(
         [
             candidate,
-            {
-                "operation_id": "op-1",
-                "approved": True,
-                "findings": [],
-                "rationale": "结构与连续性完整。",
-            },
         ]
     )
 
@@ -198,9 +235,7 @@ async def test_only_writer_receives_reference_images_and_reviewer_has_occlusion_
     )
 
     assert not isinstance(client.messages[0][1].content, str)
-    assert isinstance(client.messages[1][1].content, str)
-    assert "景框自然裁切" in client.messages[1][0].content
-    assert "不得仅凭这些现象认定身体残缺" in client.messages[1][0].content
+    assert "不得把服装纹理" in client.messages[0][0].content
 
 
 @pytest.mark.asyncio
@@ -209,18 +244,12 @@ async def test_h3_harness_records_per_call_telemetry() -> None:
     client = QueueClient(
         [
             valid_base_candidate(),
-            {
-                "operation_id": "op-1",
-                "approved": True,
-                "findings": [],
-                "rationale": "结构与连续性完整。",
-            },
         ]
     )
 
     await H3PromptHarness(client, library(), telemetry_sink=telemetry.append).generate(request())
 
-    assert [item.stage for item in telemetry] == ["write", "review"]
+    assert [item.stage for item in telemetry] == ["write"]
     assert all(item.succeeded and item.total_seconds >= 0 for item in telemetry)
     assert all(item.input_characters > 0 and item.output_characters > 0 for item in telemetry)
 

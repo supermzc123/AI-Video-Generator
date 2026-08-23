@@ -48,8 +48,20 @@ def resolve_batch_run(store: SQLiteTaskStore, batch: BatchRun) -> BatchRun:
     persisted response for backwards compatibility and observability only.
     """
     resolved_items: list[BatchRunItem] = []
+    active_members = {
+        item.project_id
+        for existing in store.list_batch_runs()
+        if existing.state in {BatchState.DRAFT, BatchState.RUNNING, BatchState.PAUSED}
+        and existing.batch_id != batch.batch_id
+        for item in existing.items
+    }
     for item in batch.items:
+        if item.project_id in active_members:
+            raise StoreConflictError(
+                f"project {item.project_id} already belongs to an active batch"
+            )
         tasks = store.list_tasks(project_id=item.project_id)
+        created_planning = False
         orchestration_kinds = {
             TaskKind.LLM_PLANNING,
             TaskKind.CONDITIONING_ENCODING,
@@ -102,7 +114,12 @@ def resolve_batch_run(store: SQLiteTaskStore, batch: BatchRun) -> BatchRun:
                 )
             )
             tasks = (*tasks, planning)
-        selected = _resolve_item_tasks(tasks, item.start_boundary)
+            created_planning = True
+        selected = (
+            {planning.task_id}
+            if created_planning
+            else _resolve_item_tasks(tasks, item.start_boundary)
+        )
         if not selected:
             raise StoreConflictError(
                 f"project {item.project_id} has no unfinished tasks at {item.start_boundary}"
@@ -128,6 +145,12 @@ def batch_project_tasks(
             f"batch {batch.batch_id} references missing tasks: {', '.join(missing)}"
         )
     return tuple(by_id[task_id] for task_id in item.task_ids)
+
+
+def resolve_batch_task_ids(tasks: tuple[TaskSpec, ...], boundary: str) -> tuple[str, ...]:
+    """Resolve a compiled project DAG using the same boundary contract as admission."""
+    selected = _resolve_item_tasks(tasks, boundary)
+    return tuple(task.task_id for task in tasks if task.task_id in selected)
 
 
 def reconcile_batch_runs(

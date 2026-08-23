@@ -36,7 +36,7 @@ async def _read_upload(upload: UploadFile) -> bytes:
         content.extend(chunk)
         if len(content) > MAX_PROJECT_ASSET_BYTES:
             raise ProjectAssetTooLargeError(
-                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+                f"media exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
             )
     return bytes(content)
 
@@ -49,7 +49,11 @@ def create_project_assets_router(settings: Settings) -> APIRouter:
         nonlocal store
         if store is None:
             data_root = Path(settings.data_root)
-            store = ProjectAssetStore(data_root / "control-plane.db", data_root / "project-assets")
+            store = ProjectAssetStore(
+                data_root / "control-plane.db",
+                data_root / "project-assets",
+                ffprobe_binary=settings.ffprobe_binary,
+            )
         return store
 
     @router.post("", response_model=ProjectAsset, status_code=201)
@@ -99,6 +103,19 @@ def create_project_assets_router(settings: Settings) -> APIRouter:
         except ProjectAssetNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project asset not found") from exc
         return FileResponse(path, media_type="image/jpeg", filename=f"{asset_id}-preview.jpg")
+
+    @router.get("/{asset_id}/media", response_class=FileResponse)
+    async def get_project_asset_media(project_id: str, asset_id: str) -> FileResponse:
+        try:
+            asset = get_store().get_asset(project_id, asset_id)
+            path = get_store().media_for(project_id, asset_id)
+        except ProjectAssetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project asset not found") from exc
+        return FileResponse(
+            path,
+            media_type=asset.mime_type or "application/octet-stream",
+            filename=asset.original_name,
+        )
 
     @router.post("/{asset_id}/relink", response_model=ProjectAsset)
     async def relink_project_asset(

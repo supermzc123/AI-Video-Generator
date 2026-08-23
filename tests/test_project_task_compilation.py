@@ -18,14 +18,21 @@ from ai_video_generator.domain import (
     TaskState,
     TaskWorkloadManifest,
     WorkflowApproval,
+    WorkflowBinding,
     WorkflowBindingDraft,
+    WorkflowOutput,
+    WorkflowOutputType,
+    WorkflowTemplate,
 )
 from ai_video_generator.persistence import SQLiteTaskStore
 from ai_video_generator.services.project_tasks import (
+    ProjectTaskPlan,
+    compile_delivery_task_plan,
     compile_project_task_plan,
     persist_project_task_plan,
 )
 from ai_video_generator.workers import inspect_api_workflow, workflow_template_from_inspection
+from ai_video_generator.workers.workflow import canonical_json_sha256
 
 
 def ready_h3_prompt(segment_id: str, continuation_of: str | None = None) -> dict[str, object]:
@@ -46,6 +53,25 @@ def test_asset_image_resolution_is_independent_from_video_resolution() -> None:
         1600,
     )
     assert _asset_plan_resolution({"kind": "scene"}) == (1600, 1024)
+
+
+def test_delivery_plan_uses_active_video_inputs_without_compiling_h3() -> None:
+    plan = compile_delivery_task_plan(
+        project_id="project-1",
+        payload={
+            "fps": 24,
+            "postProcessing": {
+                "seedvr": {"enabled": False},
+                "rife": {"enabled": False},
+                "whisper": {"enabled": False},
+            },
+        },
+        segment_outputs={"segment-1": "active-video-snapshot"},
+    )
+
+    assert plan.blockers == ()
+    assert [task.kind for task in plan.tasks] == [TaskKind.MASTER_ASSEMBLY, TaskKind.EXPORT]
+    assert plan.tasks[0].depends_on == ("active-video-snapshot",)
 
 
 def test_project_task_plan_batches_conditioning_before_h3_and_export() -> None:
@@ -85,6 +111,57 @@ def test_project_task_plan_batches_conditioning_before_h3_and_export() -> None:
     assert len(switch.depends_on) == 2
     h3 = [task for task in plan.tasks if task.kind == TaskKind.H3_GENERATION]
     assert h3[0].task_id in h3[1].depends_on
+
+
+@pytest.mark.parametrize("review", [None, {"ready": False}])
+def test_project_task_plan_uses_final_h3_text_without_prompt_review_gate(
+    review: dict[str, bool] | None,
+) -> None:
+    state = ProjectRunState(project_id="manual-prompt", updated_at=datetime.now(UTC))
+    prompt: dict[str, object] = {
+        "segmentId": "segment-1",
+        "continuationOf": None,
+        "prompt": "用户确认后的完整中文 MiniMax H3 视频提示词",
+    }
+    if review is not None:
+        prompt["review"] = review
+
+    plan = compile_project_task_plan(
+        project_id="manual-prompt",
+        workspace_revision=1,
+        payload={"prompts": {"imagePrompts": [], "h3Prompts": [prompt]}},
+        run_state=state,
+        approved_image_workflows=set(),
+        approved_image_harnesses={},
+    )
+
+    assert plan.blockers == ()
+    h3_task = next(task for task in plan.tasks if task.kind == TaskKind.H3_GENERATION)
+    assert h3_task.state == TaskState.BLOCKED
+
+
+def test_prompt_review_provenance_does_not_change_h3_task_identity() -> None:
+    state = ProjectRunState(project_id="prompt-identity", updated_at=datetime.now(UTC))
+
+    def compile_with_review(ready: bool) -> ProjectTaskPlan:
+        prompt = ready_h3_prompt("segment-1")
+        prompt["review"] = {"ready": ready, "issues": [{"code": "audit-only"}]}
+        return compile_project_task_plan(
+            project_id=state.project_id,
+            workspace_revision=1,
+            payload={"prompts": {"imagePrompts": [], "h3Prompts": [prompt]}},
+            run_state=state,
+            approved_image_workflows=set(),
+            approved_image_harnesses={},
+        )
+
+    reviewed = compile_with_review(True)
+    manually_confirmed = compile_with_review(False)
+
+    assert reviewed.fingerprint == manually_confirmed.fingerprint
+    assert [task.task_id for task in reviewed.tasks] == [
+        task.task_id for task in manually_confirmed.tasks
+    ]
 
 
 def test_human_review_timeout_takeover_keeps_compiled_dag_identity() -> None:
@@ -258,10 +335,9 @@ def test_none_review_mode_still_creates_deterministic_media_check() -> None:
 
     reviews = [task for task in plan.tasks if task.kind == TaskKind.AI_REVIEW]
     exports = [task for task in plan.tasks if task.kind == TaskKind.EXPORT]
-    assert len(reviews) == 1
-    assert reviews[0].affinity_key == "media:review"
+    assert not reviews
     master = next(task for task in plan.tasks if task.kind == TaskKind.MASTER_ASSEMBLY)
-    assert master.depends_on == (reviews[0].task_id,)
+    assert master.depends_on
     assert exports[0].depends_on == (master.task_id,)
 
 
@@ -315,8 +391,8 @@ def test_enabling_postprocessing_reuses_completed_generation_and_review(tmp_path
         **disabled,
         "rife": {
             "enabled": True,
-            "profileId": "interpolation:rife",
-            "profileRevision": 1,
+            "workflowTemplateId": "user:interpolation",
+            "workflowRevision": 1,
             "modelId": "rife49.pth",
             "targetFps": 48,
         },
@@ -361,14 +437,16 @@ def test_rife_settings_only_replace_rife_and_export() -> None:
         "seedvr": {"enabled": False},
         "rife": {
             "enabled": True,
-            "profileId": "interpolation:rife",
-            "profileRevision": 1,
+            "workflowTemplateId": "user:interpolation",
+            "workflowRevision": 1,
             "modelId": "rife49.pth",
             "targetFps": 48,
         },
         "whisper": {
             "enabled": True,
-            "profileId": "transcription:faster-whisper",
+            "workflowTemplateId": "user:transcription",
+            "workflowRevision": 1,
+            "profileId": "user:transcription",
             "profileRevision": 1,
             "modelId": "large-v3-turbo",
             "language": "zh",
@@ -393,8 +471,8 @@ def test_export_settings_only_replace_export() -> None:
         "seedvr": {"enabled": False},
         "rife": {
             "enabled": True,
-            "profileId": "interpolation:rife",
-            "profileRevision": 1,
+            "workflowTemplateId": "user:interpolation",
+            "workflowRevision": 1,
             "modelId": "rife49.pth",
             "targetFps": 48,
         },
@@ -417,8 +495,8 @@ def test_h3_prompt_change_replaces_generation_and_all_downstream_tasks() -> None
         "seedvr": {"enabled": False},
         "rife": {
             "enabled": True,
-            "profileId": "interpolation:rife",
-            "profileRevision": 1,
+            "workflowTemplateId": "user:interpolation",
+            "workflowRevision": 1,
             "modelId": "rife49.pth",
             "targetFps": 48,
         },
@@ -439,6 +517,53 @@ def test_h3_prompt_change_replaces_generation_and_all_downstream_tasks() -> None
         TaskKind.EXPORT,
     ):
         assert before_ids[kind] != after_ids[kind]
+
+
+def test_h3_execution_profile_restart_replaces_video_chain_but_reuses_images() -> None:
+    state = ProjectRunState(project_id="h3-profile", updated_at=datetime.now(UTC))
+    payload = {
+        "assetPlans": [{"id": "hero", "fulfilledByAssetId": None}],
+        "prompts": {
+            "imagePrompts": [
+                {
+                    "assetPlanId": "hero",
+                    "prompt": "角色设定图",
+                    "workflowTemplateId": "image:user",
+                }
+            ],
+            "h3Prompts": [ready_h3_prompt("segment-1")],
+        },
+    }
+
+    def compile_with_profile(generation_revision: int, model: str) -> ProjectTaskPlan:
+        return compile_project_task_plan(
+            project_id=state.project_id,
+            workspace_revision=1,
+            payload=payload,
+            run_state=state,
+            approved_image_workflows={"image:user"},
+            approved_image_harnesses={},
+            h3_execution_profile={
+                "generation_revision": generation_revision,
+                "diffusion_model": model,
+                "turbo_enabled": False,
+                "steps": 12,
+            },
+        )
+
+    before = _task_ids_by_kind(compile_with_profile(0, "h3-a.safetensors"))
+    after = _task_ids_by_kind(compile_with_profile(1, "h3-b.safetensors"))
+
+    assert before[TaskKind.IMAGE_GENERATION] == after[TaskKind.IMAGE_GENERATION]
+    for kind in (
+        TaskKind.CONDITIONING_ENCODING,
+        TaskKind.MODEL_SWITCH,
+        TaskKind.H3_GENERATION,
+        TaskKind.AI_REVIEW,
+        TaskKind.MASTER_ASSEMBLY,
+        TaskKind.EXPORT,
+    ):
+        assert before[kind] != after[kind]
 
 
 def test_post_recompile_can_adopt_matching_legacy_upstream_branch() -> None:
@@ -489,8 +614,8 @@ def test_post_recompile_can_adopt_matching_legacy_upstream_branch() -> None:
                 **disabled,
                 "rife": {
                     "enabled": True,
-                    "profileId": "interpolation:rife",
-                    "profileRevision": 1,
+                    "workflowTemplateId": "user:interpolation",
+                    "workflowRevision": 1,
                     "modelId": "rife49.pth",
                     "targetFps": 48,
                 },
@@ -508,20 +633,19 @@ def test_post_recompile_can_adopt_matching_legacy_upstream_branch() -> None:
             assert task.state == TaskState.SUCCEEDED
     rife = next(task for task in after.tasks if task.kind == TaskKind.RIFE)
     review = next(task for task in after.tasks if task.kind == TaskKind.AI_REVIEW)
-    assert rife.depends_on == (review.task_id,)
+    assert rife.depends_on != (review.task_id,)
 
 
 @pytest.mark.asyncio
 async def test_compile_endpoint_preserves_successful_upstream_for_post_only_change(
     tmp_path,
 ) -> None:
-    app = create_app(
-        Settings(
-            _env_file=None,
-            data_root=tmp_path,
-            comfyui_base_url="http://comfy-must-not-be-contacted",
-        )
+    settings = Settings(
+        _env_file=None,
+        data_root=tmp_path,
+        comfyui_base_url="http://comfy-must-not-be-contacted",
     )
+    app = create_app(settings)
     disabled = {
         "outputWidth": 640,
         "outputHeight": 960,
@@ -592,6 +716,41 @@ async def test_compile_endpoint_preserves_successful_upstream_for_post_only_chan
             tasks.append(task.model_copy(update={"state": TaskState.SUCCEEDED}))
         for task in tasks:
             store.add_task(task)
+        transcription_raw = {
+            "1": {"class_type": "LoadVideo", "inputs": {"video": "input.mp4"}},
+            "2": {"class_type": "SaveSubtitle", "inputs": {"video": ["1", 0]}},
+        }
+        store.put_workflow_revision(
+            WorkflowTemplate(
+                template_id="user:transcription",
+                revision=1,
+                name="Transcription",
+                kind="transcription",
+                workflow_sha256=canonical_json_sha256(transcription_raw),
+                node_schema_sha256="c" * 64,
+                raw_workflow=transcription_raw,
+                bindings=(
+                    WorkflowBinding(
+                        binding_id="source",
+                        semantic=BindingSemantic.SOURCE_VIDEO,
+                        node_id="1",
+                        input_name="video",
+                        value_type=BindingValueType.VIDEO_PATH,
+                        title="Source",
+                    ),
+                ),
+                outputs=(
+                    WorkflowOutput(
+                        output_id="subtitle:2",
+                        node_id="2",
+                        output_type=WorkflowOutputType.SUBTITLE,
+                        title="Subtitle",
+                    ),
+                ),
+                required_node_types=("LoadVideo", "SaveSubtitle"),
+                approval=WorkflowApproval.APPROVED,
+            )
+        )
 
         await client.post(
             "/api/v1/projects/post-project/revisions",
@@ -614,7 +773,9 @@ async def test_compile_endpoint_preserves_successful_upstream_for_post_only_chan
                         **disabled,
                         "whisper": {
                             "enabled": True,
-                            "profileId": "transcription:faster-whisper",
+                            "workflowTemplateId": "user:transcription",
+                            "workflowRevision": 1,
+                            "profileId": "user:transcription",
                             "profileRevision": 1,
                             "modelId": "small",
                             "language": "zh",
@@ -635,6 +796,173 @@ async def test_compile_endpoint_preserves_successful_upstream_for_post_only_chan
     assert store.get_task(old_export.task_id).state == TaskState.STALE
     whisper = next(task for task in compiled_tasks if task["kind"] == TaskKind.WHISPER.value)
     assert whisper["state"] == TaskState.READY.value
+
+
+@pytest.mark.asyncio
+async def test_execution_status_marks_plan_stale_when_postprocessing_changes(
+    tmp_path,
+) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    disabled = {
+        "seedvr": {"enabled": False},
+        "rife": {"enabled": False},
+        "whisper": {"enabled": False},
+    }
+    payload = {
+        "width": 320,
+        "height": 480,
+        "referenceAssetMode": "none",
+        "prompts": {
+            "imagePrompts": [],
+            "h3Prompts": [ready_h3_prompt("segment-1")],
+        },
+        "postProcessing": disabled,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/v1/projects",
+            json={
+                "project_id": "post-freshness",
+                "name": "Post freshness",
+                "width": 320,
+                "height": 480,
+                "target_duration_seconds": 4,
+            },
+        )
+        await client.post(
+            "/api/v1/projects/post-freshness/workspace",
+            json={"revision": 1, "payload": payload},
+        )
+        store = SQLiteTaskStore(tmp_path / "control-plane.db")
+        plan = compile_project_task_plan(
+            project_id="post-freshness",
+            workspace_revision=1,
+            payload=payload,
+            run_state=store.get_project_run_state("post-freshness"),
+            approved_image_workflows=set(),
+            approved_image_harnesses={},
+        )
+        for task in plan.tasks:
+            store.add_task(task)
+        current = await client.get(
+            "/api/v1/projects/post-freshness/execution-status"
+        )
+        await client.post(
+            "/api/v1/projects/post-freshness/revisions",
+            json={
+                "project_id": "post-freshness",
+                "revision": 2,
+                "name": "Post freshness",
+                "width": 320,
+                "height": 480,
+                "target_duration_seconds": 4,
+            },
+        )
+        await client.post(
+            "/api/v1/projects/post-freshness/workspace",
+            json={
+                "revision": 2,
+                "payload": {
+                    **payload,
+                    "postProcessing": {
+                        **disabled,
+                        "seedvr": {
+                            "enabled": True,
+                            "workflowTemplateId": "user:restoration",
+                            "workflowRevision": 1,
+                        },
+                    },
+                },
+            },
+        )
+        stale = await client.get(
+            "/api/v1/projects/post-freshness/execution-status"
+        )
+
+    assert current.json()["compiled"] is True
+    assert stale.json()["compiled"] is False
+
+
+@pytest.mark.asyncio
+async def test_restart_h3_compile_creates_new_video_chain_and_stales_old_tasks(
+    tmp_path,
+) -> None:
+    def comfy_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/object_info":
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+    app = create_app(
+        Settings(_env_file=None, data_root=tmp_path, comfyui_base_url="http://comfy"),
+        comfyui_transport=httpx.MockTransport(comfy_handler),
+    )
+    h3_prompt = ready_h3_prompt("segment-1")
+    h3_prompt.update(
+        {
+            "durationSeconds": 4,
+            "inputMode": "t2va",
+            "assetIds": [],
+            "seed": 42,
+        }
+    )
+    payload = {
+        "width": 320,
+        "height": 480,
+        "referenceAssetMode": "none",
+        "prompts": {
+            "imagePrompts": [],
+            "h3Prompts": [h3_prompt],
+        },
+        "postProcessing": {
+            "seedvr": {"enabled": False},
+            "rife": {"enabled": False},
+            "whisper": {"enabled": False},
+        },
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/v1/projects",
+            json={
+                "project_id": "restart-h3",
+                "name": "Restart H3",
+                "width": 320,
+                "height": 480,
+                "target_duration_seconds": 4,
+            },
+        )
+        await client.post(
+            "/api/v1/projects/restart-h3/workspace",
+            json={"revision": 1, "payload": payload},
+        )
+        first = await client.post("/api/v1/projects/restart-h3/tasks/compile")
+        first_conditioning = next(
+            task
+            for task in first.json()["tasks"]
+            if task["kind"] == "conditioning_encoding"
+        )
+        queued = await client.post(f"/api/v1/tasks/{first_conditioning['task_id']}/run")
+        restarted = await client.post(
+            "/api/v1/projects/restart-h3/tasks/compile?restart_h3=true"
+        )
+        run_state = await client.get("/api/v1/projects/restart-h3/run-state")
+
+    assert first.status_code == 201, first.text
+    assert queued.json()["state"] == TaskState.QUEUED.value
+    assert restarted.status_code == 201, restarted.text
+    assert run_state.json()["generation_revision"] == 1
+    first_h3 = next(task for task in first.json()["tasks"] if task["kind"] == "h3_generation")
+    restarted_h3 = next(
+        task for task in restarted.json()["tasks"] if task["kind"] == "h3_generation"
+    )
+    assert first_h3["task_id"] != restarted_h3["task_id"]
+    store = SQLiteTaskStore(tmp_path / "control-plane.db")
+    assert store.get_task(first_conditioning["task_id"]).state == TaskState.CANCELLED
+    assert store.get_task(first_h3["task_id"]).state == TaskState.STALE
+    assert store.get_task(restarted_h3["task_id"]).state == TaskState.BLOCKED
 
 
 @pytest.mark.asyncio

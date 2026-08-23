@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import mimetypes
 import os
 import sqlite3
+import subprocess
+import tempfile
 import unicodedata
 import uuid
 from collections.abc import Iterator
@@ -20,12 +23,13 @@ from ai_video_generator.domain import (
     AssetGenerationCandidateState,
     AssetScope,
     ProjectAsset,
+    ProjectAssetMediaKind,
     ProjectAssetPurpose,
     ProjectAssetSource,
     ProjectAssetState,
 )
 
-MAX_PROJECT_ASSET_BYTES = 50 * 1024 * 1024
+MAX_PROJECT_ASSET_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 32_768
 MAX_IMAGE_PIXELS = 100_000_000
 PREVIEW_MAX_SIZE = (768, 768)
@@ -34,6 +38,9 @@ SUPPORTED_IMAGE_FORMATS = {
     "PNG": "image/png",
     "WEBP": "image/webp",
 }
+H3_REFERENCE_VIDEO_MIN_SECONDS = 2.0
+H3_REFERENCE_VIDEO_MAX_SECONDS = 15.0
+H3_REFERENCE_VIDEO_FPS = 24.0
 
 
 class ProjectAssetStoreError(RuntimeError):
@@ -108,11 +115,18 @@ def _payload_references_asset(value: Any, asset_id: str) -> bool:
 class ProjectAssetStore:
     """Immutable project-asset metadata plus content-addressed image blobs."""
 
-    def __init__(self, database_path: str | Path, storage_root: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        storage_root: str | Path,
+        *,
+        ffprobe_binary: str = "ffprobe",
+    ) -> None:
         self.database_path = Path(database_path)
         self.storage_root = Path(storage_root)
         self.blob_root = self.storage_root / "blobs"
         self.preview_root = self.storage_root / "previews"
+        self.ffprobe_binary = ffprobe_binary
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_root.mkdir(parents=True, exist_ok=True)
         self.preview_root.mkdir(parents=True, exist_ok=True)
@@ -208,12 +222,22 @@ class ProjectAssetStore:
             raise ProjectNotFoundError(project_id)
         if len(content) > MAX_PROJECT_ASSET_BYTES:
             raise ProjectAssetTooLargeError(
-                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+                f"media exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
             )
-        image, mime_type, width, height = self._validate_image(content)
+        (
+            media_kind,
+            mime_type,
+            width,
+            height,
+            duration_seconds,
+            frame_rate,
+            has_audio,
+            preview_content,
+        ) = self._validate_upload(content, original_name)
         blob_sha256 = hashlib.sha256(content).hexdigest()
-        preview_content = self._make_preview(image)
-        preview_sha256 = hashlib.sha256(preview_content).hexdigest()
+        preview_sha256 = (
+            hashlib.sha256(preview_content).hexdigest() if preview_content is not None else None
+        )
         asset = ProjectAsset(
             asset_id=str(uuid.uuid4()),
             project_id=project_id,
@@ -224,9 +248,13 @@ class ProjectAssetStore:
             sha256=blob_sha256,
             preview_sha256=preview_sha256,
             mime_type=mime_type,
+            media_kind=media_kind,
             byte_size=len(content),
             width=width,
             height=height,
+            duration_seconds=duration_seconds,
+            frame_rate=frame_rate,
+            has_audio=has_audio,
             kind=kind,
             scope=scope,
             shot_id=shot_id,
@@ -236,7 +264,8 @@ class ProjectAssetStore:
         with self._transaction(immediate=True) as connection:
             self._ensure_unique_name(connection, project_id, asset.name)
             self._write_blob_once(self.blob_path(blob_sha256), content)
-            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            if preview_sha256 is not None and preview_content is not None:
+                self._write_blob_once(self.preview_path(preview_sha256), preview_content)
             self._insert(connection, asset)
         return asset
 
@@ -257,7 +286,7 @@ class ProjectAssetStore:
             raise ProjectNotFoundError(project_id)
         if len(content) > MAX_PROJECT_ASSET_BYTES:
             raise ProjectAssetTooLargeError(
-                f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
+                f"media exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
             )
         image, mime_type, width, height = self._validate_image(content)
         blob_sha256 = hashlib.sha256(content).hexdigest()
@@ -277,7 +306,8 @@ class ProjectAssetStore:
                 excluding_asset_id=asset_id if current else None,
             )
             self._write_blob_once(self.blob_path(blob_sha256), content)
-            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            if preview_sha256 is not None and preview_content is not None:
+                self._write_blob_once(self.preview_path(preview_sha256), preview_content)
             asset = ProjectAsset(
                 asset_id=asset_id,
                 project_id=project_id,
@@ -344,7 +374,8 @@ class ProjectAssetStore:
         )
         with self._transaction(immediate=True) as connection:
             self._write_blob_once(self.blob_path(blob_sha256), content)
-            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            if preview_sha256 is not None and preview_content is not None:
+                self._write_blob_once(self.preview_path(preview_sha256), preview_content)
             connection.execute(
                 "INSERT INTO asset_generation_candidates("
                 "candidate_id, project_id, asset_plan_id, state, payload_json, created_at"
@@ -516,16 +547,27 @@ class ProjectAssetStore:
             raise ProjectAssetTooLargeError(
                 f"image exceeds {MAX_PROJECT_ASSET_BYTES} byte upload limit"
             )
-        image, mime_type, width, height = self._validate_image(content)
+        (
+            media_kind,
+            mime_type,
+            width,
+            height,
+            duration_seconds,
+            frame_rate,
+            has_audio,
+            preview_content,
+        ) = self._validate_upload(content, original_name)
         blob_sha256 = hashlib.sha256(content).hexdigest()
-        preview_content = self._make_preview(image)
-        preview_sha256 = hashlib.sha256(preview_content).hexdigest()
+        preview_sha256 = (
+            hashlib.sha256(preview_content).hexdigest() if preview_content is not None else None
+        )
         with self._transaction(immediate=True) as connection:
             current = self._get_current(connection, project_id, asset_id)
             if current.state != ProjectAssetState.MISSING_BLOB:
                 raise ValueError("only missing_blob assets can be relinked")
             self._write_blob_once(self.blob_path(blob_sha256), content)
-            self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+            if preview_sha256 is not None and preview_content is not None:
+                self._write_blob_once(self.preview_path(preview_sha256), preview_content)
             updated = ProjectAsset.model_validate(
                 current.model_copy(
                     update={
@@ -535,9 +577,13 @@ class ProjectAssetStore:
                         "sha256": blob_sha256,
                         "preview_sha256": preview_sha256,
                         "mime_type": mime_type,
+                        "media_kind": media_kind,
                         "byte_size": len(content),
                         "width": width,
                         "height": height,
+                        "duration_seconds": duration_seconds,
+                        "frame_rate": frame_rate,
+                        "has_audio": has_audio,
                         "source": ProjectAssetSource.UPLOAD,
                         "created_at": datetime.now(UTC),
                     }
@@ -681,6 +727,15 @@ class ProjectAssetStore:
             raise ProjectAssetNotFoundError(asset_id)
         return path
 
+    def media_for(self, project_id: str, asset_id: str) -> Path:
+        asset = self.get_asset(project_id, asset_id)
+        if asset.sha256 is None:
+            raise ProjectAssetNotFoundError(asset_id)
+        path = self.blob_path(asset.sha256)
+        if not path.is_file():
+            raise ProjectAssetNotFoundError(asset_id)
+        return path
+
     def blob_path(self, sha256: str) -> Path:
         return self.blob_root / sha256[:2] / sha256
 
@@ -712,6 +767,164 @@ class ProjectAssetStore:
         except (UnidentifiedImageError, OSError, SyntaxError) as exc:
             raise InvalidProjectImageError("file content is not a valid supported image") from exc
         return image, SUPPORTED_IMAGE_FORMATS[image_format], width, height
+
+    def _validate_upload(
+        self, content: bytes, original_name: str
+    ) -> tuple[
+        ProjectAssetMediaKind,
+        str,
+        int | None,
+        int | None,
+        float | None,
+        float | None,
+        bool | None,
+        bytes | None,
+    ]:
+        try:
+            image, mime_type, width, height = self._validate_image(content)
+        except InvalidProjectImageError:
+            mime_type = self._detect_av_mime(content, original_name)
+            media_kind = (
+                ProjectAssetMediaKind.VIDEO
+                if mime_type.startswith("video/")
+                else ProjectAssetMediaKind.AUDIO
+            )
+            metadata = self._probe_av(content, original_name, media_kind)
+            return (
+                media_kind,
+                mime_type,
+                metadata["width"],
+                metadata["height"],
+                metadata["duration_seconds"],
+                metadata["frame_rate"],
+                metadata["has_audio"],
+                None,
+            )
+        return (
+            ProjectAssetMediaKind.IMAGE,
+            mime_type,
+            width,
+            height,
+            None,
+            None,
+            None,
+            self._make_preview(image),
+        )
+
+    def _probe_av(
+        self,
+        content: bytes,
+        original_name: str,
+        media_kind: ProjectAssetMediaKind,
+    ) -> dict[str, Any]:
+        suffix = Path(original_name).suffix or ".bin"
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                handle.write(content)
+                temp_path = Path(handle.name)
+            completed = subprocess.run(
+                [
+                    self.ffprobe_binary,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration:stream=codec_type,width,height,avg_frame_rate",
+                    "-of",
+                    "json",
+                    str(temp_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise InvalidProjectImageError(
+                f"ffprobe could not inspect reference media: {exc}"
+            ) from exc
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "invalid media container"
+            raise InvalidProjectImageError(f"reference media could not be decoded: {detail}")
+        try:
+            payload = json.loads(completed.stdout)
+            streams = payload.get("streams", [])
+            duration = float(payload.get("format", {}).get("duration") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise InvalidProjectImageError("ffprobe returned invalid reference metadata") from exc
+        if duration <= 0:
+            raise InvalidProjectImageError("reference media must have a positive duration")
+        video_stream = next(
+            (stream for stream in streams if stream.get("codec_type") == "video"), None
+        )
+        has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+        if media_kind == ProjectAssetMediaKind.AUDIO:
+            if not has_audio:
+                raise InvalidProjectImageError("audio reference has no decodable audio stream")
+            return {
+                "width": None,
+                "height": None,
+                "duration_seconds": duration,
+                "frame_rate": None,
+                "has_audio": True,
+            }
+        if video_stream is None:
+            raise InvalidProjectImageError("video reference has no decodable video stream")
+        if not H3_REFERENCE_VIDEO_MIN_SECONDS <= duration <= H3_REFERENCE_VIDEO_MAX_SECONDS:
+            raise InvalidProjectImageError("H3 reference videos must be between 2 and 15 seconds")
+        numerator, separator, denominator = str(
+            video_stream.get("avg_frame_rate") or "0/1"
+        ).partition("/")
+        try:
+            frame_rate = float(numerator) / float(denominator) if separator else float(numerator)
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            raise InvalidProjectImageError("video reference frame rate is invalid") from exc
+        if abs(frame_rate - H3_REFERENCE_VIDEO_FPS) > 0.01:
+            raise InvalidProjectImageError("H3 reference videos must be exactly 24 fps")
+        width = int(video_stream.get("width") or 0) or None
+        height = int(video_stream.get("height") or 0) or None
+        if width is None or height is None:
+            raise InvalidProjectImageError("video reference dimensions are invalid")
+        return {
+            "width": width,
+            "height": height,
+            "duration_seconds": duration,
+            "frame_rate": frame_rate,
+            "has_audio": has_audio,
+        }
+
+    @staticmethod
+    def _detect_av_mime(content: bytes, original_name: str) -> str:
+        if not content:
+            raise InvalidProjectImageError("uploaded media is empty")
+        guessed = mimetypes.guess_type(original_name)[0] or ""
+        header = content[:64]
+        if header.startswith(b"\x1aE\xdf\xa3") and guessed in {"video/webm", "audio/webm"}:
+            return guessed
+        if len(header) >= 12 and header[4:8] == b"ftyp" and guessed in {
+            "video/mp4",
+            "video/quicktime",
+            "audio/mp4",
+            "audio/x-m4a",
+        }:
+            return guessed
+        if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
+            return "audio/wav"
+        if header.startswith((b"ID3", b"fLaC", b"OggS")) or header[:2] in {
+            b"\xff\xfb",
+            b"\xff\xf3",
+            b"\xff\xf2",
+        }:
+            return {
+                ".flac": "audio/flac",
+                ".ogg": "audio/ogg",
+            }.get(Path(original_name).suffix.casefold(), "audio/mpeg")
+        raise InvalidProjectImageError(
+            "file must be a supported image, MP4/MOV/WebM video, or WAV/MP3/FLAC/OGG audio"
+        )
 
     @staticmethod
     def _make_preview(image: Image.Image) -> bytes:

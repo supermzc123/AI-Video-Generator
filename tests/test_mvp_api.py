@@ -111,6 +111,8 @@ async def test_workflow_inspect_register_and_compile(tmp_path: Path) -> None:
                 ).model_dump(mode="json"),
             },
         )
+        deleted = await client.delete("/api/v1/workflows/templates/image:test")
+        remaining = await client.get("/api/v1/workflows/templates")
 
     assert inspected.status_code == 200
     assert inspected.json()["bindings"] == []
@@ -118,6 +120,9 @@ async def test_workflow_inspect_register_and_compile(tmp_path: Path) -> None:
     assert registered.status_code == 201
     assert compiled.status_code == 200
     assert compiled.json()["workflow"]["1"]["inputs"]["text"] == "new prompt"
+    assert deleted.status_code == 200
+    assert deleted.json()["removed_revisions"] == 1
+    assert remaining.json() == []
 
 
 @pytest.mark.asyncio

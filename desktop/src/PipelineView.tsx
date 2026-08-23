@@ -5,8 +5,10 @@ import {
   ChevronRight,
   CircleAlert,
   Film,
+  Music,
   ImagePlus,
   ListPlus,
+  Languages,
   LockKeyhole,
   PackageCheck,
   Play,
@@ -27,14 +29,15 @@ import {
   cancelTask,
   acceptAssetCandidate,
   assetCandidatePreviewUrl,
+  compileProjectDeliveryTasks,
   compileProjectTasks,
-  createSegmentRework,
+  createReworkMarker,
+  confirmProjectReworks,
   deleteProjectAsset,
   discardAssetCandidate,
-  generateImagePrompt,
+  streamGenerateImagePrompt,
   getProjectWorkspace,
   getProjectExecutionStatus,
-  getPostProcessingCapabilities,
   getTask,
   listProjectAssets,
   listAssetCandidates,
@@ -42,9 +45,10 @@ import {
   listTaskReviewDecisions,
   artifactMediaUrl,
   projectAssetPreviewUrl,
+  projectAssetMediaUrl,
   regenerateH3Prompt,
+  streamRegenerateH3Prompt,
   regenerateProjectAsset,
-  reviewTask,
   relinkProjectAsset,
   runTask,
   runProjectImagePrompt,
@@ -52,8 +56,11 @@ import {
   setProjectMode,
   setProjectPaused,
   setReviewMode,
+  startProjectGeneration,
+  translateH3Prompt,
   updateProjectAsset,
   uploadProjectAsset,
+  withdrawReworkMarker,
 } from "./api";
 import { invalidateFromStage, persistProject } from "./project-store";
 import { ProjectAgentPanel } from "./ProjectAgentPanel";
@@ -70,9 +77,13 @@ import type {
   TaskKind,
   TaskSpec,
   ReviewDecision,
-  ReworkRequest,
-  PostProcessingCapabilities,
+  ReworkMarker,
+  SegmentGenerationVersion,
 } from "./types";
+
+function extractH3Description(stream: string): string | null {
+  return stream || null;
+}
 
 export const pipelineOrder: PipelineStageId[] = [
   "config",
@@ -82,7 +93,6 @@ export const pipelineOrder: PipelineStageId[] = [
   "assets",
   "prompts",
   "generation",
-  "review",
   "delivery",
 ];
 
@@ -94,8 +104,7 @@ const stageMeta: Record<PipelineStageId, { index: string; label: string; short: 
   assets: { index: "05", label: "素材与参考图", short: "素材" },
   prompts: { index: "06", label: "提示词设计", short: "提示词" },
   generation: { index: "07", label: "视频生成", short: "生成" },
-  review: { index: "08", label: "审核与返工", short: "审核" },
-  delivery: { index: "09", label: "后处理与交付", short: "交付" },
+  delivery: { index: "08", label: "后处理与交付", short: "交付" },
 };
 
 const taskKindLabels: Record<TaskKind, string> = {
@@ -115,7 +124,7 @@ const taskKindLabels: Record<TaskKind, string> = {
 
 const taskStateLabels: Record<TaskSpec["state"], string> = {
   blocked: "等待前置任务",
-  ready: "可执行",
+  ready: "等待派发",
   queued: "已派发",
   paused: "已暂停",
   running: "执行中",
@@ -125,6 +134,8 @@ const taskStateLabels: Record<TaskSpec["state"], string> = {
   cancelled: "已取消",
   stale: "已失效",
 };
+
+const deliveryTaskKinds = new Set<TaskKind>(["seedvr2", "rife", "whisper", "master_assembly", "export"]);
 
 const reviewBoundaryKinds = new Set<TaskKind>([
   "image_generation",
@@ -136,7 +147,7 @@ const reviewBoundaryKinds = new Set<TaskKind>([
 
 type Props = {
   project: ProjectDraft;
-  workflows: Array<{ name: string; id: string; revision: number; builtIn: boolean }>;
+  workflows: Array<{ name: string; id: string; revision: number; kind?: "image" | "interpolation" | "restoration" | "transcription" | "video" }>;
   workerOnline: boolean;
   onChange: (project: ProjectDraft) => void;
   onOpenWorkflows: () => void;
@@ -191,13 +202,10 @@ type H3SegmentSlot = {
 
 function buildH3SegmentSlots(shots: ShotDraft[]): H3SegmentSlot[] {
   return shots.flatMap((shot) => {
-    const segmentCount = shot.durationSeconds <= 15
-      ? 1
-      : Math.max(2, Math.ceil(shot.durationSeconds / 12));
-    const executionDuration = Math.max(4, shot.durationSeconds);
-    const piece = Math.round((executionDuration / segmentCount) * 1000) / 1000;
-    const durations = Array.from({ length: segmentCount }, () => piece);
-    durations[segmentCount - 1] = Math.round((executionDuration - piece * (segmentCount - 1)) * 1000) / 1000;
+    const durations = shot.motionSegments.length
+      ? shot.motionSegments.map((segment) => segment.durationSeconds)
+      : automaticMotionSegmentDurations(shot.durationSeconds);
+    const segmentCount = durations.length;
     return durations.map((durationSeconds, segmentIndex) => ({
       shotId: shot.id,
       segmentId: `${shot.id}.C${String(segmentIndex + 1).padStart(2, "0")}`,
@@ -208,6 +216,58 @@ function buildH3SegmentSlots(shots: ShotDraft[]): H3SegmentSlot[] {
       seed: shot.seed,
     }));
   });
+}
+
+function automaticMotionSegmentDurations(durationSeconds: number): number[] {
+  const executionDuration = Math.max(4, durationSeconds);
+  const count = durationSeconds <= 15 ? 1 : Math.max(2, Math.ceil(durationSeconds / 12));
+  const piece = Math.round((executionDuration / count) * 1000) / 1000;
+  const durations = Array.from({ length: count }, () => piece);
+  durations[count - 1] = Math.round((executionDuration - piece * (count - 1)) * 1000) / 1000;
+  return durations;
+}
+
+type GenerationSegment = ProjectExecutionStatus["hierarchy"][number]["segments"][number];
+
+function GenerationSegmentCard({ segment, project, tasks, reviewTasks, artifactsByTask, decisionsByTask, markers, actionBusy, onMark, onWithdraw }: {
+  segment: GenerationSegment;
+  project: ProjectDraft;
+  tasks: TaskSpec[];
+  reviewTasks: TaskSpec[];
+  artifactsByTask: Record<string, ArtifactDescriptor[]>;
+  decisionsByTask: Record<string, ReviewDecision[]>;
+  markers: ReworkMarker[];
+  actionBusy: boolean;
+  onMark: (version: SegmentGenerationVersion) => void;
+  onWithdraw: (markerId: string) => void;
+}) {
+  const version = segment.active_version ?? segment.versions.at(-1) ?? null;
+  const task = version ? tasks.find((item) => item.task_id === version.task_id) ?? segment.task : segment.task;
+  const video = task ? artifactsByTask[task.task_id]?.find((item) => item.kind === "video_segment") : null;
+  const reviewTask = task ? reviewTasks.find((item) => item.depends_on.includes(task.task_id)) : null;
+  const decision = reviewTask ? decisionsByTask[reviewTask.task_id]?.at(-1) : null;
+  const marker = markers.find((item) => item.segment_id === segment.segment_id && ["draft", "preparing", "sealed"].includes(item.state));
+  const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === segment.segment_id);
+  const showAi = !["manual", "none"].includes(project.reviewPolicy.effectiveMode);
+  return <article className="review-card">
+    <header><div><span>连接段 {segment.segment_index + 1}</span><div><strong>{segment.segment_id} · {version ? `第 ${version.generation_number} 次生成` : "尚未生成"}</strong><small>{segment.frozen ? "已冻结" : task ? taskStateLabels[task.state] : "等待计划"}</small></div></div><span className={`state state-${segment.frozen ? "paused" : task?.state ?? "blocked"}`}>{segment.frozen ? "已冻结" : task ? taskStateLabels[task.state] : "等待计划"}</span></header>
+    <div className="review-media">{video ? <video controls preload="metadata" src={artifactMediaUrl(video)}>当前系统播放器不支持此视频格式。</video> : <div className="media-placeholder"><Film size={24} /><span>{task?.state === "succeeded" ? "视频产物未登记或已作废" : segment.freeze_reason ?? "等待片段生成完成"}</span></div>}</div>
+    {prompt && <details className="review-prompt"><summary>查看生成提示词</summary><pre>{prompt.prompt}</pre></details>}
+    {decision && showAi && <section className="review-decision"><div className="decision-summary"><strong>{decision.disposition === "accepted" ? "AI 建议通过" : "AI 建议返工"}</strong><span>置信度 {Math.round(decision.confidence * 100)}%</span></div>{decision.issues.map((issue, index) => <div className={`review-issue ${issue.severity}`} key={`${issue.category}:${index}`}><header><strong>{issue.message}</strong><span>{issue.start_seconds === null ? "未标注时间" : `${issue.start_seconds.toFixed(1)}s`}</span></header>{issue.suggested_action && <p>建议：{issue.suggested_action}</p>}</div>)}</section>}
+    {marker && <div className="rework-marker"><CircleAlert size={14} /><span>{marker.state === "draft" ? "等待统一确认返工" : marker.state === "preparing" ? "返工批次准备中" : "返工批次已封存"}：{marker.feedback}</span>{marker.state !== "sealed" && <button className="secondary-button" disabled={actionBusy} onClick={() => onWithdraw(marker.marker_id)}>撤销标记</button>}</div>}
+    {version && !marker && project.reviewPolicy.effectiveMode !== "none" && <footer><button className="secondary-button" disabled={actionBusy || !video} onClick={() => onMark(version)}><RotateCcw size={14} />标记返工</button></footer>}
+  </article>;
+}
+
+function motionSegmentsValid(shot: ShotDraft): boolean {
+  if (!shot.motionSegments.length) return true;
+  const total = shot.motionSegments.reduce((sum, segment) => sum + segment.durationSeconds, 0);
+  return Math.abs(total - Math.max(4, shot.durationSeconds)) < 0.01
+    && shot.motionSegments.every((segment, index) => (
+      segment.durationSeconds >= 4
+      && segment.durationSeconds <= (index === 0 ? 15 : 12)
+      && segment.summary.trim()
+    ));
 }
 
 function activateFileLabel(event: KeyboardEvent<HTMLLabelElement>) {
@@ -313,6 +373,7 @@ function AssetLightbox({ assets, activeId, projectId, onClose, onSelect }: {
   });
 
   if (!asset) return null;
+  const mediaUrl = projectAssetMediaUrl(projectId, asset.id);
   const imageUrl = asset.previewUrl || projectAssetPreviewUrl(projectId, asset.id);
   return <div className="asset-lightbox" role="dialog" aria-modal="true" aria-label={`预览 ${asset.name}`} onClick={onClose}>
     <header onClick={(event) => event.stopPropagation()}><div><strong>{asset.name}</strong><span>{asset.width && asset.height ? `${asset.width} × ${asset.height}` : "原比例预览"} · {index + 1}/{assets.length}</span></div><button className="icon-button" title="关闭预览" onClick={onClose}><X size={20} /></button></header>
@@ -336,14 +397,18 @@ function AssetLightbox({ assets, activeId, projectId, onClose, onSelect }: {
       }}
       onPointerUp={() => { drag.current = null; }}
     >
-      <img src={imageUrl} alt={asset.name} draggable={false} style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }} />
+      {asset.mediaKind === "video" ? <video src={mediaUrl} controls autoPlay={false} />
+        : asset.mediaKind === "audio" ? <audio src={mediaUrl} controls />
+          : <img src={imageUrl} alt={asset.name} draggable={false} style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }} />}
     </div>
     <button className="lightbox-nav next" title="下一张" onClick={(event) => { event.stopPropagation(); move(1); }}><ChevronRight size={28} /></button>
-    <footer onClick={(event) => event.stopPropagation()}><ZoomIn size={15} /><span>{Math.round(scale * 100)}% · 滚轮缩放，拖动查看细节，方向键切换</span></footer>
+    <footer onClick={(event) => event.stopPropagation()}>{asset.mediaKind === "image" ? <><ZoomIn size={15} /><span>{Math.round(scale * 100)}% · 滚轮缩放，拖动查看细节，方向键切换</span></> : <><Film size={15} /><span>{asset.mediaKind === "video" ? "视频参考" : "音频参考"} · 方向键切换素材</span></>}</footer>
   </div>;
 }
 
 export function PipelineView({ project, workflows, workerOnline, onChange, onOpenWorkflows, onOpenTasks, onOpenBatch }: Props) {
+  const latestProject = useRef(project);
+  latestProject.current = project;
   const [actionBusy, setActionBusy] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -351,6 +416,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const [promptGenerationProgress, setPromptGenerationProgress] = useState({ completed: 0, total: 0 });
   const [configFormValid, setConfigFormValid] = useState(true);
   const [promptTab, setPromptTab] = useState<"image" | "h3">("h3");
+  const [promptTranslations, setPromptTranslations] = useState<Record<string, string>>({});
+  const [translatingPromptId, setTranslatingPromptId] = useState<string | null>(null);
   const [pendingUploads, setPendingUploads] = useState<Array<{ file: File; planId: string | null }>>([]);
   const [pendingUploadName, setPendingUploadName] = useState("");
   const [pendingUploadKind, setPendingUploadKind] = useState<AssetDraft["kind"]>("scene");
@@ -366,19 +433,15 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const [artifactsByTask, setArtifactsByTask] = useState<Record<string, ArtifactDescriptor[]>>({});
   const [reviewDecisionsByTask, setReviewDecisionsByTask] = useState<Record<string, ReviewDecision[]>>({});
   const [mediaLoadError, setMediaLoadError] = useState<string | null>(null);
-  const [postCapabilities, setPostCapabilities] = useState<PostProcessingCapabilities | null>(null);
-  const [postCapabilitiesError, setPostCapabilitiesError] = useState<string | null>(null);
   const [reworkDialog, setReworkDialog] = useState<null | {
-    reviewTask: TaskSpec;
-    sourceTask: TaskSpec;
+    version: SegmentGenerationVersion;
     segmentId: string;
-    action: ReworkRequest["action"];
+    action: "retry" | "change_seed" | "revise_prompt";
     feedback: string;
     replacementSeed: number;
   }>(null);
   const [imagePromptDialog, setImagePromptDialog] = useState<null | {
     planId: string;
-    mode: "ai" | "manual";
     instruction: string;
     prompt: string;
     negativePrompt: string;
@@ -387,48 +450,26 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const promptGenerationAbort = useRef<AbortController | null>(null);
   const guidedRunAbort = useRef<AbortController | null>(null);
   const activeIndex = pipelineOrder.indexOf(project.activeStage);
-  useEffect(() => {
-    if (project.activeStage !== "delivery") return;
-    let cancelled = false;
-    void getPostProcessingCapabilities().then((value) => {
-      if (!cancelled) { setPostCapabilities(value); setPostCapabilitiesError(null); }
-    }).catch((cause) => {
-      if (!cancelled) setPostCapabilitiesError(cause instanceof Error ? cause.message : "后处理能力读取失败");
-    });
-    return () => { cancelled = true; };
-  }, [project.activeStage]);
   const shotsDuration = useMemo(
     () => project.shots.reduce((total, shot) => total + shot.durationSeconds, 0),
     [project.shots],
   );
-  const segmentCount = useMemo(
-    () => project.shots.reduce((total, shot) => total + (shot.durationSeconds <= 15 ? 1 : Math.max(2, Math.ceil(shot.durationSeconds / 12))), 0),
-    [project.shots],
-  );
-  const continuationCount = Math.max(0, segmentCount - project.shots.length);
   const h3SegmentSlots = useMemo(() => buildH3SegmentSlots(project.shots), [project.shots]);
+  const segmentCount = h3SegmentSlots.length;
+  const continuationCount = Math.max(0, segmentCount - project.shots.length);
   const currentPlanTasks = executionStatus?.tasks ?? [];
   const generationTasks = currentPlanTasks.filter((task) => reviewBoundaryKinds.has(task.kind));
   const reviewTasks = currentPlanTasks.filter((task) => task.kind === "ai_review");
-  const deliveryTasks = currentPlanTasks.filter((task) => !reviewBoundaryKinds.has(task.kind));
-  const restorationProfiles = postCapabilities?.profiles.filter((item) => item.profile.kind === "restoration") ?? [];
-  const interpolationProfiles = postCapabilities?.profiles.filter((item) => item.profile.kind === "interpolation") ?? [];
-  const transcriptionProfiles = postCapabilities?.profiles.filter((item) => item.profile.kind === "transcription") ?? [];
-  const selectedRestoration = restorationProfiles.find((item) => item.profile.profile_id === project.postProcessing.seedvr.profileId) ?? null;
-  const selectedInterpolation = interpolationProfiles.find((item) => item.profile.profile_id === project.postProcessing.rife.profileId) ?? null;
-  const selectedTranscription = transcriptionProfiles.find((item) => item.profile.profile_id === project.postProcessing.whisper.profileId) ?? null;
+  const deliveryTasks = currentPlanTasks.filter((task) => deliveryTaskKinds.has(task.kind));
+  const imageWorkflows = workflows.filter((item) => !item.kind || item.kind === "image");
+  const restorationWorkflows = workflows.filter((item) => item.kind === "restoration");
+  const interpolationWorkflows = workflows.filter((item) => item.kind === "interpolation");
+  const transcriptionWorkflows = workflows.filter((item) => item.kind === "transcription");
   const mediaTaskKey = currentPlanTasks
     .filter((task) => task.kind === "h3_generation" || task.kind === "ai_review" || task.kind === "export")
     .map((task) => `${task.task_id}:${task.state}:${task.attempt}`)
     .join("|");
   const handleAutomaticGenerationChange = useCallback((busy: boolean) => setAgentGenerationBusy(busy), []);
-  const nextStageWillAutoGenerate = (
-    (project.activeStage === "idea" && project.outline.length === 0)
-    || (project.activeStage === "outline" && project.shots.length === 0)
-    || (project.activeStage === "storyboard" && project.assetPlans.length === 0)
-    || (project.activeStage === "generation" && !project.reviewNotes.trim())
-  );
-
   const refreshExecutionStatus = async () => {
     try {
       const status = await getProjectExecutionStatus(project.projectId);
@@ -448,7 +489,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   }, [project.projectId, project.revision, activeIndex]);
 
   useEffect(() => {
-    if (project.activeStage !== "review" && project.activeStage !== "delivery") return;
+    if (project.activeStage !== "generation" && project.activeStage !== "delivery") return;
     let cancelled = false;
     const loadMedia = async () => {
       const artifactTasks = currentPlanTasks.filter((task) => task.kind === "h3_generation" || task.kind === "export");
@@ -484,14 +525,14 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   };
 
   const availableImageWorkflow = (candidate: string | null | undefined) => (
-    workflows.some((workflow) => workflow.id === candidate) ? candidate ?? null : null
+    imageWorkflows.some((workflow) => workflow.id === candidate) ? candidate ?? null : null
   );
 
   const imageWorkflowForPlan = (planId: string) => {
     const existing = project.prompts.imagePrompts.find((item) => item.assetPlanId === planId);
     return availableImageWorkflow(selectedWorkflowByPlan[planId])
       ?? availableImageWorkflow(existing?.workflowTemplateId)
-      ?? workflows[0]?.id
+      ?? imageWorkflows[0]?.id
       ?? null;
   };
 
@@ -554,8 +595,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       message: "至少保留一个完整故事段落",
     },
     storyboard: {
-      valid: project.shots.length > 0 && project.shots.every((shot) => shot.title.trim() && shot.summary.trim() && shot.durationSeconds > 0),
-      message: "至少保留一个有效电影分镜",
+      valid: project.shots.length > 0 && project.shots.every((shot) => shot.title.trim() && shot.summary.trim() && shot.durationSeconds > 0 && motionSegmentsValid(shot)),
+      message: "至少保留一个有效电影分镜；自定义续段须合计为镜头时长，每段 4–12 秒并填写内容",
     },
     assets: {
       valid: project.referenceAssetMode === "none" || (
@@ -567,42 +608,21 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     },
     prompts: {
       valid: project.prompts.h3Prompts.length === segmentCount
-        && project.prompts.h3Prompts.every((prompt) => prompt.prompt.trim() && prompt.review.ready),
-      message: "所有 H3 片段都需要完整提示词并通过审核",
+        && h3SegmentSlots.every((slot) => project.prompts.h3Prompts.some(
+          (prompt) => prompt.segmentId === slot.segmentId && Boolean(prompt.prompt.trim()),
+        )),
+      message: "每个 H3 片段都需要一份非空视频提示词；点击下一步即确认当前文本",
     },
     generation: {
-      valid: executionStatus?.generation_complete === true,
-      message: executionStatus?.compiled ? "等待全部 H3 视频任务成功产出" : "先创建并执行本项目任务计划",
-    },
-    review: {
       valid: executionStatus?.review_complete === true,
-      message: "所有片段必须完成所选审核策略",
+      message: executionStatus?.delivery_blocked_reason
+        ?? (executionStatus?.compiled ? "等待完整活动视频链和全部返工结论" : "先创建并执行本项目任务计划"),
     },
     delivery: {
       valid: executionStatus?.delivery_complete === true,
       message: "创建并成功完成 FFmpeg 导出任务",
     },
   }), [configFormValid, executionStatus, project]);
-
-  useEffect(() => {
-    if (
-      project.activeStage !== "prompts"
-      || !completion.assets.valid
-      || completion.prompts.valid
-      || actionBusy
-    ) return;
-    void runPromptGeneration(false);
-  }, [project.activeStage, project.projectId]);
-
-  useEffect(() => {
-    if (
-      pipelineOrder.indexOf(project.activeStage) > pipelineOrder.indexOf("assets")
-      && !completion.assets.valid
-    ) {
-      onChange(persistProject({ ...project, activeStage: "assets" }));
-      setActionError("请先完成并确认全部需求图片，再生成视频提示词");
-    }
-  }, [project.activeStage, completion.assets.valid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -683,10 +703,10 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     if (!force && promptGenerationStarted.current.has(key)) return;
     const targets = h3SegmentSlots.filter((slot) => {
       const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId);
-      return prompt?.review.ready !== true;
+      return !prompt?.prompt.trim();
     });
     if (!targets.length) {
-      setActionMessage("所有视频提示词均已生成并通过审核");
+      setActionMessage("所有视频提示词均已填写；文本框内容将直接用于视频生成");
       return;
     }
     promptGenerationStarted.current.add(key);
@@ -699,23 +719,31 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     let succeeded = 0;
     let failed = 0;
     try {
-      for (const [index, slot] of targets.entries()) {
-        if (controller.signal.aborted) break;
-        const shotTitle = project.shots.find((shot) => shot.id === slot.shotId)?.title ?? slot.segmentId;
-        setActionMessage(`正在生成“${shotTitle}”的视频提示词（${index + 1}/${targets.length}）...`);
-        const generated = await regenerateH3Prompt(
+      const results = await Promise.allSettled(targets.map(async (slot) => {
+        let streamed = "";
+        const generated = await streamRegenerateH3Prompt(
           project.projectId,
           slot.segmentId,
+          (delta) => {
+            streamed += delta;
+            const preview = extractH3Description(streamed);
+            if (preview) patchH3Prompt(slot, preview);
+          },
           controller.signal,
         );
-        onChange(generated);
-        const result = generated.prompts.h3Prompts.find(
-          (item) => item.segmentId === slot.segmentId,
-        );
-        if (result?.review.ready) succeeded += 1;
-        else failed += 1;
-        setPromptGenerationProgress({ completed: index + 1, total: targets.length });
+        return { slot, generated };
+      }));
+      const merged = new Map(project.prompts.h3Prompts.map((item) => [item.segmentId, item]));
+      results.forEach((result) => {
+        if (result.status === "fulfilled") {
+          const prompt = result.value.generated.prompts.h3Prompts.find((item) => item.segmentId === result.value.slot.segmentId);
+          if (prompt?.prompt.trim()) { succeeded += 1; merged.set(prompt.segmentId, prompt); } else failed += 1;
+        } else if (!controller.signal.aborted) failed += 1;
+      });
+      if (merged.size !== project.prompts.h3Prompts.length || succeeded) {
+        onChange({ ...project, prompts: { ...project.prompts, h3Prompts: [...merged.values()] } });
       }
+      setPromptGenerationProgress({ completed: succeeded + failed, total: targets.length });
       if (controller.signal.aborted) {
         setActionMessage(`已停止视频提示词生成；本次已完成 ${succeeded + failed}/${targets.length} 个片段`);
       } else if (failed) {
@@ -778,11 +806,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   };
 
   const selectStage = (stage: PipelineStageId) => {
-    const index = pipelineOrder.indexOf(stage);
-    const unlocked = index === 0 || pipelineOrder.slice(0, index).every(
-      (id) => project.stageApprovals[id] && completion[id].valid,
-    );
-    if (unlocked) onChange(persistProject({ ...project, activeStage: stage }));
+    onChange(persistProject({ ...project, activeStage: stage }));
   };
 
   const addOutlineBeat = () => update("outline", (current) => ({
@@ -809,6 +833,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       camera: "固定机位",
       seed: 0,
       durationSeconds: 8,
+      motionSegments: [],
       locked: false,
     }],
   }));
@@ -817,6 +842,43 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     ...current,
     shots: current.shots.map((shot) => shot.id === id ? { ...shot, ...values } : shot),
   }));
+
+  const customizeMotionSegments = (shot: ShotDraft) => patchShot(shot.id, {
+    motionSegments: shot.motionSegments.length
+      ? []
+      : automaticMotionSegmentDurations(shot.durationSeconds).map((durationSeconds, index) => ({
+        id: uid("motion"),
+        durationSeconds,
+        summary: index === 0 ? shot.summary : "承接上一段结束状态并继续动作",
+      })),
+  });
+
+  const addMotionSegment = (shot: ShotDraft) => {
+    const source = shot.motionSegments.length ? [...shot.motionSegments] : automaticMotionSegmentDurations(shot.durationSeconds).map((durationSeconds, index) => ({ id: uid("motion"), durationSeconds, summary: index === 0 ? shot.summary : "承接上一段结束状态并继续动作" }));
+    const splitIndex = source.reduce((best, segment, index) => segment.durationSeconds > source[best].durationSeconds ? index : best, 0);
+    if (source[splitIndex].durationSeconds < 8) {
+      setActionError("每个 H3 可见片段至少需要 4 秒；当前没有可继续拆分的片段");
+      return;
+    }
+    const first = Math.round((source[splitIndex].durationSeconds / 2) * 1000) / 1000;
+    const second = Math.round((source[splitIndex].durationSeconds - first) * 1000) / 1000;
+    source.splice(splitIndex, 1,
+      { ...source[splitIndex], durationSeconds: first },
+      { id: uid("motion"), durationSeconds: second, summary: "承接上一段结束状态并继续动作" },
+    );
+    patchShot(shot.id, { motionSegments: source });
+  };
+
+  const removeMotionSegment = (shot: ShotDraft, segmentIndex: number) => {
+    if (shot.motionSegments.length <= 1) {
+      patchShot(shot.id, { motionSegments: [] });
+      return;
+    }
+    const next = shot.motionSegments.filter((_, index) => index !== segmentIndex);
+    const mergeIndex = Math.max(0, segmentIndex - 1);
+    next[mergeIndex] = { ...next[mergeIndex], durationSeconds: Math.round((next[mergeIndex].durationSeconds + shot.motionSegments[segmentIndex].durationSeconds) * 1000) / 1000 };
+    patchShot(shot.id, { motionSegments: next });
+  };
 
   const queueAssetUploads = (event: ChangeEvent<HTMLInputElement>, planId: string | null = null) => {
     const files = Array.from(event.target.files ?? []);
@@ -862,6 +924,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         prompts: {
           ...project.prompts,
           imagePrompts: project.prompts.imagePrompts.filter((item) => item.assetPlanId !== pending.planId),
+          h3Prompts: pending.planId ? [] : project.prompts.h3Prompts,
+          generatedAt: pending.planId ? null : project.prompts.generatedAt,
         },
       };
       const invalidationStage = pending.planId ? "assets" : "idea";
@@ -875,7 +939,9 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       } else {
         setPendingUploadKind("scene");
       }
-      setActionMessage(`已上传并登记素材“${name}”`);
+      setActionMessage(pending.planId
+        ? `已上传并绑定素材“${name}”；旧视频提示词和任务计划已失效，请重新生成提示词并重新创建任务计划`
+        : `已上传并登记素材“${name}”`);
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "图片上传失败");
     } finally {
@@ -883,13 +949,11 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     }
   };
 
-  const writeAndRunAssetPlan = async (
-    plan: ProjectDraft["assetPlans"][number],
-    instruction: string | null = null,
-    workflowTemplateId: string | null = null,
-  ) => {
-    const selectedWorkflow = availableImageWorkflow(workflowTemplateId)
-      ?? imageWorkflowForPlan(plan.id);
+  const fillImagePromptWithAI = async () => {
+    if (!imagePromptDialog) return;
+    const plan = project.assetPlans.find((item) => item.id === imagePromptDialog.planId);
+    if (!plan) return;
+    const selectedWorkflow = imageWorkflowForPlan(plan.id);
     if (!selectedWorkflow) {
       setActionError("请先为该素材需求选择图片工作流");
       return;
@@ -898,26 +962,67 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     setActionMessage(`正在为“${plan.name}”编写图片提示词...`);
     try {
       const saved = await saveProjectToControlPlane(project);
-      const changed = await generateImagePrompt(
+      setImagePromptDialog((current) => current ? { ...current, prompt: "" } : current);
+      const changed = await streamGenerateImagePrompt(
         saved.projectId,
         plan.id,
-        instruction,
+        imagePromptDialog.instruction.trim() || null,
         selectedWorkflow,
+        (delta) => setImagePromptDialog((current) => current ? { ...current, prompt: `${current.prompt}${delta}` } : current),
       );
       const generated = changed.prompts.imagePrompts.find((item) => item.assetPlanId === plan.id);
       if (!generated?.prompt.trim()) throw new Error("LLM 未返回该素材需求的有效图片提示词");
       onChange(changed);
-      if (!workerOnline) throw new Error("提示词已保存，但 ComfyUI Worker 离线，暂时不能生成图片");
-      const task = await runProjectImagePrompt(changed.projectId, plan.id);
-      setActiveImageTasks((current) => ({ ...current, [plan.id]: task.task_id }));
-      setImagePromptDialog(null);
-      setActionMessage(`“${plan.name}”的提示词已完成，图片任务正在运行`);
+      setImagePromptDialog({
+        planId: plan.id,
+        instruction: "",
+        prompt: generated.prompt,
+        negativePrompt: generated.negativePrompt,
+      });
+      setActionMessage("AI 已将图片提示词写入统一编辑框，请确认或继续修改");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "图片提示词生成失败");
     } finally { setActionBusy(false); }
   };
 
-  const saveManualImagePromptAndRun = async () => {
+  const generateAllImagePrompts = async () => {
+    const targets = project.assetPlans.filter((plan) => Boolean(imageWorkflowForPlan(plan.id)));
+    if (!targets.length) {
+      setActionError("没有可用的图片素材需求或已批准图片工作流");
+      return;
+    }
+    setActionBusy(true);
+    setActionMessage(`正在并发生成 ${targets.length} 份图片提示词...`);
+    try {
+      const results = await Promise.allSettled(targets.map(async (plan) => {
+        const generated = await streamGenerateImagePrompt(
+          project.projectId,
+          plan.id,
+          null,
+          imageWorkflowForPlan(plan.id),
+          () => undefined,
+        );
+        return generated.prompts.imagePrompts.find((item) => item.assetPlanId === plan.id);
+      }));
+      const byPlan = new Map(project.prompts.imagePrompts.map((item) => [item.assetPlanId, item]));
+      let completed = 0;
+      results.forEach((result) => {
+        if (result.status === "fulfilled" && result.value?.prompt.trim()) {
+          byPlan.set(result.value.assetPlanId, result.value);
+          completed += 1;
+        }
+      });
+      onChange({ ...project, prompts: { ...project.prompts, imagePrompts: [...byPlan.values()] } });
+      if (completed !== targets.length) setActionError(`图片提示词部分完成：${completed}/${targets.length}`);
+      else setActionMessage(`图片提示词已全部生成，共 ${completed} 份`);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "图片提示词批量生成失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const saveImagePromptAndRun = async () => {
     if (!imagePromptDialog) return;
     const plan = project.assetPlans.find((item) => item.id === imagePromptDialog.planId);
     if (!plan || !imagePromptDialog.prompt.trim()) {
@@ -925,9 +1030,9 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       return;
     }
     const existing = project.prompts.imagePrompts.find((item) => item.assetPlanId === plan.id);
-    const defaultWorkflow = workflows.find(
+    const defaultWorkflow = imageWorkflows.find(
       (item) => item.id === selectedWorkflowByPlan[plan.id],
-    ) ?? workflows[0];
+    ) ?? imageWorkflows[0];
     if (!existing && !defaultWorkflow) {
       setActionError("请先登记并批准一个图片工作流");
       return;
@@ -968,20 +1073,16 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       const task = await runProjectImagePrompt(saved.projectId, plan.id);
       setActiveImageTasks((current) => ({ ...current, [plan.id]: task.task_id }));
       setImagePromptDialog(null);
-      setActionMessage(`“${plan.name}”的手动提示词已保存，图片任务正在运行`);
+      setActionMessage(`“${plan.name}”的提示词已保存，图片任务正在运行`);
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "保存并生成图片失败");
     } finally { setActionBusy(false); }
   };
 
-  const openImagePromptDialog = (
-    plan: ProjectDraft["assetPlans"][number],
-    mode: "ai" | "manual",
-  ) => {
+  const openImagePromptDialog = (plan: ProjectDraft["assetPlans"][number]) => {
     const existing = project.prompts.imagePrompts.find((item) => item.assetPlanId === plan.id);
     setImagePromptDialog({
       planId: plan.id,
-      mode,
       instruction: "",
       prompt: existing?.prompt ?? "",
       negativePrompt: existing?.negativePrompt ?? "",
@@ -989,7 +1090,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   };
 
   const patchH3Prompt = (slot: H3SegmentSlot, promptText: string) => {
-    update("prompts", (current) => {
+    const current = latestProject.current;
+    const changed = (() => {
       const existing = current.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId);
       const next = existing
         ? current.prompts.h3Prompts.map((item) => item.segmentId === slot.segmentId
@@ -1014,7 +1116,9 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           review: { ready: false, issues: [], reviewedAt: null },
         }];
       return { ...current, prompts: { ...current.prompts, h3Prompts: next } };
-    });
+    })();
+    latestProject.current = changed;
+    onChange(changed);
   };
 
   const generateOneH3Prompt = async (slot: H3SegmentSlot) => {
@@ -1022,11 +1126,40 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     setActionMessage(`正在生成“${project.shots.find((shot) => shot.id === slot.shotId)?.title ?? slot.segmentId}”第 ${slot.segmentIndex + 1} 段提示词...`);
     try {
       const saved = await saveProjectToControlPlane(project);
-      onChange(await regenerateH3Prompt(saved.projectId, slot.segmentId));
-      setActionMessage("视频提示词已生成并完成审核");
+      let streamed = "";
+      const generated = await streamRegenerateH3Prompt(saved.projectId, slot.segmentId, (delta) => {
+        streamed += delta;
+        const preview = extractH3Description(streamed);
+        if (preview) patchH3Prompt(slot, preview);
+      });
+      onChange(generated);
+      const failed = generated.prompts.generationSummary?.failedSegmentIds?.includes(slot.segmentId);
+      if (failed) {
+        const issue = generated.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId)?.review.issues[0];
+        throw new Error(issue?.message || "视频提示词生成失败，请查看该片段的问题详情");
+      }
+      setActionMessage("视频提示词已生成并写入文本框");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "视频提示词生成失败");
     } finally { setActionBusy(false); }
+  };
+
+  const translatePrompt = async (promptId: string) => {
+    if (promptId.startsWith("draft-")) {
+      setActionError("请先使用 AI 编写并保存英文执行稿，再生成中文对照");
+      return;
+    }
+    setTranslatingPromptId(promptId);
+    setActionError(null);
+    try {
+      const result = await translateH3Prompt(project.projectId, promptId);
+      setPromptTranslations((current) => ({ ...current, [promptId]: result.translation }));
+      setActionMessage("中文对照已生成；英文执行稿和审核状态未改变");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "中文对照生成失败");
+    } finally {
+      setTranslatingPromptId(null);
+    }
   };
 
   const dismissAssetPlan = async (planId: string) => {
@@ -1116,15 +1249,54 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     } finally { setActionBusy(false); }
   };
 
-  const ensureCompiledDag = async () => {
+  const startGeneration = async () => {
+    if (!workerOnline) {
+      setActionError("ComfyUI Worker 离线，无法启动视频生成");
+      return;
+    }
+    setActionBusy(true);
+    try {
+      const status = await ensureCompiledDag();
+      await startProjectGeneration(project.projectId);
+      await refreshExecutionStatus();
+      setActionMessage(status.compiled ? "后台调度已启动；关闭页面后仍会继续" : "生成批次已启动");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "启动生成失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const restartGeneration = async () => {
+    if (!window.confirm("将取消当前 MiniMax H3 执行，重新读取全局设置，并从条件编码开始生成。已确认的素材和提示词会保留。是否继续？")) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionMessage("正在重新读取设置并重建 MiniMax H3 执行链...");
+    let restarted = false;
+    try {
+      const saved = await saveProjectToControlPlane(project);
+      onChange(saved);
+      const result = await compileProjectTasks(saved.projectId, true);
+      await refreshExecutionStatus();
+      const profile = result.h3_execution_profile;
+      setActionMessage(profile
+        ? `已读取最新设置：${profile.diffusion_model} · ${profile.turbo_enabled ? "Turbo" : "标准模式"} · ${profile.steps} 步；已重建 ${result.tasks.length} 个任务`
+        : `已重新读取设置并重建 ${result.tasks.length} 个任务`);
+      restarted = true;
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "重新开始 MiniMax H3 生成失败");
+    } finally {
+      setActionBusy(false);
+    }
+    if (restarted) await startProjectGeneration(project.projectId);
+  };
+
+  const ensureCompiledDag = async (target: "generation" | "delivery" = "generation") => {
     const saved = await saveProjectToControlPlane(project);
     onChange(saved);
-    const current = await getProjectExecutionStatus(saved.projectId).catch(() => null);
-    if (current?.compiled) {
-      setExecutionStatus(current);
-      return current;
-    }
-    const compiled = await compileProjectTasks(saved.projectId);
+    const compiled = target === "delivery"
+      ? await compileProjectDeliveryTasks(saved.projectId)
+      : await compileProjectTasks(saved.projectId);
     const status = await getProjectExecutionStatus(saved.projectId);
     setExecutionStatus(status);
     setActionMessage(`已创建 ${compiled.tasks.length} 个任务，准备从流程中执行`);
@@ -1193,8 +1365,16 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           getProjectWorkspace(project.projectId),
           listProjectAssets(project.projectId),
         ]);
-        onChange({ ...workspace, assets });
-        setActionMessage("已接受候选版本；仅实际引用该素材的下游内容会失效");
+        onChange({
+          ...workspace,
+          assets,
+          prompts: {
+            ...workspace.prompts,
+            h3Prompts: [],
+            generatedAt: null,
+          },
+        });
+        setActionMessage("已接受候选版本；旧视频提示词已失效，请按最新参考重新生成");
       } else {
         await discardAssetCandidate(candidate.candidate_id);
         setActionMessage("已放弃候选版本，当前素材保持不变");
@@ -1251,15 +1431,16 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     setGuidedRunTarget(target);
     setActionMessage(target === "review" ? "正在准备并执行到审核门..." : "正在执行后处理与导出...");
     try {
-      await ensureCompiledDag();
+      await ensureCompiledDag(target === "delivery" ? "delivery" : "generation");
       while (!controller.signal.aborted) {
         const status = await getProjectExecutionStatus(project.projectId);
         setExecutionStatus(status);
         const relevant = target === "review"
           ? status.tasks.filter((task) => reviewBoundaryKinds.has(task.kind))
-          : status.tasks;
+          : status.tasks.filter((task) => deliveryTaskKinds.has(task.kind));
         const failed = relevant.find((task) => task.state === "failed"
-          && task.error_code !== "ai_review_rework_queued");
+          && task.error_code !== "ai_review_rework_queued"
+          && !(target === "delivery" && task.kind === "ai_review"));
         if (failed) {
           throw new Error(`${taskKindLabels[failed.kind]}失败：${failed.error_message || "请在当前流程中重试"}`);
         }
@@ -1308,6 +1489,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
 
   const operatePipelineTask = async (task: TaskSpec, operation: "retry" | "cancel") => {
     setActionBusy(true);
+    setActionError(null);
+    setActionMessage(operation === "retry" ? `正在重新提交：${taskKindLabels[task.kind]}...` : null);
     try {
       if (operation === "cancel") await cancelTask(task.task_id);
       else await runTask(task.task_id);
@@ -1320,41 +1503,11 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     }
   };
 
-  const sourceTaskForReview = (reviewTask: TaskSpec) => currentPlanTasks.find(
-    (candidate) => candidate.kind === "h3_generation" && reviewTask.depends_on.includes(candidate.task_id),
-  ) ?? null;
-
-  const segmentForReview = (reviewTask: TaskSpec, sourceTask: TaskSpec | null) => {
-    const decision = reviewDecisionsByTask[reviewTask.task_id]?.at(-1);
-    const artifact = sourceTask ? artifactsByTask[sourceTask.task_id]?.find((item) => item.segment_id) : null;
-    return decision?.segment_id ?? artifact?.segment_id ?? null;
-  };
-
-  const acceptReview = async (task: TaskSpec) => {
-    setActionBusy(true);
-    try {
-      await reviewTask(task.task_id, true, project.reviewNotes);
-      await refreshExecutionStatus();
-      setActionMessage("已接受片段，后继任务已解锁");
-    } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : "审核操作失败");
-    } finally {
-      setActionBusy(false);
-    }
-  };
-
-  const openReworkDialog = (reviewTask: TaskSpec) => {
-    const sourceTask = sourceTaskForReview(reviewTask);
-    const segmentId = segmentForReview(reviewTask, sourceTask);
-    if (!sourceTask || !segmentId) {
-      setActionError("无法从审核任务定位原始视频片段，请刷新执行状态后重试");
-      return;
-    }
-    const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === segmentId);
+  const openReworkDialog = (version: SegmentGenerationVersion) => {
+    const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === version.segment_id);
     setReworkDialog({
-      reviewTask,
-      sourceTask,
-      segmentId,
+      version,
+      segmentId: version.segment_id,
       action: "revise_prompt",
       feedback: "",
       replacementSeed: (prompt?.seed ?? 0) + 1,
@@ -1365,28 +1518,43 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     if (!reworkDialog || !reworkDialog.feedback.trim()) return;
     setActionBusy(true);
     try {
-      if (reworkDialog.reviewTask.state === "needs_review") {
-        await reviewTask(reworkDialog.reviewTask.task_id, false, reworkDialog.feedback.trim());
-      }
-      const request = await createSegmentRework(project.projectId, reworkDialog.segmentId, {
-        source_h3_task_id: reworkDialog.sourceTask.task_id,
-        review_task_id: reworkDialog.reviewTask.task_id,
+      await createReworkMarker(project.projectId, {
+        version_id: reworkDialog.version.version_id,
         action: reworkDialog.action,
         feedback: reworkDialog.feedback.trim(),
         replacement_seed: reworkDialog.action === "change_seed" ? reworkDialog.replacementSeed : null,
       });
       setReworkDialog(null);
-      if (request.state === "queued" && request.replacement_task_id) {
-        const replacement = await getTask(request.replacement_task_id);
-        if (replacement.state === "ready") await runTask(replacement.task_id);
-        setActionMessage("返工任务已创建并从当前流程派发；完成后会重新审核");
-      } else {
-        selectStage("prompts");
-        setActionMessage("返工反馈已绑定到对应片段，请修改该片段提示词后重新生成");
-      }
+      setActionMessage("已标记返工；该 Motion Context 序列已从问题段起冻结");
       await refreshExecutionStatus();
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "创建返工任务失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const confirmAllReworks = async () => {
+    setActionBusy(true);
+    try {
+      await confirmProjectReworks(project.projectId);
+      await refreshExecutionStatus();
+      setActionMessage("返工批次已确认，后台将按统一管线执行");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "确认返工失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const withdrawMarker = async (markerId: string) => {
+    setActionBusy(true);
+    try {
+      await withdrawReworkMarker(project.projectId, markerId);
+      await refreshExecutionStatus();
+      setActionMessage("已撤销返工标记，后台会重新计算可执行片段");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "撤销返工失败");
     } finally {
       setActionBusy(false);
     }
@@ -1411,8 +1579,6 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       <div><strong>{project.executionMode === "guided" ? "精细化模式" : "批量模式"}</strong><span>{actionMessage ?? "项目进度和任务状态会自动保存"}</span></div>
       <button className="secondary-button" disabled={actionBusy} onClick={() => void saveDraft()}><Save size={15} />保存草稿</button>
       {project.stageApprovals.outline && project.outline.length > 0 && !executionStatus?.task_count && <button className="primary-button" disabled={actionBusy} onClick={onOpenBatch}><PackageCheck size={15} />加入批量队列</button>}
-      {activeIndex >= pipelineOrder.indexOf("generation") && project.executionMode === "guided" && <button className="secondary-button" disabled={actionBusy || Boolean(guidedRunTarget)} onClick={() => void runNextTask()}><Play size={15} />执行下一项</button>}
-      {activeIndex >= pipelineOrder.indexOf("generation") && project.executionMode === "guided" && <button className="secondary-button" disabled={actionBusy || (Boolean(guidedRunTarget) && guidedRunTarget !== "review")} onClick={() => guidedRunTarget === "review" ? stopGuidedRun() : void runGuidedTo("review")}>{guidedRunTarget === "review" ? <Square size={14} /> : <PackageCheck size={15} />}{guidedRunTarget === "review" ? "停止自动派发" : "执行到审核门"}</button>}
       {executionStatus?.task_count ? <button className="secondary-button" disabled={actionBusy} onClick={() => void (async () => {
         setActionBusy(true);
         try { const state = await setProjectPaused(project.projectId, !project.paused); onChange({ ...project, paused: state.paused }); }
@@ -1425,16 +1591,14 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     <div className="pipeline-rail" aria-label="制作阶段">
       {pipelineOrder.map((stage, index) => {
         const approved = Boolean(project.stageApprovals[stage]) && completion[stage].valid;
-        const unlocked = index === 0 || pipelineOrder.slice(0, index).every(
-          (id) => project.stageApprovals[id] && completion[id].valid,
-        );
+        const unlocked = true;
         const current = project.activeStage === stage;
         return <button
           key={stage}
           className={`pipeline-step ${current ? "current" : ""} ${approved ? "complete" : ""}`}
           disabled={!unlocked}
           onClick={() => selectStage(stage)}
-          title={unlocked ? stageMeta[stage].label : "批准前序阶段后解锁"}
+          title={stageMeta[stage].label}
         >
           <span className="pipeline-step-index">{approved ? <Check size={14} /> : unlocked ? stageMeta[stage].index : <LockKeyhole size={13} />}</span>
           <span>{stageMeta[stage].short}</span>
@@ -1469,9 +1633,9 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           <Field label="视觉风格"><input value={project.idea.visualStyle} onChange={(event) => update("idea", (current) => ({ ...current, idea: { ...current.idea, visualStyle: event.target.value } }))} /></Field>
           <Field label="目标观众"><input value={project.idea.audience} onChange={(event) => update("idea", (current) => ({ ...current, idea: { ...current.idea, audience: event.target.value } }))} placeholder="可选" /></Field>
           <div className="idea-assets field-wide">
-            <div className="inline-toolbar"><span>创意参考图 · 输入 @名称 引用</span><label className="secondary-button" role="button" aria-label="上传并命名创意参考图" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={15} />上传并命名<input type="file" accept="image/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div>
+            <div className="inline-toolbar"><span>创意参考素材 · 输入 @名称 引用</span><label className="secondary-button" role="button" aria-label="上传并命名创意参考素材" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={15} />上传并命名<input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div>
             <div className="idea-asset-strip">{project.assets.map((asset) => <div key={asset.id} className="idea-asset-chip">
-              {asset.status === "ready" ? <button className="thumbnail-button" title={`放大预览 ${asset.name}`} onClick={() => setLightboxAssetId(asset.id)}><img src={asset.previewUrl || projectAssetPreviewUrl(project.projectId, asset.id)} alt={asset.name} /></button> : <ImagePlus size={18} />}
+              {asset.status === "ready" ? <button className="thumbnail-button" title={`预览 ${asset.name}`} onClick={() => setLightboxAssetId(asset.id)}>{asset.mediaKind === "image" ? <img src={asset.previewUrl || projectAssetPreviewUrl(project.projectId, asset.id)} alt={asset.name} /> : asset.mediaKind === "video" ? <Film size={18} /> : <Music size={18} />}</button> : <ImagePlus size={18} />}
               <span>@{asset.name}</span>
               <button className="icon-button" disabled={actionBusy} title={`删除素材 ${asset.name}`} aria-label={`删除素材 ${asset.name}`} onClick={() => void removeAsset(asset)}><Trash2 size={14} /></button>
             </div>)}{!project.assets.length && <span className="muted-copy">上传后即可在创意和对话中按名称引用</span>}</div>
@@ -1497,12 +1661,22 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           {project.shots.map((shot, index) => <div className="shot-row" key={shot.id}>
             <div className="shot-index"><span>{String(index + 1).padStart(2, "0")}</span><Film size={17} /></div>
             <div className="shot-main">
-              <div className="shot-title-line"><input className="title-input" value={shot.title} onChange={(event) => patchShot(shot.id, { title: event.target.value })} />{shot.durationSeconds > 15 && <span className="continuation-chip">{Math.max(2, Math.ceil(shot.durationSeconds / 12))} 段连续生成</span>}</div>
+              <div className="shot-title-line"><input className="title-input" value={shot.title} onChange={(event) => patchShot(shot.id, { title: event.target.value })} />{buildH3SegmentSlots([shot]).length > 1 && <span className="continuation-chip">{buildH3SegmentSlots([shot]).length} 段连续生成</span>}</div>
               <textarea rows={3} value={shot.summary} onChange={(event) => patchShot(shot.id, { summary: event.target.value })} placeholder="画面内容、人物动作和环境变化" />
               <div className="shot-controls">
                 <input value={shot.camera} onChange={(event) => patchShot(shot.id, { camera: event.target.value })} aria-label="运镜" />
                 <label>Seed <input type="number" min="0" value={shot.seed} onChange={(event) => patchShot(shot.id, { seed: Math.max(0, Number(event.target.value) || 0) })} /></label>
                 <label><input type="checkbox" checked={shot.locked} onChange={(event) => patchShot(shot.id, { locked: event.target.checked })} />锁定 LLM 字段</label>
+              </div>
+              <div className="motion-segment-editor">
+                <header><div><strong>Motion Context 分段</strong><span>{shot.motionSegments.length ? "手工与 AI 共用此分段计划" : "当前按时长自动均分，可改为明确接缝"}</span></div><div><button className="secondary-button" onClick={() => customizeMotionSegments(shot)}>{shot.motionSegments.length ? "重置均分" : "编辑分段"}</button><button className="secondary-button" onClick={() => addMotionSegment(shot)}><Plus size={13} />增加分段</button></div></header>
+                {shot.motionSegments.map((segment, segmentIndex) => <div className="motion-segment-row" key={segment.id}>
+                  <span>C{String(segmentIndex + 1).padStart(2, "0")}</span>
+                  <input type="number" min="4" max={segmentIndex === 0 ? 15 : 12} step="0.5" value={segment.durationSeconds} aria-label={`续段 ${segmentIndex + 1} 时长`} onChange={(event) => patchShot(shot.id, { motionSegments: shot.motionSegments.map((item, index) => index === segmentIndex ? { ...item, durationSeconds: Math.max(.5, Number(event.target.value) || .5) } : item) })} />
+                  <textarea rows={2} value={segment.summary} aria-label={`续段 ${segmentIndex + 1} 内容`} onChange={(event) => patchShot(shot.id, { motionSegments: shot.motionSegments.map((item, index) => index === segmentIndex ? { ...item, summary: event.target.value } : item) })} placeholder="本段动作、机位变化，以及适合交给下一段继承的结束状态" />
+                  <button className="icon-button" title="移除分段" onClick={() => removeMotionSegment(shot, segmentIndex)}><Trash2 size={14} /></button>
+                </div>)}
+                {shot.motionSegments.length ? <footer className={motionSegmentsValid(shot) ? "valid" : "invalid"}>计划合计 {shot.motionSegments.reduce((sum, segment) => sum + segment.durationSeconds, 0)} / {Math.max(4, shot.durationSeconds)} 秒；首段最多 15 秒，续段最多 12 秒</footer> : null}
               </div>
             </div>
             <div className="row-duration"><input type="number" min="1" step="0.5" value={shot.durationSeconds} onChange={(event) => patchShot(shot.id, { durationSeconds: Math.max(.5, Number(event.target.value) || .5) })} /><span>秒</span></div>
@@ -1512,11 +1686,50 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         </div>}
 
         {project.activeStage === "assets" && <div className="asset-stage">
-          <div className="inline-toolbar"><span>{project.assets.length} 个素材 · 公共素材自动绑定相关片段</span><div className="toolbar-actions"><button className="secondary-button" onClick={onOpenWorkflows}><SlidersHorizontal size={16} />图片工作流</button><label className="primary-button" role="button" aria-label="上传项目参考图" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={16} />上传参考图<input type="file" accept="image/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div></div>
+          <div className="inline-toolbar"><span>{project.assets.length} 个素材 · 公共素材自动绑定相关片段</span><div className="toolbar-actions"><button className="secondary-button" onClick={onOpenWorkflows}><SlidersHorizontal size={16} />图片工作流</button><label className="primary-button" role="button" aria-label="上传项目参考素材" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={16} />上传参考素材<input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label></div></div>
           <label className="check-label"><input type="checkbox" checked={project.referenceAssetMode === "none"} onChange={(event) => update("assets", (current) => ({ ...current, referenceAssetMode: event.target.checked ? "none" : "planned" }))} />本项目不需要参考素材，交由 H3 直接生成</label>
+          <div className="asset-shot-map">
+            <div className="inline-toolbar"><h3>分镜素材引用</h3><span>先按分镜查看引用，再在下方集中管理素材</span></div>
+            {project.shots.map((shot, index) => {
+              const plans = project.assetPlans.filter((plan) =>
+                (plan.shotIds.length ? plan.shotIds.includes(shot.id) : plan.shotId === shot.id)
+                || (plan.scope === "public" && plan.shotIds.length === 0),
+              );
+              const togglePlanShot = (plan: ProjectDraft["assetPlans"][number], checked: boolean) => {
+                const allShotIds = project.shots.map((item) => item.id);
+                const currentIds = plan.shotIds.length
+                  ? plan.shotIds
+                  : plan.scope === "public" ? allShotIds : plan.shotId ? [plan.shotId] : [];
+                const nextIds = checked
+                  ? [...new Set([...currentIds, shot.id])]
+                  : currentIds.filter((id) => id !== shot.id);
+                update("assets", (current) => ({
+                  ...current,
+                  assetPlans: current.assetPlans.map((item) => item.id === plan.id
+                    ? { ...item, scope: "public" as const, shotId: null, shotIds: nextIds }
+                    : item),
+                }));
+              };
+              return <div className="asset-shot-map-row" key={shot.id}>
+                <strong>分镜 {index + 1} · {shot.title}</strong>
+                <div className="asset-shot-map-options">
+                  {project.assetPlans.length ? project.assetPlans.map((plan) => {
+                    const checked = plan.shotIds.length
+                      ? plan.shotIds.includes(shot.id)
+                      : plan.scope === "public" && plan.shotId === null
+                        ? true
+                        : plan.shotId === shot.id;
+                    return <label key={plan.id} className="asset-shot-map-option"><input type="checkbox" checked={checked} onChange={(event) => togglePlanShot(plan, event.target.checked)} /><span>@{plan.name}</span></label>;
+                  }) : <span>暂无素材需求</span>}
+                  {!plans.length && project.assetPlans.length > 0 && <small>当前未引用素材</small>}
+                </div>
+              </div>;
+            })}
+            {!project.shots.length && <div className="table-empty">请先完成分镜，素材需求才能绑定到具体镜头。</div>}
+          </div>
           <div className="asset-grid">
             {project.assets.map((asset) => <div className="asset-item" key={asset.id}>
-              <button className="asset-preview" disabled={asset.status !== "ready"} title={asset.status === "ready" ? `放大预览 ${asset.name}` : "素材不可预览"} onClick={() => setLightboxAssetId(asset.id)}>{asset.status === "ready" ? <img src={asset.previewUrl || projectAssetPreviewUrl(project.projectId, asset.id)} alt={asset.name} /> : <ImagePlus size={24} />}</button>
+              <button className="asset-preview" disabled={asset.status !== "ready"} title={asset.status === "ready" ? `预览 ${asset.name}` : "素材不可预览"} onClick={() => setLightboxAssetId(asset.id)}>{asset.status !== "ready" ? <ImagePlus size={24} /> : asset.mediaKind === "image" ? <img src={asset.previewUrl || projectAssetPreviewUrl(project.projectId, asset.id)} alt={asset.name} /> : asset.mediaKind === "video" ? <Film size={24} /> : <Music size={24} />}</button>
               <div className="asset-info"><input aria-label="素材名称" defaultValue={asset.name} onBlur={(event) => { if (event.target.value.trim() && event.target.value.trim() !== asset.name) void patchAsset(asset, { name: event.target.value }); }} /><span>{asset.status === "missing_blob" ? "缺少原始文件" : asset.source === "upload" ? "本地上传" : "工作流生成"}</span></div>
               <select value={asset.kind} onChange={(event) => void patchAsset(asset, { kind: event.target.value as AssetDraft["kind"] })}><option value="character">角色</option><option value="scene">场景</option><option value="prop">道具</option><option value="style">风格</option></select>
               <select value={asset.scope} onChange={(event) => {
@@ -1530,10 +1743,10 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                 }
               }}><option value="public">公共</option><option value="shot" disabled={!project.shots.length}>镜头专用</option></select>
               {asset.scope === "shot" && <select value={asset.shotId ?? ""} onChange={(event) => void patchAsset(asset, { shotId: event.target.value || null })}><option value="">选择分镜</option>{project.shots.map((shot) => <option key={shot.id} value={shot.id}>{shot.title}</option>)}</select>}
-              {asset.status === "missing_blob" && <label className="secondary-button" role="button" aria-label={`重新关联素材 ${asset.name}`} tabIndex={0} onKeyDown={activateFileLabel}><Upload size={14} />重新关联<input type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void relinkAsset(asset, file); }} /></label>}
+              {asset.status === "missing_blob" && <label className="secondary-button" role="button" aria-label={`重新关联素材 ${asset.name}`} tabIndex={0} onKeyDown={activateFileLabel}><Upload size={14} />重新关联<input type="file" accept="image/*,video/*,audio/*" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void relinkAsset(asset, file); }} /></label>}
               <button className="icon-button" title="移除素材" onClick={() => void removeAsset(asset)}><Trash2 size={16} /></button>
             </div>)}
-            {!project.assets.length && <label className="asset-empty" role="button" aria-label="上传角色、场景、道具或风格参考图" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={24} /><span>上传角色、场景或风格参考图</span><input type="file" accept="image/*" multiple onChange={(event) => queueAssetUploads(event)} /></label>}
+            {!project.assets.length && <label className="asset-empty" role="button" aria-label="上传图片、视频或音频参考" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={24} /><span>上传图片、视频或音频参考</span><input type="file" accept="image/*,video/*,audio/*" multiple onChange={(event) => queueAssetUploads(event)} /></label>}
           </div>
           {project.assetPlans.length > 0 && <div className="asset-plan-list">
             <div className="inline-toolbar"><h3>AI 素材需求</h3><button className="secondary-button" onClick={() => void (async () => { const changed = invalidateFromStage({ ...project, assetPlans: [], referenceAssetMode: "none", prompts: { ...project.prompts, imagePrompts: [] } }, "assets", pipelineOrder); onChange(await saveProjectToControlPlane(changed)); setActionMessage("已忽略全部 AI 素材需求，H3 将直接生成画面"); })()}><Trash2 size={14} />忽略全部需求</button></div>
@@ -1547,15 +1760,13 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
               const pendingCandidate = assetCandidatesByPlan[plan.id]?.find((candidate) => candidate.state === "pending");
               return <div key={plan.id} className="asset-plan-row">
                 <button className="asset-plan-preview" disabled={!fulfilled} title={fulfilled ? `放大预览 ${fulfilled.name}` : "尚未生成"} onClick={() => fulfilled && setLightboxAssetId(fulfilled.id)}>{fulfilled ? <img src={fulfilled.previewUrl || projectAssetPreviewUrl(project.projectId, fulfilled.id)} alt={fulfilled.name} /> : <ImagePlus size={19} />}</button>
-                <div className="asset-plan-info"><strong>{fulfilled?.name ?? plan.name}</strong><p>{plan.description}</p><small>{plan.kind} · {plan.scope === "public" ? "公共素材" : "分镜专用"}</small>{assetResolutionControls(plan)}</div>
+                <div className="asset-plan-info"><strong>{fulfilled?.name ?? plan.name}</strong><p>{plan.description}</p><small>{plan.kind} · {plan.scope === "public" ? "公共素材" : `引用分镜：${plan.shotIds.length ? plan.shotIds.map((id) => project.shots.find((shot) => shot.id === id)?.title ?? id).join("、") : plan.shotId ? (project.shots.find((shot) => shot.id === plan.shotId)?.title ?? plan.shotId) : "未指定"}`}</small>{assetResolutionControls(plan)}</div>
                 <span className={`state ${fulfilled ? "state-ready" : ""}`}>{generating ? "GENERATING" : fulfilled ? "SATISFIED" : hasPrompt ? "PROMPT READY" : plan.state.toUpperCase()}</span>
                 <div className="asset-plan-actions">
-                  {!fulfilled && !generating && <label className="asset-plan-workflow"><span>图片工作流</span><select value={selectedWorkflow} onChange={(event) => setSelectedWorkflowByPlan((current) => ({ ...current, [plan.id]: event.target.value }))}><option value="">请选择</option>{workflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name} · R{workflow.revision}</option>)}</select></label>}
+                  {!fulfilled && !generating && <label className="asset-plan-workflow"><span>图片工作流</span><select value={selectedWorkflow} onChange={(event) => setSelectedWorkflowByPlan((current) => ({ ...current, [plan.id]: event.target.value }))}><option value="">请选择</option>{imageWorkflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name} · R{workflow.revision}</option>)}</select></label>}
                   {!fulfilled && !generating && <label className="secondary-button" role="button" aria-label={`上传图片填充素材需求 ${plan.name}`} tabIndex={0} onKeyDown={activateFileLabel}><Upload size={14} />上传填充<input type="file" accept="image/*" onChange={(event) => queueAssetUploads(event, plan.id)} /></label>}
-                  {!fulfilled && !generating && <button className="primary-button" disabled={actionBusy || !workerOnline || !selectedWorkflow} onClick={() => void writeAndRunAssetPlan(plan, null, selectedWorkflow)}><Sparkles size={14} />AI 写提示词并生成</button>}
-                  {fulfilled?.source === "generated" && !generating && <button className="secondary-button" disabled={actionBusy || !workerOnline} onClick={() => openImagePromptDialog(plan, "ai")}><Sparkles size={14} />AI 修改</button>}
+                  {!generating && <button className={!fulfilled ? "primary-button" : "secondary-button"} disabled={actionBusy || !selectedWorkflow} onClick={() => openImagePromptDialog(plan)}><SlidersHorizontal size={14} />编辑提示词</button>}
                   {fulfilled?.source === "generated" && hasPrompt && !generating && !pendingCandidate && <button className="secondary-button" disabled={actionBusy || !workerOnline} title="生成候选版本，不会立即替换当前素材" onClick={() => void regenerateAssetPlan(plan)}><RotateCcw size={14} />按原提示词重新生成</button>}
-                  {hasPrompt && !generating && <button className="secondary-button" disabled={actionBusy} onClick={() => openImagePromptDialog(plan, "manual")}><SlidersHorizontal size={14} />手动编辑</button>}
                   <button className="icon-button" disabled={actionBusy} title="不需要此素材，由视频模型直接生成" onClick={() => void dismissAssetPlan(plan.id)}><Trash2 size={15} /></button>
                 </div>
                 {pendingCandidate && <div className="asset-candidate-comparison">
@@ -1580,17 +1791,13 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         {imagePromptDialog && <div className="asset-name-dialog-backdrop">
           <form className="asset-name-dialog image-prompt-dialog" onSubmit={(event) => {
             event.preventDefault();
-            const plan = project.assetPlans.find((item) => item.id === imagePromptDialog.planId);
-            if (!plan) return;
-            if (imagePromptDialog.mode === "ai") void writeAndRunAssetPlan(plan, imagePromptDialog.instruction, imageWorkflowForPlan(plan.id));
-            else void saveManualImagePromptAndRun();
+            void saveImagePromptAndRun();
           }}>
-            <header><div><strong>{imagePromptDialog.mode === "ai" ? "让 AI 修改图片提示词" : "手动编辑图片提示词"}</strong><span>{project.assetPlans.find((item) => item.id === imagePromptDialog.planId)?.name}</span></div></header>
-            {imagePromptDialog.mode === "ai" ? <label className="field"><span>修改要求</span><textarea autoFocus rows={6} value={imagePromptDialog.instruction} onChange={(event) => setImagePromptDialog({ ...imagePromptDialog, instruction: event.target.value })} placeholder="例如：保持人物身份不变，改为雨夜霓虹场景，使用低机位全身构图" /></label> : <>
-              <label className="field"><span>正向提示词</span><textarea autoFocus rows={9} value={imagePromptDialog.prompt} onChange={(event) => setImagePromptDialog({ ...imagePromptDialog, prompt: event.target.value })} /></label>
-              <label className="field"><span>负向提示词</span><textarea rows={4} value={imagePromptDialog.negativePrompt} onChange={(event) => setImagePromptDialog({ ...imagePromptDialog, negativePrompt: event.target.value })} /></label>
-            </>}
-            <footer><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => setImagePromptDialog(null)}>取消</button><button type="submit" className="primary-button" disabled={actionBusy || (imagePromptDialog.mode === "ai" ? !imagePromptDialog.instruction.trim() : !imagePromptDialog.prompt.trim())}>{actionBusy ? "正在处理..." : imagePromptDialog.mode === "ai" ? "应用修改并重新生成" : "保存并重新生成"}</button></footer>
+            <header><div><strong>图片提示词</strong><span>{project.assetPlans.find((item) => item.id === imagePromptDialog.planId)?.name} · 手工与 AI 共用</span></div></header>
+            <div className="prompt-ai-command"><label className="field"><span>交给 AI 的要求（可选）</span><textarea rows={3} value={imagePromptDialog.instruction} onChange={(event) => setImagePromptDialog({ ...imagePromptDialog, instruction: event.target.value })} placeholder="例如：保持人物身份不变，改为雨夜霓虹场景，使用低机位全身构图" /></label><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => void fillImagePromptWithAI()}><Sparkles size={14} />AI 填入输入框</button></div>
+            <label className="field"><span>正向提示词</span><textarea autoFocus rows={9} value={imagePromptDialog.prompt} onChange={(event) => setImagePromptDialog({ ...imagePromptDialog, prompt: event.target.value })} /></label>
+            <label className="field"><span>负向提示词</span><textarea rows={4} value={imagePromptDialog.negativePrompt} onChange={(event) => setImagePromptDialog({ ...imagePromptDialog, negativePrompt: event.target.value })} /></label>
+            <footer><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => setImagePromptDialog(null)}>取消</button><button type="submit" className="primary-button" disabled={actionBusy || !imagePromptDialog.prompt.trim()}>{actionBusy ? "正在处理..." : "保存并生成"}</button></footer>
           </form>
         </div>}
 
@@ -1601,7 +1808,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
 
         {reworkDialog && <div className="asset-name-dialog-backdrop">
           <form className="asset-name-dialog rework-dialog" onSubmit={(event) => { event.preventDefault(); void submitRework(); }}>
-            <header><div><strong>拒绝片段并创建返工</strong><span>片段 {reworkDialog.segmentId} · 返工会准确绑定原视频任务</span></div></header>
+            <header><div><strong>标记片段返工</strong><span>片段 {reworkDialog.segmentId} · 标记后立即冻结所属连续序列</span></div></header>
             <fieldset className="rework-actions"><legend>处理方式</legend>
               <label><input type="radio" name="rework-action" checked={reworkDialog.action === "retry"} onChange={() => setReworkDialog({ ...reworkDialog, action: "retry" })} /><span><strong>重跑原任务</strong><small>用于文件损坏、黑帧或执行异常</small></span></label>
               <label><input type="radio" name="rework-action" checked={reworkDialog.action === "change_seed"} onChange={() => setReworkDialog({ ...reworkDialog, action: "change_seed" })} /><span><strong>更换 Seed</strong><small>用于瞬态伪影、偶发形体或构图问题</small></span></label>
@@ -1609,7 +1816,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             </fieldset>
             {reworkDialog.action === "change_seed" && <label className="field"><span>新 Seed</span><input type="number" min="0" value={reworkDialog.replacementSeed} onChange={(event) => setReworkDialog({ ...reworkDialog, replacementSeed: Math.max(0, Number(event.target.value) || 0) })} /></label>}
             <label className="field"><span>驳回反馈（必填）</span><textarea autoFocus rows={6} required value={reworkDialog.feedback} onChange={(event) => setReworkDialog({ ...reworkDialog, feedback: event.target.value })} placeholder="描述问题、出现时间和期望修改，例如：2.1–3.0 秒人物身份漂移，保持服装和脸部特征不变。" /></label>
-            <footer><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => setReworkDialog(null)}>取消</button><button type="submit" className="primary-button" disabled={actionBusy || !reworkDialog.feedback.trim()}>{actionBusy ? "正在创建..." : "确认驳回并返工"}</button></footer>
+            <footer><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => setReworkDialog(null)}>取消</button><button type="submit" className="primary-button" disabled={actionBusy || !reworkDialog.feedback.trim()}>{actionBusy ? "正在标记..." : "标记返工"}</button></footer>
           </form>
         </div>}
 
@@ -1618,13 +1825,17 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             <button className={promptTab === "image" ? "active" : ""} onClick={() => setPromptTab("image")}>图片提示词 <span>{project.prompts.imagePrompts.length}</span></button>
             <button className={promptTab === "h3" ? "active" : ""} onClick={() => setPromptTab("h3")}>H3 视频提示词 <span>{project.prompts.h3Prompts.length}/{segmentCount}</span></button>
           </div>
-          {promptGenerationBusy && <div className="prompt-generating" aria-live="polite"><Sparkles size={17} /><span>正在分析素材、编写并审核提示词；已完成 {promptGenerationProgress.completed}/{promptGenerationProgress.total}，结果会逐项保存。</span></div>}
+          {promptGenerationBusy && <div className="prompt-generating" aria-live="polite"><Sparkles size={17} /><span>正在分析素材并编写提示词；已完成 {promptGenerationProgress.completed}/{promptGenerationProgress.total}，结果会逐项写入文本框。</span></div>}
           {promptTab === "image" && <div className="prompt-list">
+            <div className="inline-toolbar prompt-stage-toolbar">
+              <span>{project.assetPlans.length} 份图片素材需求 · AI 请求并发执行</span>
+              <button className="primary-button" disabled={actionBusy || !project.assetPlans.length} onClick={() => void generateAllImagePrompts()}><Sparkles size={15} />生成全部图片提示词</button>
+            </div>
             {project.prompts.imagePrompts.map((prompt, index) => <article className="prompt-card" key={prompt.id}>
               <header><div><span>图片 {String(index + 1).padStart(2, "0")}</span><strong>{project.assetPlans.find((plan) => plan.id === prompt.assetPlanId)?.name ?? "待生成素材"}</strong></div><span className="state">已编写</span></header>
               <label>正向提示词<textarea rows={5} value={prompt.prompt} onChange={(event) => update("prompts", (current) => ({ ...current, prompts: { ...current.prompts, imagePrompts: current.prompts.imagePrompts.map((item) => item.id === prompt.id ? { ...item, prompt: event.target.value } : item) } }))} /></label>
               <label>负向提示词<textarea rows={2} value={prompt.negativePrompt} onChange={(event) => update("prompts", (current) => ({ ...current, prompts: { ...current.prompts, imagePrompts: current.prompts.imagePrompts.map((item) => item.id === prompt.id ? { ...item, negativePrompt: event.target.value } : item) } }))} /></label>
-              <label>图片工作流<select value={prompt.workflowTemplateId ?? ""} onChange={(event) => update("prompts", (current) => ({ ...current, prompts: { ...current.prompts, imagePrompts: current.prompts.imagePrompts.map((item) => item.id === prompt.id ? { ...item, workflowTemplateId: event.target.value || null, harnessRevision: null } : item) } }))}><option value="">选择已批准工作流</option>{workflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{workflow.name} · R{workflow.revision}</option>)}</select></label>
+              <label>图片工作流<select value={prompt.workflowTemplateId ?? ""} onChange={(event) => update("prompts", (current) => ({ ...current, prompts: { ...current.prompts, imagePrompts: current.prompts.imagePrompts.map((item) => item.id === prompt.id ? { ...item, workflowTemplateId: event.target.value || null, harnessRevision: null } : item) } }))}><option value="">选择已批准工作流</option>{imageWorkflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{workflow.name} · R{workflow.revision}</option>)}</select></label>
               {(() => { const plan = project.assetPlans.find((item) => item.id === prompt.assetPlanId); return plan ? assetResolutionControls(plan) : null; })()}
               <footer><span>{prompt.referenceAssetIds.length} 张参考图</span><button className="primary-button" disabled={actionBusy || !prompt.workflowTemplateId || !workerOnline} onClick={() => void runImagePrompt(prompt.assetPlanId)}><ImagePlus size={14} />重新生成图片</button></footer>
             </article>)}
@@ -1657,21 +1868,37 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                   return <section className="h3-segment-editor" key={slot.segmentId}>
                     <div className="h3-segment-heading">
                       <div><strong>视频提示词 {slot.segmentIndex + 1}/{slot.segmentCount}</strong><span>{slot.durationSeconds} 秒 · Seed {slot.seed}{slot.continuationOf ? " · Motion Context 续段" : slot.segmentCount > 1 ? " · 连续链首段" : " · 独立片段"}</span></div>
-                      <div className="h3-segment-actions"><span className={`state ${prompt?.review.ready ? "state-ready" : ""}`}>{prompt?.review.ready ? "REVIEWED" : prompt?.prompt.trim() ? "DRAFT" : "待编写"}</span><button className="secondary-button" disabled={actionBusy || promptGenerationBusy} onClick={() => void generateOneH3Prompt(slot)}>{prompt?.prompt.trim() ? <RotateCcw size={14} /> : <Sparkles size={14} />}{prompt?.prompt.trim() ? "重新生成并审核" : "AI 生成并审核"}</button></div>
+                      <div className="h3-segment-actions"><span className={`state ${prompt?.prompt.trim() ? "state-ready" : ""}`}>{prompt?.prompt.trim() ? "已填写" : "待编写"}</span><button className="secondary-button" disabled={actionBusy || promptGenerationBusy} onClick={() => void generateOneH3Prompt(slot)}>{prompt?.prompt.trim() ? <RotateCcw size={14} /> : <Sparkles size={14} />}{prompt?.prompt.trim() ? "AI 重新编写" : "AI 编写"}</button></div>
                     </div>
                     <textarea
                       rows={9}
                       disabled={actionBusy || promptGenerationBusy}
                       value={prompt?.prompt ?? ""}
                       onChange={(event) => patchH3Prompt(slot, event.target.value)}
-                      placeholder="可在此手动编写中文 H3 视频提示词，或使用右上角按钮自动生成并审核。"
+                      placeholder="可在此手动编写 H3 视频提示词，或使用右上角按钮让 AI 按官方规范编写。执行描述建议使用英文；中文对白、歌词和画面文字保持原文。文本框中的最终内容会直接传给 MiniMax。"
                     />
                     <footer>
-                      <span>{prompt ? `${prompt.inputMode.toUpperCase()} · 规则版本 R${prompt.harnessRevision ?? "-"} · ${prompt.assetIds.length} 张参考图` : "尚未生成 · 将根据素材自动选择输入模式"}</span>
+                      <span>{prompt ? `${prompt.inputMode.toUpperCase()} · 规则版本 R${prompt.harnessRevision ?? "-"} · ${prompt.assetIds.length} 个参考素材` : "尚未生成 · 将根据素材自动选择输入模式"}</span>
                       <div>
-                        {prompt?.review.issues.map((issue) => <span className={`prompt-issue ${issue.severity}`} key={`${issue.code}:${issue.message}`}>{issue.message}</span>)}
+                        {prompt?.prompt.trim() && <button
+                          className="secondary-button"
+                          disabled={actionBusy || translatingPromptId === prompt.id || prompt.id.startsWith("draft-")}
+                          onClick={() => void translatePrompt(prompt.id)}
+                          title="生成不参与 H3 执行的中文对照"
+                        ><Languages size={14} />{translatingPromptId === prompt.id ? "翻译中" : "生成中文对照"}</button>}
+                        {prompt?.prompt.trim() && <span>点击“批准并进入下一阶段”即确认此文本</span>}
                       </div>
                     </footer>
+                    {prompt && (prompt.assumptions?.length || prompt.stageTrace?.length || prompt.assetRoles?.length) ? <details className="h3-runtime-details">
+                      <summary>Harness 运行记录</summary>
+                      {prompt.assumptions?.length ? <div><strong>自动假设</strong><ul>{prompt.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></div> : null}
+                      {prompt.assetRoles?.length ? <div><strong>素材职责</strong><pre>{JSON.stringify(prompt.assetRoles, null, 2)}</pre></div> : null}
+                      {prompt.stageTrace?.length ? <div><strong>阶段轨迹</strong><div className="h3-stage-trace">{prompt.stageTrace.map((item, index) => <span key={`${item.stage}-${index}`}>{item.stage} · {item.status}</span>)}</div></div> : null}
+                    </details> : null}
+                    {prompt && promptTranslations[prompt.id] ? <section className="h3-translation" aria-label="非执行中文对照">
+                      <header><Languages size={14} /><strong>中文对照</strong><span>非执行内容</span></header>
+                      <p>{promptTranslations[prompt.id]}</p>
+                    </section> : null}
                   </section>;
                 })}</div>
               </article>;
@@ -1685,68 +1912,20 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             <div><span>电影分镜</span><strong>{project.shots.length}</strong></div><ArrowRight size={18} /><div><span>H3 执行片段</span><strong>{segmentCount}</strong></div><ArrowRight size={18} /><div><span>连续衔接</span><strong>{continuationCount}</strong></div>
           </div>
           <div className="generation-actions">
-            <button className="primary-button" disabled={actionBusy || (Boolean(guidedRunTarget) && guidedRunTarget !== "review") || !workerOnline} onClick={() => guidedRunTarget === "review" ? stopGuidedRun() : void runGuidedTo("review")}>{guidedRunTarget === "review" ? <Square size={15} /> : <Play size={16} />}{guidedRunTarget === "review" ? "停止自动派发" : executionStatus?.compiled ? "继续生成到审核" : "创建计划并开始生成"}</button>
-            <button className="secondary-button" disabled={actionBusy || Boolean(guidedRunTarget)} onClick={() => void compileDag()}><ListPlus size={16} />仅创建任务计划</button>
+            <button className="primary-button" disabled={actionBusy || !workerOnline} onClick={() => void startGeneration()}><Play size={16} />{executionStatus?.compiled ? "开始 / 继续派发" : "创建计划并开始生成"}</button>
+            <button className="secondary-button" disabled={actionBusy || !workerOnline} onClick={() => void restartGeneration()} title="重新读取全局 MiniMax H3 设置，保留素材和提示词并重建视频任务"><RotateCcw size={15} />重新开始</button>
+            <button className="secondary-button" disabled={actionBusy} onClick={() => void compileDag()}><ListPlus size={16} />仅创建任务计划</button>
             <button className="secondary-button" onClick={onOpenTasks}><ArrowRight size={15} />查看任务进度</button>
+            <button className="secondary-button" disabled={actionBusy || !executionStatus?.rework_markers.some((item) => item.state === "draft")} onClick={() => void confirmAllReworks()}><Check size={15} />统一确认返工</button>
           </div>
+          <Field label="项目审核标准" wide><textarea rows={4} value={project.reviewNotes} onChange={(event) => update("generation", (current) => ({ ...current, reviewNotes: event.target.value }))} placeholder="身份一致性、动作连续性、闪烁、黑帧、声音接缝等" /></Field>
           {!workerOnline && <div className="error-banner inline-banner"><CircleAlert size={16} />ComfyUI Worker 离线。可以创建任务计划，但不能启动 GPU 生成。</div>}
-          <div className="execution-bands">
-            <div><span className="band-index">A</span><div><strong>静态条件批量编码</strong><span>{segmentCount} 个片段的文本与参考图先统一编码</span></div><span className="state state-ready">READY</span></div>
-            <div><span className="band-index">B</span><div><strong>准备视频生成模型</strong><span>使用高速模式与显存优化 · 已关闭额外缓存加速</span></div><span className="state">WAITING</span></div>
-            <div><span className="band-index">C</span><div><strong>按连续链串行生成</strong><span>续段预留约 2.33 秒潜空间上下文并自动裁切；长镜头会均衡拆分</span></div><span className="state">WAITING</span></div>
-          </div>
-          <div className="stage-callout"><CircleAlert size={17} /><span>精细化模式可直接在这里生成。系统会自动准备素材信息和视频模型，逐段生成，并在需要人工审核时停下。</span></div>
-          <div className="task-table pipeline-task-table">
-            <div className="task-header"><span>当前执行链</span><span>类型</span><span>状态</span><span>尝试</span><span>操作</span></div>
-            {generationTasks.map((task) => <div className="task-row" key={task.task_id}>
-              <div><strong>{task.task_id.split(":").slice(-2).join(" · ")}</strong><small>{task.state === "blocked" ? `等待 ${task.depends_on.length} 个前置任务` : task.comfyui_prompt_id ? `ComfyUI ${task.comfyui_prompt_id}` : task.affinity_key ?? "本地执行"}</small></div>
-              <span>{taskKindLabels[task.kind]}</span><span className={`state state-${task.state}`}>{taskStateLabels[task.state]}</span><span>{task.attempt}/{task.max_attempts}</span>
-              <div className="task-actions">
-                {["failed", "stale", "paused"].includes(task.state) && <button className="secondary-button" disabled={actionBusy || Boolean(guidedRunTarget)} onClick={() => void operatePipelineTask(task, "retry")}><RotateCcw size={14} />重试</button>}
-                {["queued", "running"].includes(task.state) && <button className="secondary-button" disabled={actionBusy} onClick={() => void operatePipelineTask(task, "cancel")}><Square size={13} />取消</button>}
-              </div>
-              {task.error_message && <div className="task-detail">{task.error_message}</div>}
-            </div>)}
-            {!generationTasks.length && <div className="table-empty">尚未创建任务计划；点击“创建计划并开始生成”即可启动。</div>}
-          </div>
-        </div>}
-
-        {project.activeStage === "review" && <div className="review-stage">
-          <Field label="项目审核标准" wide><textarea rows={5} value={project.reviewNotes} onChange={(event) => update("review", (current) => ({ ...current, reviewNotes: event.target.value }))} placeholder="身份一致性、动作连续性、闪烁、黑帧、声音接缝等" /></Field>
-          {!executionStatus?.generation_complete && <div className="stage-callout"><CircleAlert size={17} /><span>视频生成尚未完成，可以从当前页面继续执行到审核门。</span><button className="primary-button" disabled={actionBusy || Boolean(guidedRunTarget) || !workerOnline} onClick={() => void runGuidedTo("review")}><Play size={15} />继续生成</button></div>}
-          {mediaLoadError && <div className="error-banner inline-banner"><CircleAlert size={16} />审核媒体读取失败：{mediaLoadError}</div>}
-          <div className="review-list">{reviewTasks.map((task, index) => {
-            const sourceTask = sourceTaskForReview(task);
-            const artifacts = sourceTask ? artifactsByTask[sourceTask.task_id] ?? [] : [];
-            const video = artifacts.find((item) => item.kind === "video_segment");
-            const decisions = reviewDecisionsByTask[task.task_id] ?? [];
-            const decision = decisions.at(-1);
-            const segmentId = segmentForReview(task, sourceTask);
-            const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === segmentId);
-            const shot = project.shots.find((item) => item.id === prompt?.shotId);
-            return <article className="review-card" key={task.task_id}>
-              <header><div><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{shot?.title ?? `片段 ${index + 1}`}</strong><small>{prompt ? `${prompt.durationSeconds} 秒 · ${prompt.inputMode.toUpperCase()} · ${segmentId}` : segmentId ?? task.task_id.slice(-12)}</small></div></div><span className={`state state-${task.state}`}>{taskStateLabels[task.state]}</span></header>
-              <div className="review-media">
-                {video ? <video controls preload="metadata" src={artifactMediaUrl(video)}>当前系统播放器不支持此视频格式。</video> : <div className="media-placeholder"><Film size={24} /><span>{sourceTask?.state === "succeeded" ? "视频产物未登记或文件已移动" : "等待片段生成完成"}</span></div>}
-                {video && <div className="artifact-meta"><span>{video.file_name}</span><span>{(video.byte_size / 1024 / 1024).toFixed(1)} MB</span><span>{new Date(video.created_at).toLocaleString()}</span></div>}
-              </div>
-              {prompt && <details className="review-prompt"><summary>查看生成提示词</summary><pre>{prompt.prompt}</pre></details>}
-              {decision && <section className="review-decision">
-                <div className="decision-summary"><strong>{decision.disposition === "accepted" ? "AI 建议通过" : decision.disposition === "rejected" ? "AI 建议返工" : "需要人工判断"}</strong><span>置信度 {Math.round(decision.confidence * 100)}%</span><span>{decision.input_mode === "video" ? "视频审核" : "抽帧审核"}</span><span>{decision.deterministic_checks_passed ? "媒体检查通过" : "媒体检查失败"}</span></div>
-                {decision.fallback_reason && <div className="review-fallback"><CircleAlert size={14} />视频输入回退为抽帧：{decision.fallback_reason}</div>}
-                {decision.issues.length ? <div className="review-issues">{decision.issues.map((issue, issueIndex) => <div className={`review-issue ${issue.severity}`} key={`${issue.category}:${issueIndex}`}><header><strong>{issue.message}</strong><span>{issue.start_seconds === null ? "未标注时间" : `${issue.start_seconds.toFixed(1)}s${issue.end_seconds === null ? "" : `–${issue.end_seconds.toFixed(1)}s`}`}</span></header>{issue.evidence && <p>证据：{issue.evidence}</p>}{issue.suggested_action && <p>建议：{issue.suggested_action}</p>}</div>)}</div> : <p className="review-clean">未发现需要处理的问题。</p>}
-              </section>}
-              {task.error_message && <div className="error-copy">{task.error_message}</div>}
-              {task.state === "needs_review" && <footer className="task-actions"><button className="primary-button" disabled={actionBusy || !video} onClick={() => void acceptReview(task)}><Check size={14} />接受片段</button><button className="secondary-button" disabled={actionBusy || !video} onClick={() => openReworkDialog(task)}><RotateCcw size={14} />拒绝并返工</button></footer>}
-              {task.state === "failed" && sourceTask?.state === "succeeded" && segmentId && <footer className="task-actions"><button className="secondary-button" disabled={actionBusy || !video} onClick={() => openReworkDialog(task)}><RotateCcw size={14} />根据审核结论返工</button></footer>}
-            </article>;
-          })}</div>
-          {!reviewTasks.length && executionStatus?.generation_complete && <div className="stage-callout"><Check size={17} /><span>{project.reviewPolicy.effectiveMode === "none" ? "已按不审核模式通过确定性检查。" : "当前执行计划没有人工审核项，AI 审核完成后会自动放行。"}</span></div>}
-          <button className="secondary-button" onClick={onOpenTasks}><PackageCheck size={16} />查看只读任务进度</button>
+          {mediaLoadError && <div className="error-banner inline-banner"><CircleAlert size={16} />视频读取失败：{mediaLoadError}</div>}
+          <div className="generation-tree"><strong>{project.name}</strong>{(executionStatus?.hierarchy ?? []).map((shot) => <section key={shot.shot_id}><h3>{project.shots.find((item) => item.id === shot.shot_id)?.title ?? shot.shot_id}</h3>{shot.segments.map((segment) => <GenerationSegmentCard key={segment.segment_id} segment={segment} project={project} tasks={currentPlanTasks} reviewTasks={reviewTasks} artifactsByTask={artifactsByTask} decisionsByTask={reviewDecisionsByTask} markers={executionStatus?.rework_markers ?? []} actionBusy={actionBusy} onMark={openReworkDialog} onWithdraw={(markerId) => void withdrawMarker(markerId)} />)}</section>)}{!executionStatus?.hierarchy.length && <div className="table-empty">尚未创建任务计划。</div>}</div>
         </div>}
 
         {project.activeStage === "delivery" && <div className="delivery-stage">
-          {postCapabilitiesError && <div className="error-banner"><CircleAlert size={17} />后处理能力读取失败：{postCapabilitiesError}</div>}
+          <div className="delivery-workflow-entry"><div><strong>用户后处理工作流</strong><span>上传 ComfyUI API 工作流，使用 LLM 协助标定输入，登记后在本页选择。</span></div><button className="secondary-button" onClick={onOpenWorkflows}><Upload size={15} />上传 / 管理工作流</button></div>
           {deliveryTasks.flatMap((task) => artifactsByTask[task.task_id] ?? []).filter((artifact) => artifact.kind === "video_export").map((artifact) => <section className="delivery-artifact" key={artifact.artifact_id}>
             <div><strong>最终导出视频</strong><span>可直接播放并核对交付文件</span></div>
             <video controls preload="metadata" src={artifactMediaUrl(artifact)}>当前系统播放器不支持此视频格式。</video>
@@ -1754,30 +1933,26 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           </section>)}
           <div className="postprocess-item always-on">
             <div className="postprocess-icon"><Film size={19} /></div><div><strong>确定性 FFmpeg 处理</strong><span>统一分辨率、帧率、H.264/AAC 和音量</span></div><span className="approval-chip"><Check size={13} />默认</span>
-            <div className="postprocess-controls"><label>宽 <input type="number" step="8" value={project.postProcessing.outputWidth} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, outputWidth: Math.max(64, Number(event.target.value) || 64) } }))} /></label><label>高 <input type="number" step="8" value={project.postProcessing.outputHeight} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, outputHeight: Math.max(64, Number(event.target.value) || 64) } }))} /></label><label>CRF <input type="number" min="0" max="51" value={project.postProcessing.crf} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, crf: Math.min(51, Math.max(0, Number(event.target.value) || 0)) } }))} /></label></div>
+            <div className="postprocess-controls"><span>输出画幅沿用项目配置：{project.width} × {project.height}</span></div>
           </div>
 
           <div className={`postprocess-item ${project.postProcessing.seedvr.enabled ? "enabled" : ""}`}>
-            <div className="postprocess-icon"><Sparkles size={19} /></div><div><strong>视频修复与超分</strong><span>Profile 定义拓扑，模型由当前 ComfyUI 实际安装内容决定</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.seedvr.enabled} disabled={!restorationProfiles.some((item) => item.available)} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, enabled: event.target.checked, previewApproved: false } } }))} /><span /></label>
+            <div className="postprocess-icon"><Sparkles size={19} /></div><div><strong>视频修复与超分</strong><span>使用已登记的用户 ComfyUI 视频工作流</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.seedvr.enabled} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, enabled: event.target.checked, previewApproved: false } } }))} /><span /></label>
             {project.postProcessing.seedvr.enabled && <div className="postprocess-detail">
-              <label>处理 Profile <select value={project.postProcessing.seedvr.profileId ?? ""} onChange={(event) => { const selected = restorationProfiles.find((item) => item.profile.profile_id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, profileId: selected?.profile.profile_id ?? null, profileRevision: selected?.profile.revision ?? null, modelId: null, vaeId: null, previewApproved: false } } })); }}><option value="">请选择</option>{restorationProfiles.map((item) => <option key={item.profile.profile_id} value={item.profile.profile_id} disabled={!item.available}>{item.profile.name}{item.available ? "" : "（未就绪）"}</option>)}</select></label>
-              <label>扩散模型 <select value={project.postProcessing.seedvr.modelId ?? ""} disabled={!selectedRestoration?.available} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, modelId: event.target.value || null, modelSha256: null, previewApproved: false } } }))}><option value="">请选择</option>{selectedRestoration?.models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-              <label>VAE <select value={project.postProcessing.seedvr.vaeId ?? ""} disabled={!selectedRestoration?.available} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, vaeId: event.target.value || null, vaeSha256: null, previewApproved: false } } }))}><option value="">请选择</option>{selectedRestoration?.auxiliary_models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-              <label>处理宽 <input type="number" min="64" step="32" value={project.postProcessing.seedvr.processingWidth} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, processingWidth: Math.max(64, Math.round((Number(event.target.value) || 64) / 32) * 32), previewApproved: false } } }))} /></label>
-              <label>处理高 <input type="number" min="64" step="32" value={project.postProcessing.seedvr.processingHeight} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, processingHeight: Math.max(64, Math.round((Number(event.target.value) || 64) / 32) * 32), previewApproved: false } } }))} /></label>
-              {selectedRestoration?.blockers.length ? <span className="resource-note"><CircleAlert size={15} />{selectedRestoration.blockers.join("；")}</span> : null}
-              <label>预览时长 <input type="number" min="1" max="3" value={project.postProcessing.seedvr.previewSeconds} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, previewSeconds: Math.min(3, Math.max(1, Number(event.target.value) || 1)), previewApproved: false } } }))} /> 秒</label>
+              <label>用户工作流 <select value={project.postProcessing.seedvr.workflowTemplateId ?? ""} onChange={(event) => { const selected = restorationWorkflows.find((item) => item.id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, workflowTemplateId: selected?.id ?? null, workflowRevision: selected?.revision ?? null, profileId: selected?.id ?? null, profileRevision: selected?.revision ?? null, previewApproved: false } } })); }}><option value="">请选择已登记的修复 / 超分工作流</option>{restorationWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label>
+              <label>放大倍率 <input type="number" min="1" max="8" step="0.25" placeholder="使用模板默认值" value={project.postProcessing.seedvr.upscaleFactor ?? ""} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, seedvr: { ...current.postProcessing.seedvr, upscaleFactor: event.target.value ? Number(event.target.value) : null, previewApproved: false } } }))} /></label>
+              {!restorationWorkflows.length && <span className="resource-note"><CircleAlert size={15} />请先上传并登记“视频超分 / 修复”工作流</span>}
             </div>}
           </div>
 
           <div className={`postprocess-item ${project.postProcessing.rife.enabled ? "enabled" : ""}`}>
-            <div className="postprocess-icon"><SlidersHorizontal size={19} /></div><div><strong>视频插帧</strong><span>逐片段处理，不跨剪辑点或 Motion Context reset 边界</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.rife.enabled} disabled={!interpolationProfiles.some((item) => item.available)} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, enabled: event.target.checked } } }))} /><span /></label>
-            {project.postProcessing.rife.enabled && <div className="postprocess-detail"><label>算法 Profile <select value={project.postProcessing.rife.profileId ?? ""} onChange={(event) => { const selected = interpolationProfiles.find((item) => item.profile.profile_id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, profileId: selected?.profile.profile_id ?? null, profileRevision: selected?.profile.revision ?? null, modelId: null } } })); }}><option value="">请选择</option>{interpolationProfiles.map((item) => <option key={item.profile.profile_id} value={item.profile.profile_id} disabled={!item.available}>{item.profile.name}{item.available ? "" : "（未就绪）"}</option>)}</select></label><label>模型 <select value={project.postProcessing.rife.modelId ?? ""} disabled={!selectedInterpolation?.available} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, modelId: event.target.value || null, modelSha256: null } } }))}><option value="">请选择</option>{selectedInterpolation?.models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label>目标帧率 <select value={project.postProcessing.rife.targetFps} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, targetFps: Number(event.target.value) as 48 | 60 | 120 } } }))}>{(selectedInterpolation?.profile.supported_target_fps ?? [48, 60, 120]).map((fps) => <option value={fps} key={fps}>{fps} fps</option>)}</select></label>{selectedInterpolation?.blockers.length ? <span className="resource-note"><CircleAlert size={15} />{selectedInterpolation.blockers.join("；")}</span> : null}</div>}
+            <div className="postprocess-icon"><SlidersHorizontal size={19} /></div><div><strong>视频插帧</strong><span>使用已登记的用户工作流逐片段处理</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.rife.enabled} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, enabled: event.target.checked } } }))} /><span /></label>
+            {project.postProcessing.rife.enabled && <div className="postprocess-detail"><label>用户工作流 <select value={project.postProcessing.rife.workflowTemplateId ?? ""} onChange={(event) => { const selected = interpolationWorkflows.find((item) => item.id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, workflowTemplateId: selected?.id ?? null, workflowRevision: selected?.revision ?? null, profileId: selected?.id ?? null, profileRevision: selected?.revision ?? null } } })); }}><option value="">请选择已登记的插帧工作流</option>{interpolationWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label>目标帧率 <select value={project.postProcessing.rife.targetFps} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, rife: { ...current.postProcessing.rife, targetFps: Number(event.target.value) as 48 | 60 | 120 } } }))}>{[48, 60, 120].map((fps) => <option value={fps} key={fps}>{fps} fps</option>)}</select></label>{!interpolationWorkflows.length && <span className="resource-note"><CircleAlert size={15} />请先上传并登记“视频插帧”工作流</span>}</div>}
           </div>
 
           <div className={`postprocess-item ${project.postProcessing.whisper.enabled ? "enabled" : ""}`}>
-            <div className="postprocess-icon"><PackageCheck size={19} /></div><div><strong>语音转写与字幕</strong><span>先保留无字幕母版，再生成软字幕或烧录版本</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.whisper.enabled} disabled={!transcriptionProfiles.some((item) => item.available)} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, enabled: event.target.checked } } }))} /><span /></label>
-            {project.postProcessing.whisper.enabled && <div className="postprocess-detail"><label>转写 Profile <select value={project.postProcessing.whisper.profileId ?? ""} onChange={(event) => { const selected = transcriptionProfiles.find((item) => item.profile.profile_id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, profileId: selected?.profile.profile_id ?? null, profileRevision: selected?.profile.revision ?? null, modelId: null } } })); }}><option value="">请选择</option>{transcriptionProfiles.map((item) => <option key={item.profile.profile_id} value={item.profile.profile_id} disabled={!item.available}>{item.profile.name}</option>)}</select></label><label>模型 <select value={project.postProcessing.whisper.modelId ?? ""} disabled={!selectedTranscription?.available} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, modelId: event.target.value || null, modelSha256: null } } }))}><option value="">请选择</option>{selectedTranscription?.models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label>设备 <select value={project.postProcessing.whisper.device} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, device: event.target.value as "auto" | "cpu" | "cuda" } } }))}><option value="auto">自动</option><option value="cuda">GPU</option><option value="cpu">CPU</option></select></label><label>精度 <select value={project.postProcessing.whisper.precision} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, precision: event.target.value as "auto" | "int8" | "float16" | "float32" } } }))}><option value="auto">自动</option><option value="int8">INT8</option><option value="float16">FP16</option><option value="float32">FP32</option></select></label><label>语言 <select value={project.postProcessing.whisper.language} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, language: event.target.value as "zh" | "en" | "auto" } } }))}><option value="zh">中文</option><option value="en">英文</option><option value="auto">自动</option></select></label><label className="check-label"><input type="checkbox" checked={project.postProcessing.whisper.burnIn} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, burnIn: event.target.checked } } }))} />烧录字幕</label></div>}
+            <div className="postprocess-icon"><PackageCheck size={19} /></div><div><strong>语音转写与字幕</strong><span>使用用户上传的 ComfyUI 语音识别工作流生成 SRT</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.whisper.enabled} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, enabled: event.target.checked } } }))} /><span /></label>
+            {project.postProcessing.whisper.enabled && <div className="postprocess-detail"><label>用户工作流 <select value={project.postProcessing.whisper.workflowTemplateId ?? ""} onChange={(event) => { const selected = transcriptionWorkflows.find((item) => item.id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, workflowTemplateId: selected?.id ?? null, workflowRevision: selected?.revision ?? null, profileId: selected?.id ?? null, profileRevision: selected?.revision ?? null } } })); }}><option value="">请选择已登记的语音识别工作流</option>{transcriptionWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label>识别语言 <select value={project.postProcessing.whisper.language} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, language: event.target.value as "zh" | "en" | "auto" } } }))}><option value="zh">中文</option><option value="en">英文</option><option value="auto">自动</option></select></label><label className="check-label"><input type="checkbox" checked={project.postProcessing.whisper.burnIn} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, burnIn: event.target.checked } } }))} />烧录字幕</label>{!transcriptionWorkflows.length && <span className="resource-note"><CircleAlert size={15} />请先上传并登记“语音识别 / 字幕”工作流</span>}</div>}
           </div>
           <div className="generation-actions"><button className="primary-button" disabled={actionBusy || !executionStatus?.review_complete || (Boolean(guidedRunTarget) && guidedRunTarget !== "delivery")} onClick={() => guidedRunTarget === "delivery" ? stopGuidedRun() : void runGuidedTo("delivery")}>{guidedRunTarget === "delivery" ? <Square size={14} /> : <PackageCheck size={16} />}{guidedRunTarget === "delivery" ? "停止自动派发" : executionStatus?.delivery_complete ? "重新检查交付状态" : "开始后处理并导出"}</button><button className="secondary-button" onClick={onOpenTasks}><ArrowRight size={15} />查看只读任务进度</button></div>
           <div className="task-table pipeline-task-table">
@@ -1818,7 +1993,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
 
         <footer className="stage-footer">
           <div className={agentGenerationBusy ? "stage-generating" : completion[project.activeStage].valid ? "stage-valid" : "stage-invalid"}>{agentGenerationBusy ? <Sparkles size={16} /> : completion[project.activeStage].valid ? <Check size={16} /> : <CircleAlert size={16} />}{agentGenerationBusy ? "正在生成初稿，请稍候" : completion[project.activeStage].valid ? "阶段内容可批准" : completion[project.activeStage].message}</div>
-          <button className="primary-button approve-stage" disabled={actionBusy || agentGenerationBusy || !completion[project.activeStage].valid} onClick={() => void approve()}>{project.activeStage === "delivery" ? <PackageCheck size={16} /> : nextStageWillAutoGenerate ? <Sparkles size={16} /> : <Check size={16} />}{project.activeStage === "delivery" ? "确认交付完成" : project.stageApprovals[project.activeStage] ? nextStageWillAutoGenerate ? "前往并生成下一阶段" : "前往下一阶段" : nextStageWillAutoGenerate ? "批准并生成下一阶段" : "批准并进入下一阶段"}</button>
+          <button className="primary-button approve-stage" disabled={actionBusy || agentGenerationBusy || !completion[project.activeStage].valid} onClick={() => void approve()}>{project.activeStage === "delivery" ? <PackageCheck size={16} /> : <Check size={16} />}{project.activeStage === "delivery" ? "确认交付完成" : project.stageApprovals[project.activeStage] ? "前往下一阶段" : "批准并进入下一阶段"}</button>
         </footer>
       </div>
 

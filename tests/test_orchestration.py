@@ -401,6 +401,60 @@ async def test_workspace_and_guided_task_control_api(tmp_path) -> None:
     assert workspace.json()["payload"]["outline"][0]["title"] == "Opening"
 
 
+@pytest.mark.asyncio
+async def test_run_endpoint_resets_failed_comfyui_execution_before_retry(tmp_path) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    failed = task("failed-comfy", state=TaskState.FAILED).model_copy(
+        update={
+            "comfyui_prompt_id": "old-failed-prompt",
+            "error_code": "comfy_failed",
+            "error_message": "old failure",
+            "attempt": 3,
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post("/api/v1/tasks", json=failed.model_dump(mode="json"))
+        retried = await client.post("/api/v1/tasks/failed-comfy/run")
+
+    assert created.status_code == 201
+    assert retried.status_code == 200
+    assert retried.json()["state"] == "queued"
+    assert retried.json()["comfyui_prompt_id"] is None
+    assert retried.json()["error_code"] is None
+    assert retried.json()["error_message"] is None
+    assert retried.json()["attempt"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_endpoint_reuses_completed_comfyui_job_when_output_collection_failed(
+    tmp_path,
+) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    failed = task("failed-collection", state=TaskState.FAILED).model_copy(
+        update={
+            "comfyui_prompt_id": "completed-prompt",
+            "error_code": "local_output_collection_failed",
+            "error_message": "ReadTimeout",
+            "attempt": 3,
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post("/api/v1/tasks", json=failed.model_dump(mode="json"))
+        retried = await client.post("/api/v1/tasks/failed-collection/run")
+
+    assert created.status_code == 201
+    assert retried.status_code == 200
+    assert retried.json()["state"] == "queued"
+    assert retried.json()["comfyui_prompt_id"] == "completed-prompt"
+    assert retried.json()["error_code"] is None
+    assert retried.json()["error_message"] is None
+    assert retried.json()["attempt"] == 2
+
+
 def test_project_agent_patches_are_applied_without_touching_locked_siblings() -> None:
     response = StructuredOperationResponse(
         operation_id="op-1",

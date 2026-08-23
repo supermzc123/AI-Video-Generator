@@ -402,8 +402,14 @@ class RemoteWorkerRuntime:
             if renewal in done:
                 execution.cancel()
                 await asyncio.gather(execution, return_exceptions=True)
-                await renewal
-                raise AssertionError("unreachable")
+                error = renewal.exception()
+                if error is None:
+                    raise RemoteWorkerError("lease renewal stopped before task completion")
+                if isinstance(error, RemoteWorkerError):
+                    raise error
+                raise RemoteWorkerError(
+                    f"lease renewal failed: {type(error).__name__}: {error}"
+                ) from error
             try:
                 outcome = await execution
             except asyncio.CancelledError:
@@ -453,7 +459,15 @@ class RemoteWorkerRuntime:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.lease_renew_interval_seconds)
             except TimeoutError:
-                await self.client.renew(self.capabilities.worker_id, task.task_id)
+                try:
+                    await self.client.renew(self.capabilities.worker_id, task.task_id)
+                except RemoteLeaseLostError:
+                    raise
+                except (RemoteWorkerError, httpx.TimeoutException, httpx.NetworkError) as exc:
+                    raise RemoteWorkerError(
+                        f"lease renewal request failed for {task.task_id}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
 
     async def _execute(self, task: TaskSpec) -> WorkerExecutionOutcome:
         if task.workload_manifest_sha256 is None:

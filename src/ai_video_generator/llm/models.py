@@ -185,7 +185,10 @@ def _validate_default_value(binding: WorkflowBindingDraft) -> None:
         return
     if binding.value_type == BindingValueType.STRING and not isinstance(value, str):
         raise ValueError(f"binding {binding.binding_id} default must be a string")
-    if binding.value_type == BindingValueType.IMAGE_PATH and not isinstance(value, str):
+    if binding.value_type in {
+        BindingValueType.IMAGE_PATH,
+        BindingValueType.VIDEO_PATH,
+    } and not isinstance(value, str):
         raise ValueError(f"binding {binding.binding_id} default must be an image path")
     if binding.value_type == BindingValueType.INTEGER and (
         not isinstance(value, int) or isinstance(value, bool)
