@@ -460,6 +460,10 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     [project.shots],
   );
   const h3SegmentSlots = useMemo(() => buildH3SegmentSlots(project.shots), [project.shots]);
+  const promptForSlot = (slot: H3SegmentSlot) => project.prompts.h3Prompts.find((item) => (
+    item.segmentId === slot.segmentId
+    || (item.shotId === slot.shotId && item.segmentIndex === slot.segmentIndex)
+  ));
   const segmentCount = h3SegmentSlots.length;
   const continuationCount = Math.max(0, segmentCount - project.shots.length);
   const currentPlanTasks = executionStatus?.tasks ?? [];
@@ -613,9 +617,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     },
     prompts: {
       valid: project.prompts.h3Prompts.length === segmentCount
-        && h3SegmentSlots.every((slot) => project.prompts.h3Prompts.some(
-          (prompt) => prompt.segmentId === slot.segmentId && Boolean(prompt.prompt.trim()),
-        )),
+        && h3SegmentSlots.every((slot) => Boolean(promptForSlot(slot)?.prompt.trim())),
       message: "每个 H3 片段都需要一份非空视频提示词；点击下一步即确认当前文本",
     },
     generation: {
@@ -707,7 +709,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     const key = `${project.projectId}:${project.revision}:prompts`;
     if (!force && promptGenerationStarted.current.has(key)) return;
     const targets = h3SegmentSlots.filter((slot) => {
-      const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId);
+      const prompt = promptForSlot(slot);
       return !prompt?.prompt.trim();
     });
     if (!targets.length) {
@@ -741,7 +743,10 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       const merged = new Map(project.prompts.h3Prompts.map((item) => [item.segmentId, item]));
       results.forEach((result) => {
         if (result.status === "fulfilled") {
-          const prompt = result.value.generated.prompts.h3Prompts.find((item) => item.segmentId === result.value.slot.segmentId);
+          const prompt = result.value.generated.prompts.h3Prompts.find((item) => (
+            item.segmentId === result.value.slot.segmentId
+            || (item.shotId === result.value.slot.shotId && item.segmentIndex === result.value.slot.segmentIndex)
+          ));
           if (prompt?.prompt.trim()) { succeeded += 1; merged.set(prompt.segmentId, prompt); } else failed += 1;
         } else if (!controller.signal.aborted) failed += 1;
       });
@@ -1132,10 +1137,13 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
 
   const patchH3Prompt = (slot: H3SegmentSlot, promptText: string) => {
     const current = latestProject.current;
+    const existingIndex = current.prompts.h3Prompts.findIndex((item) => (
+      item.segmentId === slot.segmentId
+      || (item.shotId === slot.shotId && item.segmentIndex === slot.segmentIndex)
+    ));
     const changed = (() => {
-      const existing = current.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId);
-      const next = existing
-        ? current.prompts.h3Prompts.map((item) => item.segmentId === slot.segmentId
+      const next = existingIndex >= 0
+        ? current.prompts.h3Prompts.map((item, index) => index === existingIndex
           ? { ...item, prompt: promptText, review: { ...item.review, ready: false } }
           : item)
         : [...current.prompts.h3Prompts, {
@@ -1768,7 +1776,28 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                     const fulfilled = project.assets.find((asset) => asset.id === plan.fulfilledByAssetId);
                     return <label key={plan.id} className="asset-shot-map-option"><input type="checkbox" checked={checked} onChange={(event) => togglePlanShot(plan, event.target.checked)} /><span>@{fulfilled?.name ?? plan.name}</span></label>;
                   }) : <span>暂无素材需求</span>}
-                  {project.assets.filter((asset) => asset.status === "ready" && !project.assetPlans.some((plan) => plan.fulfilledByAssetId === asset.id) && (asset.scope === "public" || asset.shotId === shot.id)).map((asset) => <span key={asset.id} className="asset-shot-map-option asset-shot-map-uploaded"><ImagePlus size={13} />@{asset.name}</span>)}
+                  {project.assets.filter((asset) => asset.status === "ready" && !project.assetPlans.some((plan) => plan.fulfilledByAssetId === asset.id)).map((asset) => {
+                    const checked = asset.scope === "public" || asset.shotId === shot.id;
+                    return <label key={asset.id} className="asset-shot-map-option asset-shot-map-uploaded">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(event) => {
+                          if (event.target.checked) {
+                            void patchAsset(asset, { scope: "shot", shotId: shot.id });
+                          } else if (asset.scope === "public") {
+                            const otherShot = project.shots.find((item) => item.id !== shot.id);
+                            if (otherShot) void patchAsset(asset, { scope: "shot", shotId: otherShot.id });
+                            else setActionMessage("项目只有一个分镜时，公共素材始终属于该分镜");
+                          } else {
+                            setActionMessage("该素材已是其它分镜专用素材");
+                          }
+                        }}
+                      />
+                      {asset.mediaKind === "video" ? <Film size={13} /> : asset.mediaKind === "audio" ? <Music size={13} /> : <ImagePlus size={13} />}
+                      @{asset.name}
+                    </label>;
+                  })}
                   {!plans.length && project.assetPlans.length > 0 && <small>当前未引用素材</small>}
                 </div>
                 <div className="asset-shot-map-assets">
@@ -1921,7 +1950,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                   <div className="h3-shot-meta"><span>{shot.camera}</span><strong>{shot.durationSeconds} 秒 · {slots.length} 个 H3 片段</strong></div>
                 </header>
                 <div className="h3-segment-list">{slots.map((slot) => {
-                  const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId);
+                  const prompt = promptForSlot(slot);
                   return <section className="h3-segment-editor" key={slot.segmentId}>
                     <div className="h3-segment-heading">
                       <div><strong>视频提示词 {slot.segmentIndex + 1}/{slot.segmentCount}</strong><span>{slot.durationSeconds} 秒 · Seed {slot.seed}{slot.continuationOf ? " · Motion Context 续段" : slot.segmentCount > 1 ? " · 连续链首段" : " · 独立片段"}</span></div>
