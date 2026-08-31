@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "avg:h3-quality-director-input:v1",
+  "title": "H3 Quality Director Input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["mode", "prompt", "canvas", "duration_seconds", "fps", "references"],
+  "properties": {
+    "mode": {
+      "enum": ["t2va", "i2va", "fl2va", "l2va", "ref2va"]
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Final English H3 execution prompt. This is the only text sent to H3."
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "fit"],
+      "properties": {
+        "width": {"type": "integer", "minimum": 32, "multipleOf": 32},
+        "height": {"type": "integer", "minimum": 32, "multipleOf": 32},
+        "fit": {"enum": ["match_reference", "contain", "cover", "stretch"]}
+      }
+    },
+    "duration_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 15},
+    "fps": {"const": 24},
+    "references": {
+      "type": "array",
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "asset_id",
+          "media_type",
+          "stream",
+          "slot",
+          "local_prompt",
+          "preserve",
+          "allow_change",
+          "forbid_propagation"
+        ],
+        "properties": {
+          "asset_id": {"type": "string", "minLength": 1},
+          "media_type": {"enum": ["image", "video", "audio"]},
+          "stream": {"enum": ["visual", "audio", "visual_and_audio"]},
+          "slot": {"type": "integer", "minimum": 1},
+          "trim_start_seconds": {"type": "number", "minimum": 0},
+          "trim_end_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "local_prompt": {"type": "string"},
+          "preserve": {"type": "array", "items": {"type": "string"}},
+          "allow_change": {"type": "array", "items": {"type": "string"}},
+          "forbid_propagation": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "continuity": {
+      "type": ["object", "null"],
+      "description": "Frozen predecessor state for a Motion Context continuation."
+    }
+  }
+}

@@ -13,22 +13,6 @@ type Props = {
   workflowName: string;
 };
 
-function stable(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-async function sha256(value: string) {
-  const data = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(data), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 export function HarnessEditor({ workflowId, workflowRevision, workflowName }: Props) {
   const harnessId = `image-harness:${workflowId}`;
   const [markdown, setMarkdown] = useState(
@@ -65,13 +49,6 @@ export function HarnessEditor({ workflowId, workflowRevision, workflowName }: Pr
       });
       const inputSchema = { type: "object" };
       const outputSchema = { type: "object" };
-      const content = {
-        markdown,
-        input_schema: inputSchema,
-        output_schema: outputSchema,
-        workflow_template_id: workflowId,
-        workflow_revision: workflowRevision,
-      };
       const item: HarnessRevision = {
         schema_version: "1.0",
         harness_id: harnessId,
@@ -79,7 +56,9 @@ export function HarnessEditor({ workflowId, workflowRevision, workflowName }: Pr
         markdown,
         input_schema: inputSchema,
         output_schema: outputSchema,
-        content_sha256: await sha256(stable(content)),
+        // The control plane owns the internal revision fingerprint. It is
+        // deliberately not computed in the browser or used as a save gate.
+        content_sha256: "0".repeat(64),
         approval,
         workflow_template_id: workflowId,
         workflow_revision: workflowRevision,

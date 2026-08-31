@@ -4,7 +4,6 @@ import {
   ChevronRight,
   CircleAlert,
   Clapperboard,
-  FolderOpen,
   FolderCog,
   FilePlus2,
   ListChecks,
@@ -77,12 +76,34 @@ const workflowSemantics: Array<{ value: WorkflowBindingSemantic; label: string; 
   { value: "seed", label: "Seed", valueType: "integer" },
   { value: "batch_size", label: "批量数", valueType: "integer" },
   { value: "reference_image", label: "参考图", valueType: "image_path" },
+  { value: "reference_video", label: "参考视频", valueType: "video_path" },
+  { value: "reference_audio", label: "参考音频", valueType: "audio_path" },
   { value: "source_video", label: "输入视频", valueType: "video_path" },
   { value: "model", label: "模型", valueType: "string" },
   { value: "interpolation_factor", label: "插帧倍率", valueType: "number" },
   { value: "upscale_factor", label: "放大倍率", valueType: "number" },
   { value: "language", label: "识别语言", valueType: "string" },
+  { value: "frame_count", label: "总帧数", valueType: "integer" },
+  { value: "conditioning_fingerprint", label: "Conditioning 指纹", valueType: "string" },
+  { value: "output_prefix", label: "输出前缀", valueType: "string" },
+  { value: "motion_context_input", label: "上一段 Motion Context", valueType: "string" },
+  { value: "motion_context_output_prefix", label: "Motion Context 输出前缀", valueType: "string" },
 ];
+
+function semanticsFor(kind: WorkflowDraft["kind"]): WorkflowBindingSemantic[] {
+  if (kind === "interpolation") return ["source_video", "model", "interpolation_factor"];
+  if (kind === "restoration") return ["source_video", "model", "upscale_factor"];
+  if (kind === "transcription") return ["source_video", "model", "language"];
+  if (kind === "h3_conditioning") return ["prompt", "width", "height", "frame_count", "conditioning_fingerprint", "reference_image", "reference_video", "reference_audio"];
+  if (kind === "h3_diffusion") return ["seed", "conditioning_fingerprint", "output_prefix", "motion_context_input", "motion_context_output_prefix", "steps", "model"];
+  return ["prompt", "negative_prompt", "width", "height", "steps", "cfg", "seed", "batch_size", "reference_image"];
+}
+
+function requiredH3Semantics(kind: WorkflowDraft["kind"]): WorkflowBindingSemantic[] {
+  if (kind === "h3_conditioning") return ["prompt", "width", "height", "frame_count", "conditioning_fingerprint"];
+  if (kind === "h3_diffusion") return ["seed", "conditioning_fingerprint", "output_prefix", "motion_context_input", "motion_context_output_prefix"];
+  return [];
+}
 
 function editableInputNames(node: WorkflowNode): string[] {
   return Object.entries(node.inputs)
@@ -112,7 +133,7 @@ function App() {
   const [draft, setDraft] = useState<WorkflowDraft | null>(null);
   const [step, setStep] = useState(1);
   const [error, setError] = useState<string | null>(null);
-  const [registered, setRegistered] = useState<Array<{ name: string; id: string; revision: number; kind?: "image" | "interpolation" | "restoration" | "transcription" }>>([]);
+  const [registered, setRegistered] = useState<Array<{ name: string; id: string; revision: number; kind?: "image" | "interpolation" | "restoration" | "transcription" | "h3_conditioning" | "h3_diffusion" }>>([]);
   const [workerOnline, setWorkerOnline] = useState(false);
   const [workerBlockers, setWorkerBlockers] = useState<string[]>([]);
   const [harnessTarget, setHarnessTarget] = useState<{ name: string; id: string; revision: number } | null>(null);
@@ -447,6 +468,10 @@ function App() {
           ? ["source_video", "model", "upscale_factor"]
           : draft.kind === "transcription"
             ? ["source_video", "model", "language"]
+          : draft.kind === "h3_conditioning"
+            ? ["prompt", "width", "height", "frame_count", "conditioning_fingerprint", "reference_image", "reference_video", "reference_audio"]
+          : draft.kind === "h3_diffusion"
+            ? ["seed", "conditioning_fingerprint", "output_prefix", "motion_context_input", "motion_context_output_prefix"]
           : ["prompt", "negative_prompt", "width", "height", "steps", "cfg", "seed", "batch_size", "reference_image"];
       const mappingInstruction = draft.kind === "interpolation"
         ? "这是视频插帧工作流。识别输入视频、插帧模型和插帧倍率；不要映射图像生成或超分参数。"
@@ -454,6 +479,10 @@ function App() {
           ? "这是视频超分或修复工作流。识别输入视频、修复/超分模型和放大倍率；不要映射图像生成或插帧参数。"
           : draft.kind === "transcription"
             ? "这是语音识别与字幕工作流。识别输入音视频、语音识别模型和语言；输出必须是 SRT 字幕文件或 SRT 文本。"
+          : draft.kind === "h3_conditioning"
+            ? "这是 MiniMax H3 编码工作流。必须映射提示词、宽、高、总帧数和 conditioning 指纹；按出现顺序映射可选参考图片、视频和音频。"
+          : draft.kind === "h3_diffusion"
+            ? "这是 MiniMax H3 扩散工作流。必须映射与编码阶段相同的 conditioning 指纹、Seed、视频输出前缀、上一段 Motion Context 路径和本段 Motion Context 输出前缀。"
           : "这是图像生成工作流。保持现有图像提示词、尺寸、采样参数和参考图映射规则。";
       const result = await suggestWorkflowBindings(
         draft.fileName,
@@ -467,8 +496,10 @@ function App() {
         inspection: { ...current.inspection, bindings: result.bindings },
         bindings: toDisplayBindings(result.bindings),
       } : current);
+      const mapped = new Set(result.bindings.map((binding) => binding.semantic));
+      const missing = requiredH3Semantics(draft.kind).filter((semantic) => !mapped.has(semantic));
       setWorkflowNotice(result.bindings.length
-        ? `LLM 已填入 ${result.bindings.length} 条映射建议，请逐项确认`
+        ? `LLM 已填入 ${result.bindings.length} 条映射建议，请逐项确认${missing.length ? `；仍缺少：${missing.join("、")}` : ""}`
         : "LLM 未找到可安全暴露的字段，请手动添加映射");
     } catch (cause) {
       setError(`LLM映射失败：${cause instanceof Error ? cause.message : "未知错误"}`);
@@ -506,9 +537,9 @@ function App() {
       if (field === "input") inputName = value;
       const semanticDefinition = workflowSemantics.find((item) => item.value === semantic) ?? workflowSemantics[0];
       const referenceIndexes = bindings
-        .filter((_, bindingIndex) => bindingIndex !== index)
+        .filter((binding, bindingIndex) => bindingIndex !== index && binding.semantic === semantic)
         .map((binding) => binding.reference_index ?? 0);
-      const referenceIndex = semantic === "reference_image"
+      const referenceIndex = ["reference_image", "reference_video", "reference_audio"].includes(semantic)
         ? existing.reference_index ?? Math.max(0, ...referenceIndexes) + 1
         : null;
       const node = current.nodes[nodeId];
@@ -543,10 +574,10 @@ function App() {
       const [nodeId, node] = candidate;
       const inputName = editableInputNames(node)[0];
       const index = bindings.length;
-      const defaultSemantic = draft.kind !== "image"
-        ? "source_video"
-        : "prompt";
-      const defaultType = defaultSemantic === "source_video" ? "video_path" : "string";
+      const defaultSemantic = draft.kind === "h3_conditioning" ? "prompt"
+        : draft.kind === "h3_diffusion" ? "seed"
+        : draft.kind !== "image" ? "source_video" : "prompt";
+      const defaultType = workflowSemantics.find((item) => item.value === defaultSemantic)?.valueType ?? "string";
       return [...bindings, {
         binding_id: `${defaultSemantic}:${nodeId}:${inputName}:${index + 1}`,
         semantic: defaultSemantic,
@@ -594,9 +625,9 @@ function App() {
         raw_workflow: draft.inspection.raw_workflow,
         bindings: cleanBindings,
         outputs: [{
-        output_id: `${draft.kind === "image" ? "image" : draft.kind === "transcription" ? "subtitle" : "video"}:${draft.outputNodeId}`,
+        output_id: `${draft.kind === "image" ? "image" : draft.kind === "transcription" ? "subtitle" : draft.kind === "h3_conditioning" ? "conditioning" : "video"}:${draft.outputNodeId}`,
           node_id: draft.outputNodeId,
-        output_type: draft.kind === "image" ? "image" : draft.kind === "transcription" ? "subtitle" : "video",
+        output_type: draft.kind === "image" ? "image" : draft.kind === "transcription" ? "subtitle" : draft.kind === "h3_conditioning" ? "conditioning" : "video",
           title: outputNode._meta?.title?.trim() || `${outputNode.class_type} #${draft.outputNodeId}`,
         }],
         required_node_types: draft.inspection.required_node_types,
@@ -654,7 +685,7 @@ function App() {
 
         {!startupLoading && projectDialog && <ProjectSwitcher mode={projectDialog} projects={projects} activeProjectId={project.projectId} busy={projectBusy} error={projectError} onClose={() => setProjectDialog(null)} onModeChange={(mode) => { setProjectError(null); setProjectDialog(mode); }} onOpen={(item) => void openSavedProject(item)} onCreate={(value) => void createNewProject(value)} />}
 
-        {startupLoading ? <section className="startup-loading" aria-live="polite"><Sparkles size={22} /><div><strong>正在加载项目</strong><span>正在读取最近项目、素材和运行状态...</span></div></section> : view === "pipeline" ? <PipelineView project={project} workflows={registered} workerOnline={workerOnline} onChange={setProject} onOpenWorkflows={() => setView("workflow")} onOpenTasks={() => setView("tasks")} onOpenBatch={() => setView("batch")} /> : view === "projects" ? <ProjectManagement projects={projects} activeProjectId={project.projectId} busy={projectBusy} onOpen={(item) => void openSavedProject(item)} onCreate={() => { setProjectError(null); setProjectDialog("new"); }} onClearTasks={(item) => void clearManagedProjectTasks(item)} onDelete={(item) => void deleteManagedProject(item)} /> : view === "settings" ? <SettingsView /> : view === "batch" ? <BatchView project={project} projects={projects} /> : view === "tasks" ? <TasksView project={project} /> : (
+        {startupLoading ? <section className="startup-loading" aria-live="polite"><Sparkles size={22} /><div><strong>正在加载项目</strong><span>正在读取最近项目、素材和运行状态...</span></div></section> : view === "pipeline" ? <PipelineView project={project} workflows={registered} workerOnline={workerOnline} onChange={setProject} onOpenWorkflows={() => setView("workflow")} onOpenTasks={() => setView("tasks")} onOpenBatch={() => setView("batch")} /> : view === "projects" ? <ProjectManagement projects={projects} activeProjectId={project.projectId} busy={projectBusy} onOpen={(item) => void openSavedProject(item)} onCreate={() => { setProjectError(null); setProjectDialog("new"); }} onClearTasks={(item) => void clearManagedProjectTasks(item)} onDelete={(item) => void deleteManagedProject(item)} /> : view === "settings" ? <SettingsView /> : view === "batch" ? <BatchView project={project} projects={projects} workflows={registered} /> : view === "tasks" ? <TasksView project={project} /> : (
           <section className="workspace">
             <div className="section-heading">
               <div><h2>工作流模板</h2><span>{registered.length} 个已登记模板 · 图片、视频工作流均可由用户上传并由 LLM 协助标定</span></div>
@@ -689,7 +720,7 @@ function App() {
                 <label className="dropzone" role="button" aria-label="选择 ComfyUI API 工作流 JSON" tabIndex={0} onKeyDown={activateFileLabel}><Upload size={28} /><strong>选择 ComfyUI API 工作流</strong><span>图片生成、视频修复、超分或插帧均可导入</span><input type="file" accept="application/json,.json" onChange={importWorkflow} /></label>
               ) : (
                 <>
-      <div className="file-summary"><div><strong>{draft.fileName}</strong><span>{nodeRows.length} 个节点 · {draft.bindings.length} 个已选输入</span></div><label className="field"><span>用途</span><select value={draft.kind ?? "image"} onChange={(event) => setDraft((current) => current?.inspection ? { ...current, kind: event.target.value as "image" | "interpolation" | "restoration" | "transcription", bindings: [], outputNodeId: null, inspection: { ...current.inspection, bindings: [] } } : current)}><option value="image">图像生成</option><option value="interpolation">视频插帧</option><option value="restoration">视频超分 / 修复</option><option value="transcription">语音识别 / 字幕</option></select></label></div>
+      <div className="file-summary"><div><strong>{draft.fileName}</strong><span>{nodeRows.length} 个节点 · {draft.bindings.length} 个已选输入</span></div><label className="field"><span>用途</span><select value={draft.kind ?? "image"} onChange={(event) => setDraft((current) => current?.inspection ? { ...current, kind: event.target.value as WorkflowDraft["kind"], bindings: [], outputNodeId: null, inspection: { ...current.inspection, bindings: [] } } : current)}><option value="image">图像生成</option><option value="h3_conditioning">H3 编码</option><option value="h3_diffusion">H3 扩散</option><option value="interpolation">视频插帧</option><option value="restoration">视频超分 / 修复</option><option value="transcription">语音识别 / 字幕</option></select></label></div>
                   {step === 2 && <>
                     {!draft.inspection && <div className="workflow-pending">正在从 ComfyUI 读取节点接口…</div>}
                     {draft.inspection?.issues.length ? <div className="workflow-issues"><strong>需要在后续步骤确认</strong>{draft.inspection.issues.map((issue) => <span key={issue}>{issue}</span>)}</div> : null}
@@ -713,12 +744,12 @@ function App() {
                   </>}
 
                   {step === 3 && draft.inspection && <>
-                    <div className="workflow-step-heading"><div><strong>输入字段映射</strong><span>只会类型化修改下列字段，其他节点参数保持工作流原值</span></div><button className="secondary-button" onClick={requestLlmMapping} disabled={busy}><Sparkles size={16} />{busy ? "LLM 分析中" : "LLM 协助识别"}</button></div>
+                    <div className="workflow-step-heading"><div><strong>输入字段映射</strong><span>只会类型化修改下列字段，其他节点参数保持工作流原值</span></div><button className="secondary-button" onClick={requestLlmMapping} disabled={busy}><Sparkles size={16} />{busy ? "LLM 分析中" : draft.kind?.startsWith("h3_") ? "LLM 标定 H3" : "LLM 协助识别"}</button></div>
                     {!draft.inspection.bindings.length && <div className="workflow-empty">尚未暴露任何输入。使用 LLM 协助识别，或手动添加一项。</div>}
                     <div className="binding-table">
                       {draft.inspection.bindings.map((binding, index) => (
                         <div className="binding-row" key={`${binding.binding_id}:${index}`}>
-                          <label><span>用途</span><select value={binding.semantic} onChange={(event) => changeWorkflowBinding(index, "semantic", event.target.value)}>{workflowSemantics.filter((semantic) => draft.kind === "interpolation" ? ["source_video", "model", "interpolation_factor"].includes(semantic.value) : draft.kind === "restoration" ? ["source_video", "model", "upscale_factor"].includes(semantic.value) : draft.kind === "transcription" ? ["source_video", "model", "language"].includes(semantic.value) : !["source_video", "model", "interpolation_factor", "upscale_factor", "language"].includes(semantic.value)).map((semantic) => <option value={semantic.value} key={semantic.value}>{semantic.label}</option>)}</select></label>
+                          <label><span>用途</span><select value={binding.semantic} onChange={(event) => changeWorkflowBinding(index, "semantic", event.target.value)}>{workflowSemantics.filter((semantic) => semanticsFor(draft.kind).includes(semantic.value)).map((semantic) => <option value={semantic.value} key={semantic.value}>{semantic.label}</option>)}</select></label>
                           <label><span>节点</span><select value={binding.node_id} onChange={(event) => changeWorkflowBinding(index, "node", event.target.value)}>{nodeRows.filter(([id, node]) => id === binding.node_id || editableInputNames(node).length).map(([id, node]) => <option value={id} key={id}>#{id} {node._meta?.title || node.class_type}</option>)}</select></label>
                           <label><span>输入字段</span><select value={binding.input_name} onChange={(event) => changeWorkflowBinding(index, "input", event.target.value)}>{Array.from(new Set([binding.input_name, ...editableInputNames(draft.nodes[binding.node_id])])).map((input) => <option value={input} key={input}>{input}</option>)}</select></label>
                           <div className="binding-type"><span>类型</span><code>{binding.value_type}</code></div>

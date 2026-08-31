@@ -1,18 +1,22 @@
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 
-from ai_video_generator.api import create_app
+from ai_video_generator.api import _active_project_agent_memory, create_app
 from ai_video_generator.api_models import ComfyNodeInstallResult, ComfyNodeInstallStep
 from ai_video_generator.config import Settings
 from ai_video_generator.domain import (
     ChainSpec,
     ConditioningStack,
+    DecisionSource,
     GenerationMode,
     GenerationSegment,
+    MemoryEventKind,
+    ProjectMemoryEvent,
 )
 from ai_video_generator.llm import (
     HarnessValidationError,
@@ -20,6 +24,48 @@ from ai_video_generator.llm import (
     StructuredOperationResponse,
 )
 from ai_video_generator.workers import PINNED_MOTION_CONTEXT_COMMIT
+
+
+def test_project_agent_memory_follows_selected_conversation_branch() -> None:
+    started = datetime.now(UTC)
+
+    def event(
+        event_id: str, role: str, offset: int, parent: str | None = None
+    ) -> ProjectMemoryEvent:
+        return ProjectMemoryEvent(
+            event_id=event_id,
+            project_id="project",
+            kind=MemoryEventKind.MESSAGE,
+            source=(
+                DecisionSource.USER if role.endswith("_user") else DecisionSource.PROJECT_AGENT
+            ),
+            role=role,
+            content=event_id,
+            parent_event_id=parent,
+            created_at=started + timedelta(seconds=offset),
+        )
+
+    events = (
+        event("retry-user", "dialog_refine_outline_user", 5, "first-assistant"),
+        event("abandoned-assistant", "dialog_refine_outline_assistant", 4, "abandoned-user"),
+        event("abandoned-user", "dialog_refine_outline_user", 3, "first-assistant"),
+        event("first-assistant", "dialog_refine_outline_assistant", 2, "first-user"),
+        event("first-user", "dialog_refine_outline_user", 1),
+    )
+
+    active = _active_project_agent_memory(events, "retry-user")
+
+    assert [item.event_id for item in active] == [
+        "first-user",
+        "first-assistant",
+        "retry-user",
+    ]
+
+    root_retry = event("new-operation:user", "dialog_refine_outline_user", 6)
+    assert [
+        item.event_id
+        for item in _active_project_agent_memory((*events, root_retry), root_retry.event_id)
+    ] == ["new-operation:user"]
 
 
 @pytest.mark.asyncio
@@ -111,6 +157,7 @@ async def test_runtime_settings_are_persisted_and_api_key_is_redacted(tmp_path: 
             "clear_llm_api_key": False,
             "llm_timeout_seconds": 45,
             "llm_first_token_timeout_seconds": 12,
+            "llm_stream_idle_timeout_seconds": 720,
             "network_proxy": "mixed:10808",
         }
 
@@ -125,6 +172,7 @@ async def test_runtime_settings_are_persisted_and_api_key_is_redacted(tmp_path: 
         assert fetched.json()["comfyui_base_url"] == "http://127.0.0.1:8288"
         assert fetched.json()["llm_api_key_configured"] is True
         assert fetched.json()["llm_first_token_timeout_seconds"] == 12
+        assert fetched.json()["llm_stream_idle_timeout_seconds"] == 720
         assert "secret-value" not in fetched.text
 
         persisted = (tmp_path / "runtime-settings.json").read_text(encoding="utf-8")
@@ -138,6 +186,7 @@ async def test_runtime_settings_are_persisted_and_api_key_is_redacted(tmp_path: 
         assert after_restart.json()["llm_model"] == "example-model"
         assert after_restart.json()["network_proxy"] == "http://127.0.0.1:10808"
         assert after_restart.json()["llm_first_token_timeout_seconds"] == 12
+        assert after_restart.json()["llm_stream_idle_timeout_seconds"] == 720
     finally:
         config_module.store_secret = original_store
         config_module.load_secret = original_load
@@ -158,6 +207,41 @@ async def test_controlled_h3_settings_allow_disabling_optional_turbo(tmp_path: P
 
     assert response.status_code == 200
     assert response.json()["h3_turbo_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_comfyui_model_list_falls_back_to_local_loras_when_server_is_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    comfy_root = tmp_path / "ComfyUI"
+    lora = comfy_root / "models" / "loras" / "characters" / "hero.safetensors"
+    lora.parent.mkdir(parents=True)
+    lora.write_bytes(b"test")
+
+    async def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(
+        "ai_video_generator.workers.comfyui.ComfyUIAdapter.get_object_info",
+        unavailable,
+    )
+    app = create_app(
+        Settings(
+            _env_file=None,
+            data_root=tmp_path / "data",
+            comfyui_root=comfy_root,
+        )
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v1/settings/comfyui-models")
+
+    assert response.status_code == 200
+    assert response.json()["source"] == "filesystem"
+    assert response.json()["loras"] == ["characters/hero.safetensors"]
+    assert "ComfyUI 离线" in response.json()["warning"]
 
 
 @pytest.mark.asyncio
@@ -343,7 +427,8 @@ async def test_project_agent_compacts_audit_for_workspace_larger_than_memory_lim
     operation = captured["operation"]
     assert len(operation.source_document["idea"]) == 1_100_000  # type: ignore[attr-defined]
     assert "legacy-snapshot-marker" not in operation.instruction  # type: ignore[attr-defined]
-    assert "legacy_payload_omitted" in operation.instruction  # type: ignore[attr-defined]
+    assert '"content_chars": 500022' in operation.instruction  # type: ignore[attr-defined]
+    assert '"content_sha256"' in operation.instruction  # type: ignore[attr-defined]
     canonical = json.dumps(
         operation.model_dump(mode="json"),  # type: ignore[attr-defined]
         ensure_ascii=False,
@@ -418,6 +503,8 @@ async def test_project_agent_stream_serializes_proposal_as_an_object(
             },
         )
         memory = await client.get("/api/v1/projects/stream-project/memory")
+        latest = await client.get("/api/v1/projects/stream-project/workspace")
+        active = await client.get("/api/v1/projects/stream-project/llm-operations")
 
     assert response.status_code == 200
     result_line = next(
@@ -431,9 +518,13 @@ async def test_project_agent_stream_serializes_proposal_as_an_object(
     assert isinstance(result["proposal"], dict)
     assert result["proposal"]["patches"] == []
     assert result["proposal"]["warnings"] == []
+    assert result["committed_revision"] == 2
+    assert result["user_event_id"] == "stream-outline:user"
+    assert result["assistant_event_id"] == "stream-outline:assistant"
+    assert latest.json()["revision"] == 2
+    assert active.json() == []
     dialog = next(
-        event
-        for event in memory.json()
-        if event["role"] == "dialog_initialize_outline_user"
+        event for event in memory.json() if event["role"] == "dialog_initialize_outline_user"
     )
     assert dialog["content"] == "自动生成故事大纲初稿"
+    assert dialog["parent_event_id"] is None

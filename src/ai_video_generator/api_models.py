@@ -123,6 +123,7 @@ class RuntimeSettingsUpdateRequest(BaseModel):
     clear_llm_api_key: bool = False
     llm_timeout_seconds: float = Field(gt=0, le=300)
     llm_first_token_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    llm_stream_idle_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
     llm_video_capable: bool = False
     network_proxy: str | None = None
     h3_diffusion_model: str = Field(
@@ -141,6 +142,10 @@ class RuntimeSettingsUpdateRequest(BaseModel):
     h3_sage_attention_enabled: bool = False
     h3_low_vram: bool = True
     h3_steps: int = Field(default=6, ge=4, le=50)
+    h3_conditioning_workflow_template_id: str | None = None
+    h3_conditioning_workflow_revision: int | None = Field(default=None, ge=1)
+    h3_diffusion_workflow_template_id: str | None = None
+    h3_diffusion_workflow_revision: int | None = Field(default=None, ge=1)
 
 
 class ComfyNodeInstallStep(BaseModel):
@@ -196,6 +201,7 @@ class ProjectAgentOperationRequest(BaseModel):
     operation: str = Field(min_length=1)
     instruction: str = Field(min_length=1, max_length=50_000)
     display_instruction: str | None = Field(default=None, min_length=1, max_length=1000)
+    conversation_parent_event_id: str | None = Field(default=None, min_length=1)
     allowed_paths: tuple[str, ...] = Field(min_length=1)
     locked_paths: tuple[str, ...] = ()
     commit: bool = False
@@ -216,7 +222,7 @@ class ReworkMarkerRequest(BaseModel):
 
     version_id: str = Field(min_length=1)
     action: ReworkAction
-    feedback: str = Field(min_length=1, max_length=4000)
+    feedback: str | None = Field(default=None, max_length=4000)
     replacement_seed: int | None = Field(default=None, ge=0)
     source: str = Field(default="human", pattern="^(human|ai)$")
 

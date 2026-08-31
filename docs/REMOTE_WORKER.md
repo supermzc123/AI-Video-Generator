@@ -26,11 +26,11 @@ wheel提供实验性命令`aivideo-worker`。systemd示例和安装脚本位于`
 
 ## 执行器接口
 
-运行时保留异步`executor(TaskSpec) -> WorkerExecutionOutcome`作为无manifest旧任务的兼容接口。带`workload_manifest_sha256`的新任务由运行时从控制平面下载manifest，校验SHA-256、Schema、任务类型及Worker能力后，交给`workload_executor(TaskSpec, TaskWorkloadManifest)`。执行器负责物化manifest列出的输入blob、把API prompt提交到Worker本机的ComfyUI并对账history；成功产物通过`ProducedArtifact`返回，运行时会先上传所有产物，再提交结果。执行器异常会转换为`worker_executor_error`失败结果。
+运行时要求任务携带 `workload_manifest_sha256`，从控制平面下载 manifest，校验 Schema、任务类型及 Worker 能力后交给 `workload_executor(TaskSpec, TaskWorkloadManifest)`。执行器负责物化 manifest 列出的输入 blob、把 API prompt 提交到 Worker 本机的 ComfyUI 并对账 history；成功产物通过 `ProducedArtifact` 返回，执行器异常会转换为明确失败结果。
 
 ## Workload manifest契约
 
-控制平面通过`POST /api/v1/workload-manifests`登记规范化JSON，并返回其SHA-256。任务通过可空的`TaskSpec.workload_manifest_sha256`引用它；可空设计保证旧任务和旧数据库兼容。远程Worker通过需要认证的`GET /api/v1/workload-manifests/{sha256}`读取内容。
+控制平面通过 `POST /api/v1/workload-manifests` 登记规范化 JSON，并返回其 SHA-256。任务通过 `TaskSpec.workload_manifest_sha256` 引用它。远程 Worker 通过需要认证的 `GET /api/v1/workload-manifests/{sha256}` 读取内容。
 
 首版manifest只允许声明式ComfyUI API prompt，格式固定为`avg-comfyui-workload+json-v1`。它包含任务类型、工作流和节点Schema哈希、prompt、内容寻址的输入blob、输出节点以及所需节点/模型/模板能力。manifest不接受命令、Python对象、pickle或脚本入口；输入blob的挂载路径必须是无`..`的相对POSIX路径。
 

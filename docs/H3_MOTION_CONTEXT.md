@@ -99,27 +99,27 @@ media extraction.
   contains generic `LoraLoaderModelOnly` and Spectrum nodes, so it must not be
   registered as the production Turbo profile.
 
-## Turbo and SageAttention compatibility
+## Turbo and Kitchen Attention compatibility
 
 No symbol-level conflict was found with the pinned official Turbo plugin
 (`Larryvrh/ComfyUI-MiniMax-H3-Turbo`, commit
-`4274783a23afcfdbea3b4876cb79effd6c510785`) or the loaded KJNodes H3
-SageAttention node:
+`4274783a23afcfdbea3b4876cb79effd6c510785`) or ComfyUI's native
+`ModelAttentionBackend`:
 
 - Motion Context patches `comfy.ldm.minimax.model.PackedLayout.__init__` and
   `comfy.model_base.MiniMaxH3.extra_conds` lazily on its first run.
 - Official Turbo provides a sampler and modifies model weights, forward hooks,
   AdaLN object patches and diffusion-model wrappers. It does not replace either
   Motion Context target.
-- KJNodes clones the model and patches each
-  `diffusion_model.blocks.*.attn.forward`. It does not replace either Motion
-  Context target.
+- `ModelAttentionBackend` clones the model and selects the native
+  `comfy kitchen attention` backend. It does not replace either Motion Context
+  target and needs no external attention plugin.
 
 Use this model path for the controlled profile:
 
 ```text
 base H3 model -> MiniMaxH3TurboLoRA
-              -> MiniMaxH3MemoryEfficientSageAttentionPatch
+              -> ModelAttentionBackend(comfy kitchen attention)
               -> guider and BasicScheduler(simple, 6 steps)
 MiniMaxH3TurboSampler -> SamplerCustomAdvanced.sampler
 ```
@@ -169,7 +169,7 @@ inside `custom_nodes` still loads and is a conflict.
    Trim both streams, then inspect duration, resolution, 32kHz audio and seam
    probe output. Free models after the batch.
 7. Only after the standard continuation passes, repeat with official Turbo plus
-   KJ SageAttention. Compare against standard sampling because upstream warns
+   Comfy Kitchen Attention. Compare against standard sampling because upstream warns
    Turbo can soften picture and thicken/dull audio across a chain.
 
 Do not retry an OOM repeatedly. Preserve the workflow, ComfyUI log, peak VRAM,

@@ -130,6 +130,27 @@ def test_batch_project_tasks_are_limited_to_frozen_member_ids(tmp_path) -> None:
     assert tuple(task.task_id for task in tasks) == ("selected",)
 
 
+def test_next_ready_resumes_failed_task_without_creating_new_planning(tmp_path) -> None:
+    store = SQLiteTaskStore(tmp_path / "batch.db")
+    store.add_task(_task("completed", TaskKind.H3_GENERATION, state=TaskState.SUCCEEDED))
+    store.add_task(
+        _task(
+            "failed",
+            TaskKind.H3_GENERATION,
+            state=TaskState.FAILED,
+            depends_on=("completed",),
+        )
+    )
+    store.add_task(
+        _task("delivery", TaskKind.EXPORT, state=TaskState.BLOCKED, depends_on=("failed",))
+    )
+
+    resolved = resolve_batch_run(store, _batch("next_ready"))
+
+    assert resolved.items[0].task_ids == ("failed", "delivery")
+    assert not any(task.kind == TaskKind.LLM_PLANNING for task in store.list_tasks())
+
+
 def test_failed_project_is_settled_without_blocking_other_batch_items(tmp_path) -> None:
     store = SQLiteTaskStore(tmp_path / "batch.db")
     store.add_task(_task("failed", TaskKind.H3_GENERATION, state=TaskState.FAILED))
@@ -201,6 +222,33 @@ async def test_create_batch_api_returns_server_resolved_task_closure(tmp_path) -
 
     assert response.status_code == 201
     assert response.json()["items"][0]["task_ids"] == ["h3", "review", "export"]
+
+
+@pytest.mark.asyncio
+async def test_batch_api_accepts_default_and_project_settings_with_existing_queue(tmp_path) -> None:
+    app = create_app(Settings(_env_file=None, data_root=tmp_path))
+    queued = _task("queued", TaskKind.H3_GENERATION, state=TaskState.QUEUED)
+    batch = _batch("next_ready").model_copy(
+        update={
+            "settings": {"imageWorkflowId": "image-default", "rifeEnabled": True},
+            "items": (
+                _batch("next_ready").items[0].model_copy(
+                    update={"settings": {"rifeWorkflowId": "rife-project"}}
+                ),
+            ),
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (
+            await client.post("/api/v1/tasks", json=queued.model_dump(mode="json"))
+        ).status_code == 201
+        response = await client.post("/api/v1/batches", json=batch.model_dump(mode="json"))
+
+    assert response.status_code == 201, response.text
+    assert response.json()["settings"]["rifeEnabled"] is True
+    assert response.json()["items"][0]["settings"]["rifeWorkflowId"] == "rife-project"
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,8 @@
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
 button, input, select { font: inherit; letter-spacing: 0; }
+select { color-scheme: dark; }
+select option { color: #e3e8e3; background: #111312; }
 button, label { -webkit-tap-highlight-color: transparent; }
 
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 224px minmax(0, 1fr); background: #111312; }
@@ -175,6 +177,12 @@ input[type="file"] { display: none; }
 .field-wide { grid-column: 1 / -1; }
 .field input, .field select { width: 100%; height: 40px; padding: 0 11px; color: #edf0ed; background: #111312; border: 1px solid #3b403c; border-radius: 5px; outline: none; }
 .field input:focus, .field select:focus { border-color: #65bf87; }
+.lora-toolbar { justify-content: flex-start; }
+.lora-toolbar .secondary-button { min-height: 30px; padding: 0 9px; font-size: 10px; }
+.lora-row { justify-content: flex-start; margin-bottom: 8px; }
+.lora-row select { min-width: 220px; height: 32px; padding: 0 8px; color: #e3e8e3; background: #111312; border: 1px solid #3b403c; border-radius: 5px; color-scheme: dark; }
+.lora-row input[type="number"] { width: 88px; height: 32px; padding: 0 8px; color: #edf0ed; background: #111312; border: 1px solid #3b403c; border-radius: 5px; }
+.lora-row input[type="checkbox"] { width: 14px; height: 14px; accent-color: #65bf87; }
 .resolution-hint { margin-top: -8px; color: #777e78; font-size: 10px; }
 .form-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 10px; padding-top: 4px; }
 .inline-banner { margin: 0 0 14px; }
@@ -209,6 +217,7 @@ input[type="file"] { display: none; }
 .batch-project-controls { display: grid; grid-template-columns: minmax(180px, 1fr) 120px; gap: 10px; padding: 4px 12px 12px; }
 .batch-project-controls label { display: grid; gap: 5px; color: #8e958f; font-size: 11px; }
 .batch-project-controls select, .batch-project-controls input { min-width: 0; }
+.batch-project-controls select { height: 32px; padding: 0 8px; color: #e3e8e3; background: #111312; border: 1px solid #3b403c; border-radius: 5px; color-scheme: dark; }
 .batch-status-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 12px; }
 .generation-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 .task-table { border: 1px solid #343835; border-radius: 7px; background: #181b19; overflow: hidden; }
@@ -245,6 +254,11 @@ input[type="file"] { display: none; }
 .batch-summary span { color: #7f8680; font-size: 10px; }
 .batch-summary strong { font: 18px/1 ui-monospace, "Cascadia Code", monospace; }
 .batch-toolbar { min-height: 58px; padding: 10px 12px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #303431; }
+.batch-default-settings { flex-wrap: wrap; margin-bottom: 14px; border: 1px solid #303431; border-radius: 6px; background: #171918; }
+.batch-default-settings strong { margin-right: 4px; color: #d8ded9; font-size: 12px; }
+.batch-default-settings label { white-space: nowrap; }
+.batch-default-settings select { min-width: 150px; height: 32px; padding: 0 8px; color: #e3e8e3; background: #111312; border: 1px solid #3b403c; border-radius: 5px; color-scheme: dark; }
+.batch-default-settings input[type="checkbox"], .batch-project-controls input[type="checkbox"] { width: 14px; height: 14px; padding: 0; accent-color: #65bf87; }
 .batch-create-toolbar { justify-content: space-between; }
 .batch-name { min-width: 0; flex: 1; display: grid; gap: 4px; }
 .batch-name span { color: #858c86; font-size: 9px; }
@@ -597,8 +611,14 @@ input[type="file"] { display: none; }
 .agent-message { display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: start; gap: 7px; }
 .agent-message > span { width: 24px; height: 24px; display: grid; place-items: center; color: #8bcaa2; background: #203027; border-radius: 4px; }
 .agent-message.user > span { color: #b9c0bb; background: #2a2e2b; }
+.agent-message-content { min-width: 0; display: grid; gap: 4px; }
+.agent-message.user .agent-message-content { justify-items: end; }
 .agent-message p { width: fit-content; max-width: 90%; margin: 0; padding: 7px 9px; color: #cbd1cc; background: #1c211e; border-radius: 5px; font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
 .agent-message.user p { margin-left: auto; background: #242925; }
+.agent-message-actions { display: flex; justify-content: flex-end; gap: 3px; opacity: 0; transition: opacity .15s ease; }
+.agent-message.user:hover .agent-message-actions, .agent-message-actions:focus-within { opacity: 1; }
+.agent-message-actions .icon-button { width: 26px; height: 24px; }
+.agent-stop-generation { width: fit-content; min-height: 28px; padding: 4px 8px; color: #d6a39d; border-color: #60413e; }
 .agent-proposal { margin: 0 12px 12px 43px; padding: 10px; border: 1px solid #405146; border-radius: 5px; background: #19221c; }
 .agent-proposal > div:first-child { display: flex; justify-content: space-between; gap: 10px; }
 .agent-proposal > div:first-child strong { font-size: 11px; }

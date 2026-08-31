@@ -26,6 +26,7 @@ class WorkflowMappingRequest(HarnessModel):
     raw_workflow: dict[str, dict[str, Any]] = Field(min_length=1)
     requested_semantics: tuple[BindingSemantic, ...] = tuple(BindingSemantic)
     instructions: str = "Identify safe user-editable workflow inputs."
+    highest_instruction: str = ""
 
     @model_validator(mode="after")
     def validate_context(self) -> WorkflowMappingRequest:
@@ -83,6 +84,7 @@ class StructuredOperationRequest(HarnessModel):
     source_document: dict[str, Any]
     allowed_paths: tuple[str, ...] = Field(min_length=1)
     locked_paths: tuple[str, ...] = ()
+    highest_instruction: str = ""
 
     @model_validator(mode="after")
     def validate_scope(self) -> StructuredOperationRequest:
@@ -134,7 +136,7 @@ def validate_workflow_mapping(
 
     binding_ids: set[str] = set()
     targets: set[tuple[str, str]] = set()
-    reference_indexes: set[int] = set()
+    reference_indexes: set[tuple[BindingSemantic, int]] = set()
     requested = set(request.requested_semantics)
 
     for binding in draft.bindings:
@@ -172,9 +174,13 @@ def validate_workflow_mapping(
             )
 
         if binding.reference_index is not None:
-            if binding.reference_index in reference_indexes:
-                raise ValueError(f"duplicate reference_index: {binding.reference_index}")
-            reference_indexes.add(binding.reference_index)
+            reference_key = (binding.semantic, binding.reference_index)
+            if reference_key in reference_indexes:
+                raise ValueError(
+                    f"duplicate {binding.semantic.value} reference_index: "
+                    f"{binding.reference_index}"
+                )
+            reference_indexes.add(reference_key)
 
         _validate_default_value(binding)
 
@@ -188,6 +194,7 @@ def _validate_default_value(binding: WorkflowBindingDraft) -> None:
     if binding.value_type in {
         BindingValueType.IMAGE_PATH,
         BindingValueType.VIDEO_PATH,
+        BindingValueType.AUDIO_PATH,
     } and not isinstance(value, str):
         raise ValueError(f"binding {binding.binding_id} default must be an image path")
     if binding.value_type == BindingValueType.INTEGER and (

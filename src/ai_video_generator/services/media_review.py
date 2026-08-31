@@ -44,6 +44,8 @@ def classify_automatic_rework(
         }
     ):
         return ReworkAction.CHANGE_SEED, "检测到瞬态伪影或运动异常，更换 seed 后重试"
+    if categories == {ReviewIssueCategory.OTHER} and issues:
+        return ReworkAction.RETRY, "Reviewer 报告了明确问题但分类不可识别，重新运行原 H3 任务"
     return None, "Reviewer 未提供足以确定自动返工方式的分类证据"
 
 

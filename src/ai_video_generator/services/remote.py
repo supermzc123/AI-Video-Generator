@@ -6,7 +6,7 @@ from enum import StrEnum
 
 from pydantic import Field, model_validator
 
-from ai_video_generator.domain import TaskSpec, WorkerCapabilities
+from ai_video_generator.domain import WorkerCapabilities
 from ai_video_generator.domain.chain import SHA256_PATTERN, FrozenModel
 
 
@@ -27,19 +27,6 @@ class WorkerHeartbeat(FrozenModel):
     sent_at: datetime
     running_task_ids: tuple[str, ...] = ()
     available_gpu_slots: int = Field(ge=0)
-
-
-class LeaseOffer(FrozenModel):
-    lease_id: str = Field(min_length=1)
-    task: TaskSpec
-    offered_at: datetime
-    expires_at: datetime
-
-    @model_validator(mode="after")
-    def validate_expiry(self) -> LeaseOffer:
-        if self.expires_at <= self.offered_at:
-            raise ValueError("lease expiry must be after offer time")
-        return self
 
 
 class ArtifactTransfer(FrozenModel):
@@ -83,14 +70,3 @@ class TaskResultReceipt(FrozenModel):
     task_id: str = Field(min_length=1)
     state: str = Field(min_length=1)
     accepted_at: datetime
-
-
-def worker_can_run(
-    capabilities: WorkerCapabilities,
-    *,
-    required_node_types: set[str],
-    required_model_sha256_values: set[str],
-) -> bool:
-    return required_node_types.issubset(capabilities.node_types) and (
-        required_model_sha256_values.issubset(capabilities.model_sha256_values)
-    )

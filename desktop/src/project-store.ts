@@ -37,6 +37,7 @@ export function newProject(): ProjectDraft {
     projectId: crypto.randomUUID(),
     revision: 1,
     name: "未命名项目",
+    highestInstruction: "",
     width: 1024,
     height: 608,
     fps: 24,
@@ -52,6 +53,7 @@ export function newProject(): ProjectDraft {
       aiTakeoverAt: null,
     },
     timeBudgetSeconds: null,
+    h3Loras: [],
     activeStage: "config",
     stageApprovals: {},
     idea: {
@@ -92,6 +94,7 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
   const rawPrompts = record(raw.prompts);
   const rawImagePrompts = Array.isArray(rawPrompts.imagePrompts) ? rawPrompts.imagePrompts : [];
   const rawH3Prompts = Array.isArray(rawPrompts.h3Prompts) ? rawPrompts.h3Prompts : [];
+  const rawH3Loras = Array.isArray(raw.h3Loras) ? raw.h3Loras : [];
   const idea = record(raw.idea);
   const concept = text(idea.concept);
   const conceptDocument = record(idea.conceptDocument);
@@ -108,7 +111,20 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
   const hydrated: ProjectDraft = {
     ...defaults,
     ...value,
-    activeStage: (value.activeStage as string) === "review" ? "generation" : value.activeStage ?? defaults.activeStage,
+    highestInstruction: text(raw.highestInstruction),
+    h3Loras: rawH3Loras.flatMap((value) => {
+      const lora = record(value);
+      const name = text(lora.name).trim();
+      if (!name) return [];
+      const parsedStrength = Number(lora.strength);
+      return [{
+        id: text(lora.id) || crypto.randomUUID(),
+        name,
+        strength: Number.isFinite(parsedStrength) ? Math.max(-4, Math.min(4, parsedStrength)) : 1,
+        enabled: lora.enabled !== false,
+      }];
+    }),
+    activeStage: value.activeStage ?? defaults.activeStage,
     idea: {
       ...defaults.idea,
       ...value.idea,
@@ -117,12 +133,7 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         nodes: hydratedConceptNodes.length ? hydratedConceptNodes : [{ type: "text" as const, text: concept }],
       },
     },
-    stageApprovals: {
-      ...value.stageApprovals,
-      ...((value.stageApprovals as Record<string, string> | undefined)?.review
-        ? { generation: (value.stageApprovals as Record<string, string>).review }
-        : {}),
-    },
+    stageApprovals: { ...value.stageApprovals },
     outline: rawOutline.map<ProjectDraft["outline"][number]>((item, index) => {
       const beat = record(item);
       return {
@@ -160,7 +171,7 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         ? text(asset.kind) as ProjectDraft["assets"][number]["kind"]
         : "character";
       const scope = text(asset.scope) === "shot" ? "shot" : "public";
-      const legacyAssetShotId = text(asset.shotId, asset.shot_id) || null;
+      const assetShotId = text(asset.shotId) || null;
       return {
         id: text(asset.id) || `asset-${crypto.randomUUID()}`,
         name: text(asset.name) || `素材 ${index + 1}`,
@@ -180,12 +191,10 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         byteSize: positiveNumber(asset.byteSize, asset.byte_size),
         kind,
         scope,
-        shotId: scope === "shot" ? legacyAssetShotId : null,
+        shotId: scope === "shot" ? assetShotId : null,
         shotIds: Array.isArray(asset.shotIds)
           ? asset.shotIds.map((value) => text(value)).filter(Boolean)
-          : Array.isArray(asset.shot_ids)
-            ? asset.shot_ids.map((value) => text(value)).filter(Boolean)
-            : legacyAssetShotId ? [legacyAssetShotId] : [],
+          : [],
         source: text(asset.source) === "generated" ? "generated" : "upload",
         status: ["ready", "missing_blob", "uploading", "failed"].includes(text(asset.status))
           ? text(asset.status) as ProjectDraft["assets"][number]["status"]
@@ -198,10 +207,10 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
       const kind = ["character", "scene", "prop", "style"].includes(text(plan.kind))
         ? text(plan.kind) as ProjectDraft["assetPlans"][number]["kind"] : "character";
       const scope = text(plan.scope) === "shot" ? "shot" : "public";
-      const legacyShotId = text(plan.shotId, plan.shot_id) || null;
+      const planShotId = text(plan.shotId) || null;
       const shotIds = Array.isArray(plan.shotIds)
         ? plan.shotIds.map((value) => text(value)).filter(Boolean)
-        : legacyShotId ? [legacyShotId] : [];
+        : [];
       const state = ["draft", "ready", "satisfied", "stale"].includes(text(plan.state))
         ? text(plan.state) as ProjectDraft["assetPlans"][number]["state"] : "draft";
       const [defaultWidth, defaultHeight] = defaultAssetResolution(kind);
@@ -209,12 +218,12 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         ? text(plan.resolutionSource, plan.resolution_source) as ProjectDraft["assetPlans"][number]["resolutionSource"]
         : "default";
       return {
-        id: text(plan.id, plan.plan_id) || `asset-plan-${crypto.randomUUID()}`,
+        id: text(plan.id) || `asset-plan-${crypto.randomUUID()}`,
         name: text(plan.name) || `素材需求 ${index + 1}`,
         description: text(plan.description),
         kind,
         scope,
-        shotId: scope === "shot" ? legacyShotId : null,
+        shotId: scope === "shot" ? planShotId : null,
         shotIds,
         fulfilledByAssetId: text(plan.fulfilledByAssetId, plan.fulfilled_by_asset_id) || null,
         state,
@@ -228,12 +237,12 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         const prompt = record(item);
         return {
           id: text(prompt.id) || `image-prompt-${crypto.randomUUID()}`,
-          assetPlanId: text(prompt.assetPlanId, prompt.asset_plan_id),
+          assetPlanId: text(prompt.assetPlanId),
           prompt: text(prompt.prompt),
-          endState: text(prompt.endState, prompt.end_state) || null,
+          endState: text(prompt.endState) || null,
           negativePrompt: text(prompt.negativePrompt, prompt.negative_prompt),
           workflowTemplateId: text(prompt.workflowTemplateId, prompt.workflow_template_id) || null,
-          harnessRevision: positiveNumber(prompt.harnessRevision, prompt.harness_revision),
+          harnessRevision: positiveNumber(prompt.harnessRevision),
           harnessManifestSha256: text(prompt.harnessManifestSha256, prompt.harness_manifest_sha256) || null,
           route: text(prompt.route) || null,
           assetRoles: Array.isArray(prompt.assetRoles) ? prompt.assetRoles as Array<Record<string, unknown>> : [],
@@ -252,20 +261,19 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
         const review = record(prompt.review);
         return {
           id: text(prompt.id) || `h3-prompt-${crypto.randomUUID()}`,
-          shotId: text(prompt.shotId, prompt.shot_id),
-          segmentId: text(prompt.segmentId, prompt.segment_id),
-          segmentIndex: Math.max(0, Math.floor(positiveNumber(prompt.segmentIndex, prompt.segment_index) ?? 0)),
-          durationSeconds: positiveNumber(prompt.durationSeconds, prompt.duration_seconds) ?? 1,
-          continuationOf: text(prompt.continuationOf, prompt.continuation_of) || null,
+          shotId: text(prompt.shotId),
+          segmentId: text(prompt.segmentId),
+          segmentIndex: Math.max(0, Math.floor(positiveNumber(prompt.segmentIndex) ?? 0)),
+          durationSeconds: positiveNumber(prompt.durationSeconds) ?? 1,
+          continuationOf: text(prompt.continuationOf) || null,
           inputMode: mode,
           prompt: text(prompt.prompt),
           endState: text(prompt.endState, prompt.end_state) || null,
           assetIds: Array.isArray(prompt.assetIds) ? prompt.assetIds.filter((id): id is string => typeof id === "string") : [],
           seed: typeof prompt.seed === "number" && prompt.seed >= 0 ? Math.floor(prompt.seed) : 0,
-          harnessRevision: positiveNumber(prompt.harnessRevision, prompt.harness_revision),
+          harnessRevision: positiveNumber(prompt.harnessRevision),
           locked: prompt.locked === true,
           revision: positiveNumber(prompt.revision) ?? 1,
-          legacy: prompt.legacy === true,
           review: {
             ready: review.ready === true,
             issues: Array.isArray(review.issues) ? review.issues.flatMap((issue) => {
@@ -294,34 +302,6 @@ export function hydrateProject(value: Partial<ProjectDraft>): ProjectDraft {
       },
     },
   };
-  if (!rawH3Prompts.length) {
-    hydrated.prompts.h3Prompts = rawShots.flatMap((item, shotIndex) => {
-      const shot = record(item);
-      const legacyPrompt = text(shot.h3Prompt, shot.prompt);
-      if (!legacyPrompt) return [];
-      const shotId = hydrated.shots[shotIndex]?.id ?? text(shot.id);
-      const duration = hydrated.shots[shotIndex]?.durationSeconds ?? 1;
-      const count = duration <= 15 ? 1 : Math.max(2, Math.ceil(duration / 12));
-      return Array.from({ length: count }, (_, segmentIndex) => ({
-        id: `legacy-h3-${crypto.randomUUID()}`,
-        shotId,
-        segmentId: `${shotId}-segment-${segmentIndex + 1}`,
-        segmentIndex,
-        durationSeconds: Math.round((Math.max(4, duration) / count) * 1000) / 1000,
-        continuationOf: segmentIndex ? `${shotId}-segment-${segmentIndex}` : null,
-        inputMode: "t2va" as const,
-        prompt: legacyPrompt,
-        endState: null,
-        assetIds: [],
-        seed: hydrated.shots[shotIndex]?.seed ?? 0,
-        harnessRevision: positiveNumber(shot.harnessRevision),
-        locked: hydrated.shots[shotIndex]?.locked ?? false,
-        revision: 1,
-        legacy: true,
-        review: { ready: false, issues: [{ severity: "warning" as const, code: "legacy_prompt", message: "旧版提示词需要通过 H3 Reviewer 重新校验" }], reviewedAt: null },
-      }));
-    });
-  }
   return hydrated;
 }
 

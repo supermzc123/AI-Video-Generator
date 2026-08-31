@@ -109,7 +109,11 @@ class HarnessRevision(FrozenModel):
     markdown: str = Field(min_length=1, max_length=200_000)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
-    content_sha256: str = Field(pattern=SHA256_PATTERN)
+    # Optional at the API boundary: the control plane computes the internal
+    # fingerprint when the revision is registered. Keeping the normalized
+    # field preserves historical task/audit references without making callers
+    # reproduce hashing or JSON canonicalization rules.
+    content_sha256: str = Field(default="0" * 64, pattern=SHA256_PATTERN)
     approval: ApprovalState = ApprovalState.DRAFT
     workflow_template_id: str | None = None
     workflow_revision: int | None = Field(default=None, ge=1)
@@ -225,6 +229,7 @@ class ProjectMemoryEvent(FrozenModel):
     source: DecisionSource
     role: str = Field(min_length=1, max_length=50)
     content: str = Field(min_length=1, max_length=1_000_000)
+    parent_event_id: str | None = Field(default=None, min_length=1)
     input_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     output_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     created_at: datetime
@@ -255,6 +260,7 @@ class BatchRunItem(FrozenModel):
     task_ids: tuple[str, ...] = ()
     start_boundary: str = Field(default="next_ready", min_length=1, max_length=100)
     priority: int = Field(default=0, ge=-100, le=100)
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchRun(FrozenModel):
@@ -265,6 +271,7 @@ class BatchRun(FrozenModel):
     items: tuple[BatchRunItem, ...] = Field(min_length=1)
     created_at: datetime
     updated_at: datetime
+    settings: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_members(self) -> BatchRun:

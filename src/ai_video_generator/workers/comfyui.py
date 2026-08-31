@@ -28,6 +28,7 @@ from .motion_director import (
 H3_NODE_PATTERN = re.compile(r"minimax|h3", re.IGNORECASE)
 H3_MODEL_PATTERN = re.compile(r"minimax|h3|qwen3vl", re.IGNORECASE)
 MODEL_DIRECTORIES = ("diffusion_models", "unet", "text_encoders", "clip", "vae", "loras")
+MODEL_FILE_SUFFIXES = {".safetensors", ".ckpt", ".pt", ".pth", ".bin"}
 
 
 class ComfyUIInventory(BaseModel):
@@ -180,6 +181,20 @@ class ComfyUIAdapter:
             unverified_h3_turbo_nodes=unverified_h3_turbo_nodes,
         )
 
+    def list_local_models(self, *directories: str) -> tuple[str, ...]:
+        if self.root is None:
+            return ()
+        models_root = self.root.expanduser() / "models"
+        matches: set[str] = set()
+        for directory in directories:
+            candidate = models_root / directory
+            if not candidate.is_dir():
+                continue
+            for path in candidate.rglob("*"):
+                if path.is_file() and path.suffix.casefold() in MODEL_FILE_SUFFIXES:
+                    matches.add(path.relative_to(candidate).as_posix())
+        return tuple(sorted(matches, key=str.casefold))
+
     async def capabilities(self) -> ComfyUICapabilities:
         inventory = self.inspect_local()
         warnings = _inventory_warnings(inventory)
@@ -317,6 +332,7 @@ class ComfyUIAdapter:
             number=payload.get("number"),
             node_errors=node_errors,
         )
+
     async def get_history(self, prompt_id: str) -> dict[str, Any] | None:
         if not prompt_id.strip():
             raise ValueError("prompt_id must not be empty")

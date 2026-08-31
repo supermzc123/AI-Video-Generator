@@ -18,6 +18,7 @@ class LLMRemoteConfig:
     api_key: str | None = None
     timeout_seconds: float = 30.0
     first_token_timeout_seconds: float | None = None
+    stream_idle_timeout_seconds: float = 600.0
     proxy: str | None = None
 
 
@@ -25,11 +26,10 @@ def remote_config(settings: Settings, *, model: str | None = None) -> LLMRemoteC
     return LLMRemoteConfig(
         base_url=settings.llm_base_url or "",
         model=model or settings.llm_model or "",
-        api_key=(
-            settings.llm_api_key.get_secret_value() if settings.llm_api_key else None
-        ),
+        api_key=(settings.llm_api_key.get_secret_value() if settings.llm_api_key else None),
         timeout_seconds=settings.llm_timeout_seconds,
         first_token_timeout_seconds=settings.llm_first_token_timeout_seconds,
+        stream_idle_timeout_seconds=settings.llm_stream_idle_timeout_seconds,
         proxy=settings.network_proxy,
     )
 
@@ -60,6 +60,7 @@ def _client(config: LLMRemoteConfig) -> OpenAICompatibleClient:
         api_key=config.api_key,
         timeout_seconds=config.timeout_seconds,
         first_token_timeout_seconds=config.first_token_timeout_seconds,
+        stream_idle_timeout_seconds=config.stream_idle_timeout_seconds,
         proxy=config.proxy,
     )
 
@@ -70,16 +71,12 @@ async def open_client(config: LLMRemoteConfig):
         yield client
 
 
-async def complete_text(
-    config: LLMRemoteConfig, messages: Sequence[ChatMessage]
-) -> str:
+async def complete_text(config: LLMRemoteConfig, messages: Sequence[ChatMessage]) -> str:
     async with _client(config) as client:
         return await client.complete_text(messages)
 
 
-async def complete_json(
-    config: LLMRemoteConfig, messages: Sequence[ChatMessage]
-) -> str:
+async def complete_json(config: LLMRemoteConfig, messages: Sequence[ChatMessage]) -> str:
     async with _client(config) as client:
         return await client.complete_json(messages)
 

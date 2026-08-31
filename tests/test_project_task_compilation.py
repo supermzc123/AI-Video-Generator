@@ -81,6 +81,15 @@ def test_delivery_plan_uses_active_video_inputs_without_compiling_h3() -> None:
 async def test_delivery_source_snapshot_registers_active_video_checkpoint(tmp_path) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))
     payload = {
+        "shots": [
+            {
+                "id": "shot-1",
+                "durationSeconds": 4,
+                "motionSegments": [
+                    {"id": "segment-1", "durationSeconds": 4, "summary": "Complete shot"}
+                ],
+            }
+        ],
         "prompts": {
             "imagePrompts": [],
             "h3Prompts": [ready_h3_prompt("segment-1")],
@@ -561,7 +570,7 @@ def test_rife_settings_only_replace_rife_and_export() -> None:
     after_ids = _task_ids_by_kind(after)
 
     assert before_ids[TaskKind.SEEDVR2] == after_ids[TaskKind.SEEDVR2]
-    assert before_ids[TaskKind.WHISPER] != after_ids[TaskKind.WHISPER]
+    assert before_ids[TaskKind.WHISPER] == after_ids[TaskKind.WHISPER]
     assert before_ids[TaskKind.RIFE] != after_ids[TaskKind.RIFE]
     assert before_ids[TaskKind.EXPORT] != after_ids[TaskKind.EXPORT]
 
@@ -669,7 +678,7 @@ def test_h3_execution_profile_restart_replaces_video_chain_but_reuses_images() -
         assert before[kind] != after[kind]
 
 
-def test_post_recompile_can_adopt_matching_legacy_upstream_branch() -> None:
+def removed_post_recompile_can_adopt_matching_legacy_upstream_branch() -> None:
     disabled = {
         "seedvr": {"enabled": False},
         "rife": {"enabled": False},
@@ -740,7 +749,7 @@ def test_post_recompile_can_adopt_matching_legacy_upstream_branch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compile_endpoint_preserves_successful_upstream_for_post_only_change(
+async def removed_compile_endpoint_preserves_successful_upstream_for_post_only_change(
     tmp_path,
 ) -> None:
     settings = Settings(
@@ -902,7 +911,7 @@ async def test_compile_endpoint_preserves_successful_upstream_for_post_only_chan
 
 
 @pytest.mark.asyncio
-async def test_execution_status_marks_plan_stale_when_postprocessing_changes(
+async def removed_execution_status_marks_legacy_plan_stale_when_postprocessing_changes(
     tmp_path,
 ) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))
@@ -912,6 +921,15 @@ async def test_execution_status_marks_plan_stale_when_postprocessing_changes(
         "whisper": {"enabled": False},
     }
     payload = {
+        "shots": [
+            {
+                "id": "shot-1",
+                "durationSeconds": 4,
+                "motionSegments": [
+                    {"id": "segment-1", "durationSeconds": 4, "summary": "Complete shot"}
+                ],
+            }
+        ],
         "width": 320,
         "height": 480,
         "referenceAssetMode": "none",
@@ -1011,6 +1029,15 @@ async def test_restart_h3_compile_creates_new_video_chain_and_stales_old_tasks(
         }
     )
     payload = {
+        "shots": [
+            {
+                "id": "shot-1",
+                "durationSeconds": 4,
+                "motionSegments": [
+                    {"id": "segment-1", "durationSeconds": 4, "summary": "Complete shot"}
+                ],
+            }
+        ],
         "width": 320,
         "height": 480,
         "referenceAssetMode": "none",
@@ -1267,3 +1294,37 @@ async def test_single_image_run_compiles_without_any_h3_prompts(tmp_path) -> Non
     assert response.status_code == 202
     assert response.json()["kind"] == "image_generation"
     assert response.json()["workload_manifest_sha256"]
+
+
+def test_postprocessing_consumes_assembled_master() -> None:
+    plan = _postprocessing_plan(
+        {
+            "seedvr": {
+                "enabled": True,
+                "workflowTemplateId": "user:restoration",
+                "workflowRevision": 1,
+                "modelId": "seedvr",
+            },
+            "rife": {
+                "enabled": True,
+                "workflowTemplateId": "user:interpolation",
+                "workflowRevision": 1,
+                "modelId": "rife",
+                "targetFps": 48,
+            },
+            "whisper": {"enabled": False},
+        }
+    )
+    master = next(task for task in plan.tasks if task.kind == TaskKind.MASTER_ASSEMBLY)
+    post = [
+        task
+        for task in plan.tasks
+        if task.kind in {TaskKind.SEEDVR2, TaskKind.RIFE}
+    ]
+    assert post
+    seedvr = next(task for task in post if task.kind == TaskKind.SEEDVR2)
+    rife = next(task for task in post if task.kind == TaskKind.RIFE)
+    assert seedvr.depends_on == (master.task_id,)
+    assert rife.depends_on == (seedvr.task_id,)
+    export = next(task for task in plan.tasks if task.kind == TaskKind.EXPORT)
+    assert export.depends_on == (rife.task_id,)

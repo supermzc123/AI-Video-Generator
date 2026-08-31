@@ -395,3 +395,81 @@ def test_dynamic_combo_and_matchtype_are_valid_workflow_contracts() -> None:
 
     assert inspection.compatible
     assert validate_workflow_template(template, info) == ()
+
+
+def test_workflow_normalizes_load_video_preview_metadata() -> None:
+    info = {
+        "LoadVideo": {
+            "input": {"required": {"file": ["COMBO", {"options": ["input.mp4"]}]}},
+            "output": ["VIDEO"],
+        },
+        "SaveVideo": {
+            "input": {"required": {"video": ["VIDEO"]}},
+            "output": [],
+            "output_node": True,
+        },
+    }
+    source = {
+        "73": {
+            "class_type": "LoadVideo",
+            "inputs": {"file": "input.mp4", "video-preview": ""},
+        },
+        "76": {"class_type": "SaveVideo", "inputs": {"video": ["73", 0]}},
+    }
+
+    inspection = inspect_api_workflow(source, info)
+
+    assert inspection.compatible
+    assert inspection.raw_workflow["73"]["inputs"] == {"file": "input.mp4"}
+
+
+def test_dynamic_combo_child_uses_the_selected_parent_branch() -> None:
+    codec_auto = [
+        "COMFY_DYNAMICCOMBO_V3",
+        {"options": [{"key": "auto", "inputs": {"required": {}}}]},
+    ]
+    codec_webm = [
+        "COMFY_DYNAMICCOMBO_V3",
+        {"options": [{"key": "av1", "inputs": {"required": {}}}]},
+    ]
+    info = {
+        "LoadVideo": {
+            "input": {"required": {"file": ["COMBO", {"options": ["input.mp4"]}]}},
+            "output": ["VIDEO"],
+        },
+        "SaveVideo": {
+            "input": {
+                "required": {
+                    "video": ["VIDEO"],
+                    "format": [
+                        "COMFY_DYNAMICCOMBO_V3",
+                        {
+                            "options": [
+                                {
+                                    "key": "auto",
+                                    "inputs": {"required": {"codec": codec_auto}},
+                                },
+                                {
+                                    "key": "webm",
+                                    "inputs": {"required": {"codec": codec_webm}},
+                                },
+                            ]
+                        },
+                    ],
+                }
+            },
+            "output": [],
+            "output_node": True,
+        },
+    }
+    source = {
+        "73": {"class_type": "LoadVideo", "inputs": {"file": "input.mp4"}},
+        "76": {
+            "class_type": "SaveVideo",
+            "inputs": {"video": ["73", 0], "format": "auto", "format.codec": "auto"},
+        },
+    }
+
+    inspection = inspect_api_workflow(source, info)
+
+    assert inspection.compatible

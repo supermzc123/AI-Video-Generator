@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, Field, TypeAdapter, field_validator, model_validator
+from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from .chain import SHA256_PATTERN, FrozenModel, GenerationMode
 from .project import AssetScope
@@ -316,11 +316,7 @@ class H3PromptRevision(FrozenModel):
     harness_id: str = Field(min_length=1, max_length=200)
     harness_revision: int = Field(ge=1)
     reference_asset_ids: tuple[str, ...] = ()
-    execution_prompt: str = Field(
-        min_length=1,
-        max_length=7000,
-        validation_alias=AliasChoices("execution_prompt", "execution_prompt_zh"),
-    )
+    execution_prompt: str = Field(min_length=1, max_length=7000)
     harness_manifest_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     route: str | None = Field(default=None, max_length=100)
     asset_role_ledger: tuple[dict[str, object], ...] = ()
@@ -339,18 +335,6 @@ class H3PromptRevision(FrozenModel):
         if self.generation_mode == GenerationMode.REF2VA and not self.reference_asset_ids:
             raise ValueError("Ref2VA prompts require at least one reference asset")
         return self
-
-    @property
-    def execution_prompt_zh(self) -> str:
-        """Read-only compatibility for callers using the legacy field name."""
-        return self.execution_prompt
-
-    def model_copy(self, *, update=None, deep: bool = False):
-        mapped = dict(update or {})
-        if "execution_prompt_zh" in mapped and "execution_prompt" not in mapped:
-            mapped["execution_prompt"] = mapped.pop("execution_prompt_zh")
-        return super().model_copy(update=mapped, deep=deep)
-
 
 class PromptSet(FrozenModel):
     schema_version: str = "1.0"

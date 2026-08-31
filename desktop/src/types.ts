@@ -148,7 +148,6 @@ export type H3PromptRevision = {
   stageTrace?: Array<{ stage: string; status: string; attempt?: number; findings?: string[] }>;
   locked: boolean;
   revision: number;
-  legacy: boolean;
   review: PromptReviewResult;
 };
 
@@ -224,6 +223,7 @@ export type ProjectDraft = {
   projectId: string;
   revision: number;
   name: string;
+  highestInstruction: string;
   width: number;
   height: number;
   fps: number;
@@ -239,6 +239,12 @@ export type ProjectDraft = {
     aiTakeoverAt: string | null;
   };
   timeBudgetSeconds: number | null;
+  h3Loras: Array<{
+    id: string;
+    name: string;
+    strength: number;
+    enabled: boolean;
+  }>;
   activeStage: PipelineStageId;
   stageApprovals: Partial<Record<PipelineStageId, string>>;
   idea: {
@@ -280,6 +286,7 @@ export type ProjectMemoryEvent = {
   source: "user" | "project_agent" | "subagent" | "system";
   role: string;
   content: string;
+  parent_event_id: string | null;
   input_sha256: string | null;
   output_sha256: string | null;
   created_at: string;
@@ -366,9 +373,21 @@ export type BatchRun = {
     task_ids: string[];
     start_boundary: string;
     priority: number;
+    settings?: BatchSettings;
   }>;
   created_at: string;
   updated_at: string;
+  settings?: BatchSettings;
+};
+
+export type BatchSettings = {
+  imageWorkflowId?: string | null;
+  seedvrEnabled?: boolean;
+  seedvrWorkflowId?: string | null;
+  seedvrUpscaleFactor?: number | null;
+  rifeEnabled?: boolean;
+  rifeWorkflowId?: string | null;
+  rifeTargetFps?: 48 | 60 | 120 | null;
 };
 
 export type HarnessBundle = {
@@ -442,7 +461,7 @@ export type Binding = {
   nodeId: string;
   inputName: string;
   title: string;
-  valueType: "string" | "integer" | "number" | "image_path" | "video_path";
+  valueType: "string" | "integer" | "number" | "image_path" | "video_path" | "audio_path";
 };
 
 export type WorkflowBindingSemantic =
@@ -455,18 +474,25 @@ export type WorkflowBindingSemantic =
   | "seed"
   | "batch_size"
   | "reference_image"
+  | "reference_video"
+  | "reference_audio"
   | "source_video"
   | "model"
   | "interpolation_factor"
   | "upscale_factor"
-  | "language";
+  | "language"
+  | "frame_count"
+  | "conditioning_fingerprint"
+  | "output_prefix"
+  | "motion_context_input"
+  | "motion_context_output_prefix";
 
 export type WorkflowDraft = {
   fileName: string;
   nodes: ApiWorkflow;
   bindings: Binding[];
   outputNodeId: string | null;
-  kind?: "image" | "interpolation" | "restoration" | "transcription";
+  kind?: "image" | "interpolation" | "restoration" | "transcription" | "h3_conditioning" | "h3_diffusion";
   inspection?: BackendInspection;
 };
 
@@ -491,7 +517,7 @@ export type BackendInspection = {
   node_schema_sha256: string;
   raw_workflow: ApiWorkflow;
   bindings: BackendBinding[];
-  outputs: Array<{ output_id: string; node_id: string; output_type: "image"; title: string }>;
+  outputs: Array<{ output_id: string; node_id: string; output_type: "image" | "video" | "subtitle" | "conditioning"; title: string }>;
   required_node_types: string[];
   unknown_node_types: string[];
   issues: string[];
@@ -504,7 +530,7 @@ export type WorkflowTemplateSummary = {
   name: string;
   approval: "draft" | "needs_confirmation" | "approved" | "rejected";
   built_in?: boolean;
-  kind?: "image" | "interpolation" | "restoration" | "transcription";
+  kind?: "image" | "interpolation" | "restoration" | "transcription" | "h3_conditioning" | "h3_diffusion";
 };
 
 export type ProjectExecutionStatus = {

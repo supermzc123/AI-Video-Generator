@@ -336,9 +336,14 @@ async def test_running_local_task_cancels_comfyui_before_database_transition(tmp
 
 def test_harness_revisions_are_versioned_and_immutable(tmp_path) -> None:
     store = SQLiteTaskStore(tmp_path / "harness.db")
-    store.put_harness_bundle(
+    bundle = store.put_harness_bundle(
         HarnessBundle(harness_id="image:test", name="Test", purpose="image_prompting")
     )
+    refreshed = store.put_harness_bundle(
+        bundle.model_copy(update={"name": "Updated", "workflow_template_id": "image-v2"})
+    )
+    assert refreshed.name == "Updated"
+    assert store.list_harness_bundles()[0].workflow_template_id == "image-v2"
     markdown = "Write an image prompt for {{prompt}}."
     payload = {
         "markdown": markdown,

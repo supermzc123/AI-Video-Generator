@@ -12,6 +12,8 @@ from ai_video_generator.domain import (
     TaskState,
 )
 from ai_video_generator.persistence import SQLiteTaskStore
+from ai_video_generator.services.generation_batches import canonical_motion_context_chain
+from ai_video_generator.services.h3_loras import diffusion_affinity
 
 
 @dataclass(frozen=True)
@@ -31,24 +33,32 @@ def append_delivery_tasks(
     builder independent from generation makes delivery-only compilation safe.
     """
     post = payload.get("postProcessing") if isinstance(payload.get("postProcessing"), dict) else {}
-    outputs = dict(segment_outputs)
+    # Assemble the generated segments first. Post-processing operates on the
+    # single ordered master, never on individual BFS-produced segments.
+    master_task = add(
+        TaskKind.MASTER_ASSEMBLY,
+        "ffmpeg-master",
+        depends_on=tuple(segment_outputs.values()),
+        inputs={"fps": payload.get("fps")},
+        affinity="ffmpeg",
+        max_attempts=2,
+    )
+    post_video_source = master_task
     if isinstance(post.get("seedvr"), dict) and post["seedvr"].get("enabled") is True:
         config = post["seedvr"]
         workflow_id = config.get("workflowTemplateId")
         workflow_revision = config.get("workflowRevision")
         if not workflow_id or not workflow_revision:
             blockers.append("视频修复已启用，但尚未选择用户工作流")
-        for segment_id, dependency in tuple(outputs.items()):
-            outputs[segment_id] = add(
-                TaskKind.SEEDVR2,
-                f"seedvr2:{segment_id}",
-                depends_on=(dependency,),
-                inputs={**config, "segment_id": segment_id},
-                affinity=(
-                    f"postprocess:{workflow_id or 'restoration'}:"
-                    f"{config.get('modelId') or 'unselected'}"
-                ),
-            )
+        seedvr_task = add(
+            TaskKind.SEEDVR2,
+            "seedvr2:master",
+            depends_on=(master_task,),
+            inputs={**config, "segment_id": "master"},
+            affinity=(f"postprocess:{workflow_id or 'restoration'}:"
+                      f"{config.get('modelId') or 'unselected'}"),
+        )
+        post_video_source = seedvr_task
     if isinstance(post.get("rife"), dict) and post["rife"].get("enabled") is True:
         config = post["rife"]
         target_fps = config.get("targetFps")
@@ -58,30 +68,15 @@ def append_delivery_tasks(
             blockers.append("插帧已启用，但尚未选择用户工作流")
         if target_fps not in {48, 60, 120}:
             blockers.append("插帧目标帧率必须为 48、60 或 120 fps")
-        for segment_id, dependency in tuple(outputs.items()):
-            outputs[segment_id] = add(
-                TaskKind.RIFE,
-                f"interpolation:{segment_id}",
-                depends_on=(dependency,),
-                inputs={**config, "segment_id": segment_id, "source_fps": payload.get("fps")},
-                affinity=(
-                    f"postprocess:{workflow_id or 'interpolation'}:"
-                    f"{config.get('modelId') or 'unselected'}"
-                ),
-            )
-    master_task = add(
-        TaskKind.MASTER_ASSEMBLY,
-        "ffmpeg-master",
-        depends_on=tuple(outputs.values()),
-        inputs={
-            "fps": post.get("rife", {}).get("targetFps")
-            if isinstance(post.get("rife"), dict) and post["rife"].get("enabled") is True
-            else payload.get("fps"),
-        },
-        affinity="ffmpeg",
-        max_attempts=2,
-    )
-    export_dependencies = [master_task]
+        post_video_source = add(
+            TaskKind.RIFE,
+            "interpolation:master",
+            depends_on=(post_video_source,),
+            inputs={**config, "segment_id": "master", "source_fps": payload.get("fps")},
+            affinity=(f"postprocess:{workflow_id or 'interpolation'}:"
+                      f"{config.get('modelId') or 'unselected'}"),
+        )
+    export_dependencies = [post_video_source]
     if isinstance(post.get("whisper"), dict) and post["whisper"].get("enabled") is True:
         config = post["whisper"]
         workflow_id = config.get("workflowTemplateId")
@@ -122,7 +117,6 @@ def compile_project_task_plan(
     approved_image_workflows: set[str],
     approved_image_harnesses: dict[str, int],
     h3_execution_profile: dict[str, Any] | None = None,
-    reusable_tasks: dict[str, TaskSpec] | None = None,
 ) -> ProjectTaskPlan:
     """Compile the approved prompt set into a deterministic persisted DAG.
 
@@ -170,6 +164,20 @@ def compile_project_task_plan(
             valid_h3.append({key: value for key, value in prompt.items() if key != "review"})
     if not valid_h3:
         blockers.append("至少需要一个非空 H3 片段提示词")
+    valid_h3 = list(canonical_motion_context_chain(valid_h3))
+
+    # Asset ids are stable across revisions. Include the active blob identity
+    # in the plan input so accepting a replacement image cannot reuse a task
+    # manifest that was compiled with the previous bytes.
+    workspace_assets = payload.get("assets") if isinstance(payload.get("assets"), list) else []
+    asset_inputs = {
+        str(asset.get("id")): {
+            "sha256": str(asset.get("sha256") or ""),
+            "revision": asset.get("revision"),
+        }
+        for asset in workspace_assets
+        if isinstance(asset, dict) and asset.get("id")
+    }
 
     canonical = json.dumps(
         {
@@ -177,6 +185,7 @@ def compile_project_task_plan(
             "reference_asset_mode": payload.get("referenceAssetMode", "planned"),
             "image_prompts": valid_images,
             "h3_prompts": valid_h3,
+            "asset_inputs": asset_inputs,
             "h3_execution_profile": h3_execution_profile or {},
             # AI takeover after a human-review timeout changes dispatch behavior,
             # not the structure or identity of the already compiled DAG.
@@ -192,8 +201,6 @@ def compile_project_task_plan(
         return ProjectTaskPlan(fingerprint=fingerprint, tasks=(), blockers=tuple(blockers))
 
     tasks: list[TaskSpec] = []
-    reusable_tasks = reusable_tasks or {}
-
     def canonical_bytes(value: Any) -> bytes:
         return json.dumps(
             value,
@@ -212,17 +219,6 @@ def compile_project_task_plan(
         max_attempts: int = 3,
         priority: int = 0,
     ) -> str:
-        legacy_identity = hashlib.sha256(f"{kind.value}:{label}".encode()).hexdigest()[:16]
-        reusable = reusable_tasks.get(f"{kind.value}:{legacy_identity}")
-        if (
-            reusable is not None
-            and reusable.project_id == project_id
-            and reusable.kind == kind
-            and reusable.depends_on == depends_on
-            and reusable.state not in {TaskState.CANCELLED, TaskState.STALE}
-        ):
-            tasks.append(reusable)
-            return reusable.task_id
         # A task is identified only by its own inputs and its effective upstream
         # tasks. Project-wide options must not invalidate unrelated completed work.
         task_input = canonical_bytes(
@@ -287,6 +283,7 @@ def compile_project_task_plan(
         )
 
     switch_dependencies = tuple(encode_tasks.values())
+    h3_affinity = diffusion_affinity(h3_execution_profile)
     switch_task = add(
         TaskKind.MODEL_SWITCH,
         "conditioning-to-h3-diffusion",
@@ -295,7 +292,7 @@ def compile_project_task_plan(
             "target": "h3-diffusion",
             "h3_execution_profile": h3_execution_profile or {},
         },
-        affinity="h3:diffusion",
+        affinity=h3_affinity,
         max_attempts=2,
     )
     h3_tasks: dict[str, str] = {}
@@ -315,7 +312,7 @@ def compile_project_task_plan(
                 "height": payload.get("height"),
                 "h3_execution_profile": h3_execution_profile or {},
             },
-            affinity="h3:diffusion",
+            affinity=h3_affinity,
             priority=100 - min(99, int(prompt.get("segmentIndex") or 0) * 10 + stable_index),
         )
 
@@ -345,10 +342,8 @@ def compile_delivery_task_plan(
     project_id: str,
     payload: dict[str, Any],
     segment_outputs: dict[str, str],
-    reusable_tasks: dict[str, TaskSpec] | None = None,
 ) -> ProjectTaskPlan:
     """Compile only delivery tasks from an already active video chain."""
-    reusable_tasks = reusable_tasks or {}
     canonical = json.dumps(
         {
             "project_id": project_id,
@@ -386,14 +381,6 @@ def compile_delivery_task_plan(
         ).encode()
         input_fingerprint = hashlib.sha256(task_input).hexdigest()
         task_id = f"delivery:{project_id}:{kind.value}:{input_fingerprint[:16]}"
-        reusable = reusable_tasks.get(task_id)
-        if (
-            reusable
-            and reusable.state not in {TaskState.CANCELLED, TaskState.STALE}
-            and reusable.depends_on == depends_on
-        ):
-            tasks.append(reusable)
-            return reusable.task_id
         tasks.append(
             TaskSpec(
                 task_id=task_id,

@@ -27,11 +27,18 @@ class BindingSemantic(StrEnum):
     SEED = "seed"
     BATCH_SIZE = "batch_size"
     REFERENCE_IMAGE = "reference_image"
+    REFERENCE_VIDEO = "reference_video"
+    REFERENCE_AUDIO = "reference_audio"
     SOURCE_VIDEO = "source_video"
     MODEL = "model"
     INTERPOLATION_FACTOR = "interpolation_factor"
     UPSCALE_FACTOR = "upscale_factor"
     LANGUAGE = "language"
+    FRAME_COUNT = "frame_count"
+    CONDITIONING_FINGERPRINT = "conditioning_fingerprint"
+    OUTPUT_PREFIX = "output_prefix"
+    MOTION_CONTEXT_INPUT = "motion_context_input"
+    MOTION_CONTEXT_OUTPUT_PREFIX = "motion_context_output_prefix"
 
 
 class BindingValueType(StrEnum):
@@ -40,12 +47,14 @@ class BindingValueType(StrEnum):
     NUMBER = "number"
     IMAGE_PATH = "image_path"
     VIDEO_PATH = "video_path"
+    AUDIO_PATH = "audio_path"
 
 
 class WorkflowOutputType(StrEnum):
     IMAGE = "image"
     VIDEO = "video"
     SUBTITLE = "subtitle"
+    CONDITIONING = "conditioning"
 
 
 class WorkflowBinding(FrozenModel):
@@ -73,11 +82,18 @@ class WorkflowBinding(FrozenModel):
             BindingSemantic.SEED: BindingValueType.INTEGER,
             BindingSemantic.BATCH_SIZE: BindingValueType.INTEGER,
             BindingSemantic.REFERENCE_IMAGE: BindingValueType.IMAGE_PATH,
+            BindingSemantic.REFERENCE_VIDEO: BindingValueType.VIDEO_PATH,
+            BindingSemantic.REFERENCE_AUDIO: BindingValueType.AUDIO_PATH,
             BindingSemantic.SOURCE_VIDEO: BindingValueType.VIDEO_PATH,
             BindingSemantic.MODEL: BindingValueType.STRING,
             BindingSemantic.INTERPOLATION_FACTOR: BindingValueType.NUMBER,
             BindingSemantic.UPSCALE_FACTOR: BindingValueType.NUMBER,
             BindingSemantic.LANGUAGE: BindingValueType.STRING,
+            BindingSemantic.FRAME_COUNT: BindingValueType.INTEGER,
+            BindingSemantic.CONDITIONING_FINGERPRINT: BindingValueType.STRING,
+            BindingSemantic.OUTPUT_PREFIX: BindingValueType.STRING,
+            BindingSemantic.MOTION_CONTEXT_INPUT: BindingValueType.STRING,
+            BindingSemantic.MOTION_CONTEXT_OUTPUT_PREFIX: BindingValueType.STRING,
         }
         if self.value_type != expected_types[self.semantic]:
             required_type = expected_types[self.semantic].value
@@ -86,10 +102,15 @@ class WorkflowBinding(FrozenModel):
             raise ValueError("string_template is only valid for string bindings")
         if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
             raise ValueError("binding minimum must not exceed maximum")
-        if self.semantic == BindingSemantic.REFERENCE_IMAGE and self.reference_index is None:
-            raise ValueError("reference image bindings require reference_index")
-        if self.semantic != BindingSemantic.REFERENCE_IMAGE and self.reference_index is not None:
-            raise ValueError("reference_index is only valid for reference image bindings")
+        indexed_references = {
+            BindingSemantic.REFERENCE_IMAGE,
+            BindingSemantic.REFERENCE_VIDEO,
+            BindingSemantic.REFERENCE_AUDIO,
+        }
+        if self.semantic in indexed_references and self.reference_index is None:
+            raise ValueError("reference media bindings require reference_index")
+        if self.semantic not in indexed_references and self.reference_index is not None:
+            raise ValueError("reference_index is only valid for reference media bindings")
         return self
 
 
@@ -111,7 +132,8 @@ class WorkflowTemplate(FrozenModel):
     revision: int = Field(default=1, ge=1)
     name: str = Field(min_length=1, max_length=200)
     kind: str = Field(
-        default="image", pattern="^(image|interpolation|restoration|transcription)$"
+        default="image",
+        pattern="^(image|interpolation|restoration|transcription|h3_conditioning|h3_diffusion)$",
     )
     workflow_sha256: str = Field(pattern=SHA256_PATTERN)
     node_schema_sha256: str = Field(pattern=SHA256_PATTERN)

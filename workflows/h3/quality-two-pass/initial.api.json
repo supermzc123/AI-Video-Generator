@@ -1,0 +1,170 @@
+{
+  "load-static": {
+    "class_type": "AVGLoadH3StaticConditioning",
+    "inputs": {"fingerprint": "REPLACE_AT_COMPILE_TIME"},
+    "_meta": {"title": "API INPUT: cached H3 conditioning and base AV latent"}
+  },
+  "load-model": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "DasiwaMinimaxH3_dasiwaHybrid8turboV1.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {"title": "API INPUT: tuned H3 diffusion model"}
+  },
+  "fp16-accumulation": {
+    "class_type": "ModelPatchTorchSettings",
+    "inputs": {
+      "model": ["load-model", 0],
+      "enable_fp16_accumulation": true
+    },
+    "_meta": {"title": "FP16 accumulation"}
+  },
+  "sigma-shift": {
+    "class_type": "MiniMaxH3SigmaShift",
+    "inputs": {
+      "model": ["fp16-accumulation", 0],
+      "shift_video": 12.0,
+      "shift_audio": 3.0
+    },
+    "_meta": {"title": "Independent video and audio sigma shift"}
+  },
+  "attention": {
+    "class_type": "ModelAttentionBackend",
+    "inputs": {
+      "model": ["sigma-shift", 0],
+      "attention": "comfy kitchen attention"
+    },
+    "_meta": {"title": "Native Comfy Kitchen attention"}
+  },
+  "guider": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": ["attention", 0],
+      "conditioning": ["load-static", 0]
+    }
+  },
+  "sampler": {
+    "class_type": "KSamplerSelect",
+    "inputs": {"sampler_name": "euler"}
+  },
+  "first-schedule": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": ["attention", 0],
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1.0
+    }
+  },
+  "first-noise": {
+    "class_type": "RandomNoise",
+    "inputs": {"noise_seed": 12},
+    "_meta": {"title": "API INPUT: generation seed"}
+  },
+  "first-pass": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["first-noise", 0],
+      "guider": ["guider", 0],
+      "sampler": ["sampler", 0],
+      "sigmas": ["first-schedule", 0],
+      "latent_image": ["load-static", 1]
+    },
+    "_meta": {"title": "Pass 1: composition and motion"}
+  },
+  "separate-av": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {"av_latent": ["first-pass", 0]}
+  },
+  "learned-video-upscale": {
+    "class_type": "MinimaxH3LatentUpscaler3D",
+    "inputs": {
+      "latent": ["separate-av", 0],
+      "model_name": "minimax_h3_latent_upscaler_3d_bf16.safetensors",
+      "mode": "scale by multiplier",
+      "mode.scale": 1.5,
+      "align": 32,
+      "enable_chunking": true,
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    "_meta": {"title": "Learned 3D latent upscale, video only"}
+  },
+  "merge-av": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": ["learned-video-upscale", 0],
+      "audio_latent": ["separate-av", 1]
+    }
+  },
+  "refine-schedule": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": ["attention", 0],
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 0.35
+    }
+  },
+  "refine-noise": {
+    "class_type": "RandomNoise",
+    "inputs": {"noise_seed": 13},
+    "_meta": {"title": "API INPUT: refinement seed"}
+  },
+  "refine-pass": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["refine-noise", 0],
+      "guider": ["guider", 0],
+      "sampler": ["sampler", 0],
+      "sigmas": ["refine-schedule", 0],
+      "latent_image": ["merge-av", 0]
+    },
+    "_meta": {"title": "Pass 2: low-denoise high-resolution refinement"}
+  },
+  "load-video-vae": {
+    "class_type": "VAELoader",
+    "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}
+  },
+  "load-audio-vae": {
+    "class_type": "VAELoader",
+    "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}
+  },
+  "decode-video": {
+    "class_type": "VAEDecode",
+    "inputs": {"samples": ["refine-pass", 0], "vae": ["load-video-vae", 0]}
+  },
+  "decode-audio": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {"samples": ["refine-pass", 0], "vae": ["load-audio-vae", 0]}
+  },
+  "create-video": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["decode-video", 0],
+      "audio": ["decode-audio", 0],
+      "fps": 24.0,
+      "bit_depth": 8
+    }
+  },
+  "save-motion-context": {
+    "class_type": "MiniMaxH3MotionContextSaveLatent",
+    "inputs": {
+      "latent": ["refine-pass", 0],
+      "filename_prefix": "REPLACE_AT_COMPILE_TIME",
+      "clip_index": 1
+    },
+    "_meta": {"title": "API OUTPUT: final refined AV latent"}
+  },
+  "save-video": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["create-video", 0],
+      "filename_prefix": "REPLACE_AT_COMPILE_TIME",
+      "format": "auto",
+      "codec": "auto"
+    },
+    "_meta": {"title": "API OUTPUT: refined H3 video"}
+  }
+}

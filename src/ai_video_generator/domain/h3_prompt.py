@@ -93,6 +93,7 @@ class H3PromptRequest(FrozenModel):
     assets: tuple[H3AssetInput, ...] = ()
     shot_strategy: H3ShotStrategy = H3ShotStrategy.AUTO
     project_memory: str = ""
+    highest_instruction: str = ""
     constraints: tuple[str, ...] = ()
     creative: H3CreativeBrief | None = None
     prior_continuity_state: str | None = None

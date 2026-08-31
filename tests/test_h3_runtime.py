@@ -25,6 +25,8 @@ def test_controlled_h3_runtime_compiles_static_and_diffusion_manifests() -> None
     assert encode.context["conditioning_fingerprint"] == diffusion.context[
         "conditioning_fingerprint"
     ]
+    assert encode.context["prompt_text"] == "完整中文 H3 提示词"
+    assert diffusion.context["prompt_text"] == "完整中文 H3 提示词"
     assert diffusion.prompt["127"]["inputs"]["unet_name"] == settings.h3_diffusion_model
     assert diffusion.prompt["124"]["inputs"]["steps"] == settings.h3_steps
 
@@ -113,9 +115,46 @@ def test_standard_profile_removes_turbo_nodes_and_uses_stock_sampler() -> None:
     )
 
     assert "134" not in diffusion.prompt
+    assert "136" not in diffusion.prompt
     assert diffusion.prompt["135"]["class_type"] == "KSamplerSelect"
     assert diffusion.prompt["135"]["inputs"]["sampler_name"] == "euler"
     assert diffusion.prompt["124"]["inputs"]["steps"] == 20
+
+
+def test_project_loras_are_applied_in_order_after_turbo() -> None:
+    settings = Settings(
+        _env_file=None, h3_turbo_enabled=True, h3_sage_attention_enabled=True
+    )
+    _encode, diffusion = compile_h3_segment_manifests(
+        settings=settings,
+        project_id="project",
+        prompt={
+            "segmentId": "segment-1",
+            "durationSeconds": 4,
+            "prompt": "A cinematic shot",
+            "seed": 42,
+            "assetIds": [],
+            "continuationOf": None,
+        },
+        width=352,
+        height=640,
+        asset_blobs=(),
+        node_schema_sha256="1" * 64,
+        project_loras=(
+            {"name": "character.safetensors", "strength": 0.8},
+            {"name": "style.safetensors", "strength": 1.2},
+        ),
+    )
+
+    first = diffusion.prompt["avg-project-lora-000"]
+    second = diffusion.prompt["avg-project-lora-001"]
+    assert first["inputs"]["model"] == ["134", 0]
+    assert first["inputs"]["lora_name"] == "character.safetensors"
+    assert second["inputs"]["model"] == ["avg-project-lora-000", 0]
+    assert diffusion.prompt["136"]["inputs"]["model"] == ["avg-project-lora-001", 0]
+    assert diffusion.prompt["136"]["class_type"] == "ModelAttentionBackend"
+    assert diffusion.prompt["136"]["inputs"]["attention"] == "comfy kitchen attention"
+    assert "character.safetensors" in diffusion.context["project_loras"]
 
 
 def test_continuation_reserves_motion_context_inside_sample_budget() -> None:

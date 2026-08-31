@@ -11,15 +11,15 @@ from ai_video_generator.domain import (
     H3InputTarget,
     H3TurboProfile,
     H3WorkflowProfile,
-    WorkflowApproval,
 )
 
 from .h3_policy import (
+    ATTENTION_BACKEND_NODE_TYPE,
+    ATTENTION_BACKEND_PYTHON_MODULE,
+    KITCHEN_ATTENTION_VALUE,
     OFFICIAL_H3_TURBO_MODULES,
     OFFICIAL_H3_TURBO_REPOSITORY,
     PINNED_H3_TURBO_COMMIT,
-    SAGE_NODE_TYPE,
-    SAGE_PYTHON_MODULE,
     TURBO_LORA_NODE_TYPE,
     TURBO_SAMPLER_NODE_TYPE,
     TURBO_SCHEDULER_NODE_TYPE,
@@ -61,18 +61,33 @@ def inspect_h3_workflow_profile(
         if "teacache" in node_type.casefold():
             issues.append(f"TeaCache node {node_id} is not supported for MiniMax H3")
 
-    if profile.attention == H3AttentionMode.SAGE:
+    if profile.attention in {H3AttentionMode.KITCHEN, H3AttentionMode.SAGE}:
         node_id = profile.sage_attention_node_id or ""
-        if node_types.get(node_id) != SAGE_NODE_TYPE:
+        if node_types.get(node_id) != ATTENTION_BACKEND_NODE_TYPE:
             issues.append(
-                "SageAttention binding must reference "
-                f"{SAGE_NODE_TYPE}, got {node_types.get(node_id, 'missing node')}"
+                "Kitchen Attention binding must reference "
+                f"{ATTENTION_BACKEND_NODE_TYPE}, got {node_types.get(node_id, 'missing node')}"
             )
         else:
-            sage_schema = object_info.get(SAGE_NODE_TYPE, {})
-            if sage_schema.get("python_module") != SAGE_PYTHON_MODULE:
-                issues.append("SageAttention node must come from ComfyUI-KJNodes")
-            warnings.append("The KJNodes MiniMax H3 SageAttention patch is experimental")
+            backend_schema = object_info.get(ATTENTION_BACKEND_NODE_TYPE, {})
+            if backend_schema.get("python_module") != ATTENTION_BACKEND_PYTHON_MODULE:
+                issues.append("Kitchen Attention must use the native ComfyUI backend node")
+            attention_definition = (
+                backend_schema.get("input", {}).get("required", {}).get("attention")
+            )
+            attention_choices = (
+                attention_definition[0]
+                if isinstance(attention_definition, list)
+                and attention_definition
+                and isinstance(attention_definition[0], list)
+                else []
+            )
+            if KITCHEN_ATTENTION_VALUE not in attention_choices:
+                issues.append("Installed ComfyUI does not expose the Kitchen Attention backend")
+            if workflow[node_id]["inputs"].get("attention") != KITCHEN_ATTENTION_VALUE:
+                issues.append(
+                    f"ModelAttentionBackend attention must be {KITCHEN_ATTENTION_VALUE}"
+                )
 
     if profile.acceleration == H3AccelerationMode.TURBO and profile.turbo:
         _validate_turbo(
@@ -109,35 +124,6 @@ def compile_h3_workflow(profile: H3WorkflowProfile) -> dict[str, dict[str, Any]]
     if turbo.scheduler_name_target:
         _set_target(compiled, turbo.scheduler_name_target, "simple")
     return compiled
-
-
-def build_h3_profile(
-    *,
-    profile_id: str,
-    name: str,
-    raw_workflow: dict[str, Any],
-    object_info: dict[str, Any],
-    acceleration: H3AccelerationMode = H3AccelerationMode.STANDARD,
-    attention: H3AttentionMode = H3AttentionMode.NATIVE,
-    turbo: H3TurboProfile | None = None,
-    sage_attention_node_id: str | None = None,
-    approval: WorkflowApproval = WorkflowApproval.DRAFT,
-    revision: int = 1,
-) -> H3WorkflowProfile:
-    workflow = parse_api_workflow(raw_workflow)
-    return H3WorkflowProfile(
-        profile_id=profile_id,
-        revision=revision,
-        name=name,
-        approval=approval,
-        workflow_sha256=canonical_json_sha256(workflow),
-        node_schema_sha256=canonical_json_sha256(object_info),
-        raw_workflow=workflow,
-        acceleration=acceleration,
-        attention=attention,
-        turbo=turbo,
-        sage_attention_node_id=sage_attention_node_id,
-    )
 
 
 def _validate_turbo(
@@ -188,10 +174,16 @@ def _inspect_h3_structure(
         if "teacache" in node_type.casefold():
             issues.append(f"TeaCache node {node_id} is not supported for MiniMax H3")
 
-    if profile.attention == H3AttentionMode.SAGE:
+    if profile.attention in {H3AttentionMode.KITCHEN, H3AttentionMode.SAGE}:
         node_id = profile.sage_attention_node_id or ""
-        if node_types.get(node_id) != SAGE_NODE_TYPE:
-            issues.append(f"SageAttention binding must reference {SAGE_NODE_TYPE}")
+        if node_types.get(node_id) != ATTENTION_BACKEND_NODE_TYPE:
+            issues.append(
+                f"Kitchen Attention binding must reference {ATTENTION_BACKEND_NODE_TYPE}"
+            )
+        elif workflow[node_id]["inputs"].get("attention") != KITCHEN_ATTENTION_VALUE:
+            issues.append(
+                f"ModelAttentionBackend attention must be {KITCHEN_ATTENTION_VALUE}"
+            )
 
     if profile.acceleration == H3AccelerationMode.TURBO and profile.turbo:
         turbo_issues, turbo_warnings = _inspect_turbo_structure(

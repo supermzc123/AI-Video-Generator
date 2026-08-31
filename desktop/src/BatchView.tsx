@@ -2,10 +2,11 @@ import { CircleAlert, ListFilter, Pause, Play, RefreshCw, Search, Square } from 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { cancelBatchProject, createBatch, getProjectRunState, listBatches, listTasks, transitionBatch } from "./api";
 import type { BackendProjectSpec } from "./api";
-import type { BatchRun, ProjectDraft, TaskSpec } from "./types";
+import type { BatchRun, BatchSettings, ProjectDraft, TaskSpec } from "./types";
 
-type Props = { project: ProjectDraft; projects: BackendProjectSpec[] };
-type Selection = { startBoundary: string; priority: number };
+type WorkflowChoice = { id: string; name: string; revision: number; kind?: string };
+type Props = { project: ProjectDraft; projects: BackendProjectSpec[]; workflows?: WorkflowChoice[] };
+type Selection = { startBoundary: string; priority: number; settings: BatchSettings };
 type BatchFilter = "active" | "history" | "all";
 
 const boundaryOptions = [
@@ -23,7 +24,7 @@ const taskStateLabels: Record<string, string> = {
   needs_review: "待审核", succeeded: "成功", failed: "失败", cancelled: "取消", stale: "已失效",
 };
 
-export function BatchView({ project, projects }: Props) {
+export function BatchView({ project, projects, workflows = [] }: Props) {
   const [tasks, setTasks] = useState<TaskSpec[]>([]);
   const [batches, setBatches] = useState<BatchRun[]>([]);
   const [selected, setSelected] = useState<Map<string, Selection>>(new Map());
@@ -35,6 +36,7 @@ export function BatchView({ project, projects }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [outlineReady, setOutlineReady] = useState<Set<string>>(new Set());
+  const [defaults, setDefaults] = useState<BatchSettings>({ imageWorkflowId: null, seedvrEnabled: false, seedvrWorkflowId: null, seedvrUpscaleFactor: 2, rifeEnabled: false, rifeWorkflowId: null, rifeTargetFps: 48 });
 
   const allProjects = useMemo(() => {
     const values = new Map(projects.map((item) => [item.project_id, item.name]));
@@ -98,7 +100,7 @@ export function BatchView({ project, projects }: Props) {
   function toggleProject(projectId: string, checked: boolean) {
     setSelected((current) => {
       const next = new Map(current);
-      if (checked) next.set(projectId, { startBoundary: "next_ready", priority: 0 });
+      if (checked) next.set(projectId, { startBoundary: "next_ready", priority: 0, settings: { ...defaults } });
       else next.delete(projectId);
       return next;
     });
@@ -110,11 +112,18 @@ export function BatchView({ project, projects }: Props) {
       const next = new Map(current);
       for (const projectId of eligibleProjectIds) {
         if (allSelected) next.delete(projectId);
-        else if (!next.has(projectId)) next.set(projectId, { startBoundary: "next_ready", priority: 0 });
+        else if (!next.has(projectId)) next.set(projectId, { startBoundary: "next_ready", priority: 0, settings: { ...defaults } });
       }
       return next;
     });
   }
+
+  const imageWorkflows = workflows.filter((item) => item.kind === "image");
+  const restorationWorkflows = workflows.filter((item) => item.kind === "restoration");
+  const interpolationWorkflows = workflows.filter((item) => item.kind === "interpolation");
+  const updateDefaults = (update: Partial<BatchSettings>) => {
+    setDefaults((current) => ({ ...current, ...update }));
+  };
 
   function updateSelection(projectId: string, update: Partial<Selection>) {
     setSelected((current) => {
@@ -132,7 +141,8 @@ export function BatchView({ project, projects }: Props) {
       const name = batchName.trim() || `${selected.size} 个项目批次`;
       const batch: BatchRun = {
         schema_version: "1.0", batch_id: crypto.randomUUID(), name, state: "draft",
-        items: [...selected].map(([projectId, selection]) => ({ project_id: projectId, task_ids: [], start_boundary: selection.startBoundary, priority: selection.priority })),
+        settings: defaults,
+        items: [...selected].map(([projectId, selection]) => ({ project_id: projectId, task_ids: [], start_boundary: selection.startBoundary, priority: selection.priority, settings: selection.settings })),
         created_at: now, updated_at: now,
       };
       const resolved = await createBatch(batch);
@@ -175,6 +185,7 @@ export function BatchView({ project, projects }: Props) {
       <div><span>排队/运行任务</span><strong>{tasks.filter((task) => ["queued", "running"].includes(task.state)).length}</strong></div>
       <div><span>失败任务</span><strong>{tasks.filter((task) => task.state === "failed").length}</strong></div>
     </div>
+    <div className="batch-toolbar batch-default-settings"><strong>默认设置</strong><label>图片工作流<select value={defaults.imageWorkflowId ?? ""} onChange={(event) => updateDefaults({ imageWorkflowId: event.target.value || null })}><option value="">项目当前设置</option>{imageWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label><input type="checkbox" checked={Boolean(defaults.seedvrEnabled)} onChange={(event) => updateDefaults({ seedvrEnabled: event.target.checked })} />启用超分</label><label>放大倍数<select value={defaults.seedvrUpscaleFactor ?? 2} onChange={(event) => updateDefaults({ seedvrUpscaleFactor: Number(event.target.value) })}><option value={2}>2x</option><option value={4}>4x</option></select></label><label>超分工作流<select value={defaults.seedvrWorkflowId ?? ""} onChange={(event) => updateDefaults({ seedvrWorkflowId: event.target.value || null })}><option value="">项目当前设置</option>{restorationWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label><input type="checkbox" checked={Boolean(defaults.rifeEnabled)} onChange={(event) => updateDefaults({ rifeEnabled: event.target.checked })} />启用补帧</label><label>目标帧率<select value={defaults.rifeTargetFps ?? 48} onChange={(event) => updateDefaults({ rifeTargetFps: Number(event.target.value) as 48 | 60 | 120 })}><option value={48}>48 fps</option><option value={60}>60 fps</option><option value={120}>120 fps</option></select></label><label>补帧工作流<select value={defaults.rifeWorkflowId ?? ""} onChange={(event) => updateDefaults({ rifeWorkflowId: event.target.value || null })}><option value="">项目当前设置</option>{interpolationWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label></div>
     <div className="batch-layout">
       <div className="batch-selector">
         <div className="batch-toolbar batch-create-toolbar"><label className="batch-name"><span>批次名称</span><input value={batchName} maxLength={200} placeholder={`${selected.size || "所选"}个项目批次`} onChange={(event) => setBatchName(event.target.value)} /></label><button className="primary-button" disabled={busy || !selected.size} onClick={() => void createAndStart()}><Play size={16} />启动 {selected.size || ""} 个项目</button></div>
@@ -189,7 +200,7 @@ export function BatchView({ project, projects }: Props) {
           const status = inActiveBatch ? "已在活动批次中" : projectTasks.length ? `${unfinished.length} 个未完成 · ${counts.failed ?? 0} 个失败` : outlineReady.has(projectId) ? "大纲已批准 · 可自动规划" : "需先批准故事大纲";
           return <div className={`batch-project ${inActiveBatch ? "in-active-batch" : ""}`} key={projectId}>
             <header><label className="batch-project-choice"><input type="checkbox" checked={Boolean(selection)} disabled={!canEnterBatch} onChange={(event) => toggleProject(projectId, event.target.checked)} /><strong>{name}</strong></label><span>{status}</span></header>
-            {selection && <div className="batch-project-controls"><label>执行范围<select value={selection.startBoundary} onChange={(event) => updateSelection(projectId, { startBoundary: event.target.value })}>{boundaryOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><label>优先级<input type="number" min="-100" max="100" value={selection.priority} onChange={(event) => updateSelection(projectId, { priority: Number(event.target.value) })} /></label></div>}
+            {selection && <div className="batch-project-controls"><label>执行范围<select value={selection.startBoundary} onChange={(event) => updateSelection(projectId, { startBoundary: event.target.value })}>{boundaryOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><label>优先级<input type="number" min="-100" max="100" value={selection.priority} onChange={(event) => updateSelection(projectId, { priority: Number(event.target.value) })} /></label><label>图片工作流<select value={selection.settings.imageWorkflowId ?? ""} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, imageWorkflowId: event.target.value || null } })}><option value="">使用默认设置</option>{imageWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label><input type="checkbox" checked={Boolean(selection.settings.seedvrEnabled)} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, seedvrEnabled: event.target.checked } })} />启用超分</label><label>放大倍数<select value={selection.settings.seedvrUpscaleFactor ?? defaults.seedvrUpscaleFactor ?? 2} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, seedvrUpscaleFactor: Number(event.target.value) } })}><option value={2}>2x</option><option value={4}>4x</option></select></label><label>超分工作流<select value={selection.settings.seedvrWorkflowId ?? ""} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, seedvrWorkflowId: event.target.value || null } })}><option value="">使用默认设置</option>{restorationWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label><input type="checkbox" checked={Boolean(selection.settings.rifeEnabled)} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, rifeEnabled: event.target.checked } })} />启用补帧</label><label>目标帧率<select value={selection.settings.rifeTargetFps ?? defaults.rifeTargetFps ?? 48} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, rifeTargetFps: Number(event.target.value) as 48 | 60 | 120 } })}><option value={48}>48 fps</option><option value={60}>60 fps</option><option value={120}>120 fps</option></select></label><label>补帧工作流<select value={selection.settings.rifeWorkflowId ?? ""} onChange={(event) => updateSelection(projectId, { settings: { ...selection.settings, rifeWorkflowId: event.target.value || null } })}><option value="">使用默认设置</option>{interpolationWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label></div>}
             {projectTasks.length > 0 && <div className="batch-status-strip">{Object.entries(counts).map(([state, count]) => <span className={`state state-${state}`} key={state}>{taskStateLabels[state] ?? state} {count}</span>)}</div>}
           </div>;
         })}

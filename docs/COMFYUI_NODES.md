@@ -14,7 +14,7 @@
 - 安装固定提交并校验文件哈希的H3 Motion Context；
 - 安装固定提交并校验文件哈希的官方Turbo节点。
 
-该操作不安装SageAttention。全新配置默认关闭SageAttention，已有配置仍尊重用户原来的选择。所有项目安装器均可重复运行，正确版本已经存在时只校验、不覆盖。
+该操作不安装外部注意力插件。全新配置默认关闭 Kitchen Attention，已有配置仍尊重用户原来的选择；启用时使用 ComfyUI 原生 `ModelAttentionBackend` 的 `comfy kitchen attention`。所有项目安装器均可重复运行，正确版本已经存在时只校验、不覆盖。
 
 节点代码位于`comfyui_nodes/ai_video_generator_nodes`。命令行脚本仅作为开发和故障排查入口：
 

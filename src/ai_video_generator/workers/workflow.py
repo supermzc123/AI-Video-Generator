@@ -20,6 +20,10 @@ from ai_video_generator.domain import (
     WorkflowTemplate,
 )
 
+UI_ONLY_WORKFLOW_INPUTS: dict[str, frozenset[str]] = {
+    "LoadVideo": frozenset({"video-preview"}),
+}
+
 
 class WorkflowContractError(ValueError):
     pass
@@ -114,7 +118,10 @@ def parse_api_workflow(
         title = (metadata or {}).get("title")
         if title is not None and not isinstance(title, str):
             raise WorkflowContractError(f"workflow node {node_id!r} title must be a string")
-        workflow[node_id] = copy.deepcopy(raw_node)
+        normalized_node = copy.deepcopy(raw_node)
+        for input_name in UI_ONLY_WORKFLOW_INPUTS.get(class_type, ()):
+            normalized_node["inputs"].pop(input_name, None)
+        workflow[node_id] = normalized_node
     for node_id, node in workflow.items():
         for input_name, input_value in node["inputs"].items():
             link = _as_link(input_value)
@@ -195,6 +202,7 @@ def validate_workflow_template(
             schema,
             binding.input_name,
             binding.value_type,
+            node["inputs"],
         )
         if issue:
             issues.append(f"binding {binding.binding_id}: {issue}")
@@ -328,7 +336,11 @@ def _normalize_schemas(object_info: Mapping[str, Any]) -> dict[str, dict[str, An
     return dict(sorted(schemas.items()))
 
 
-def _schema_input(schema: Mapping[str, Any], input_name: str) -> Any:
+def _schema_input(
+    schema: Mapping[str, Any],
+    input_name: str,
+    inputs: Mapping[str, Any] | None = None,
+) -> Any:
     input_block = schema.get("input", {})
     if not isinstance(input_block, Mapping):
         return None
@@ -345,19 +357,36 @@ def _schema_input(schema: Mapping[str, Any], input_name: str) -> Any:
         if not isinstance(fields, Mapping):
             continue
         definition = fields.get(dynamic_name)
-        resolved = _dynamic_schema_input(definition, child_name)
+        selected = inputs.get(dynamic_name) if inputs is not None else None
+        resolved = _dynamic_schema_input(definition, child_name, selected=selected)
         if resolved is not None:
             return resolved
     return None
 
 
-def _dynamic_schema_input(definition: Any, child_name: str) -> Any:
+def _dynamic_schema_input(definition: Any, child_name: str, *, selected: Any = None) -> Any:
     if not isinstance(definition, (list, tuple)) or len(definition) < 2:
         return None
     kind, options = definition[0], definition[1]
     if not isinstance(options, Mapping):
         return None
     if kind == "COMFY_DYNAMICCOMBO_V3":
+        if isinstance(selected, str):
+            selected_option = next(
+                (
+                    option
+                    for option in options.get("options", [])
+                    if isinstance(option, Mapping) and option.get("key") == selected
+                ),
+                None,
+            )
+            if isinstance(selected_option, Mapping):
+                selected_inputs = selected_option.get("inputs", {})
+                if isinstance(selected_inputs, Mapping):
+                    for section in ("required", "optional"):
+                        fields = selected_inputs.get(section, {})
+                        if isinstance(fields, Mapping) and child_name in fields:
+                            return fields[child_name]
         candidates = []
         for option in options.get("options", []):
             if not isinstance(option, Mapping):
@@ -437,7 +466,7 @@ def _workflow_schema_issues(
                         f"node {node_id} ({node_type}): required input {required_name!r} is missing"
                     )
         for input_name, input_value in inputs.items():
-            definition = _schema_input(schema, input_name)
+            definition = _schema_input(schema, input_name, inputs)
             if definition is None:
                 issues.append(
                     f"node {node_id} ({node_type}): input {input_name!r} "
@@ -523,10 +552,11 @@ def _validate_schema_input(
     schema: Mapping[str, Any] | None,
     input_name: str,
     value_type: BindingValueType,
+    inputs: Mapping[str, Any] | None = None,
 ) -> tuple[str | None, float | None, float | None]:
     if schema is None:
         return None, None, None
-    definition = _schema_input(schema, input_name)
+    definition = _schema_input(schema, input_name, inputs)
     if definition is None:
         return "input is not exposed by object_info", None, None
     type_spec = (
@@ -546,6 +576,7 @@ def _validate_schema_input(
         BindingValueType.NUMBER: {"FLOAT", "INT"},
         BindingValueType.IMAGE_PATH: {"STRING", "COMBO"},
         BindingValueType.VIDEO_PATH: {"STRING", "COMBO"},
+        BindingValueType.AUDIO_PATH: {"STRING", "COMBO"},
     }[value_type]
     issue = (
         None if actual in allowed else f"expected {value_type.value}, object_info reports {actual}"
@@ -564,10 +595,15 @@ def _coerce_binding_value(binding: WorkflowBinding, value: Any) -> Any:
         BindingValueType.STRING,
         BindingValueType.IMAGE_PATH,
         BindingValueType.VIDEO_PATH,
+        BindingValueType.AUDIO_PATH,
     }:
         if not isinstance(value, str):
             raise WorkflowContractError(f"binding {binding.binding_id!r} requires a string")
-        if binding.value_type in {BindingValueType.IMAGE_PATH, BindingValueType.VIDEO_PATH}:
+        if binding.value_type in {
+            BindingValueType.IMAGE_PATH,
+            BindingValueType.VIDEO_PATH,
+            BindingValueType.AUDIO_PATH,
+        }:
             _validate_relative_media_path(value)
         coerced: Any = value
     elif binding.value_type == BindingValueType.INTEGER:

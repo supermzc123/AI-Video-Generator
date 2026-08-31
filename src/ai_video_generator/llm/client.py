@@ -29,10 +29,7 @@ def is_retryable_llm_error(error: LLMClientError) -> bool:
         return True
     if "provider rejected request" not in message:
         return False
-    return any(
-        f"status={status}" in message
-        for status in (408, 409, 425, 429, 500, 502, 503, 504)
-    )
+    return any(f"status={status}" in message for status in (408, 409, 425, 429, 500, 502, 503, 504))
 
 
 class TextContentPart(BaseModel):
@@ -91,6 +88,7 @@ class OpenAICompatibleClient:
         api_key: str | None = None,
         timeout_seconds: float = 30,
         first_token_timeout_seconds: float | None = None,
+        stream_idle_timeout_seconds: float = 600,
         proxy: str | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -105,11 +103,11 @@ class OpenAICompatibleClient:
         )
         # The first-token budget ends after the first delta, but a half-open
         # stream still needs a bounded inter-token read.
-        self._stream_idle_timeout_seconds = timeout_seconds
+        self._stream_idle_timeout_seconds = stream_idle_timeout_seconds
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         self._http = http_client or httpx.AsyncClient(
             headers=self._headers,
-            timeout=timeout_seconds,
+            timeout=httpx.Timeout(timeout_seconds, read=stream_idle_timeout_seconds),
             proxy=proxy,
         )
 
@@ -127,11 +125,7 @@ class OpenAICompatibleClient:
                     return await self._complete_json_stream(payload, callback)
                 return await self._complete_json_nonstream(payload)
             except LLMClientError as exc:
-                if (
-                    attempt == 0
-                    and not exc.response_started
-                    and is_retryable_llm_error(exc)
-                ):
+                if attempt == 0 and not exc.response_started and is_retryable_llm_error(exc):
                     # Gateways behind a local proxy occasionally reset an
                     # otherwise healthy connection. A single short retry
                     # avoids surfacing these transient failures to the harness.
@@ -149,9 +143,7 @@ class OpenAICompatibleClient:
         }
         callback = llm_delta_callback.get()
         if callback is not None:
-            return await self._complete_json_stream(
-                payload, callback, accept_started_text_on_idle=True
-            )
+            return await self._complete_json_stream(payload, callback)
         return await self._complete_json_nonstream(payload)
 
     async def _complete_json_nonstream(self, payload: dict[str, Any]) -> str:
@@ -191,11 +183,10 @@ class OpenAICompatibleClient:
         self,
         payload: dict[str, Any],
         on_delta: Callable[[str], None],
-        *,
-        accept_started_text_on_idle: bool = False,
     ) -> str:
         chunks: list[str] = []
         first_token_received = False
+        stream_finished = False
         try:
             async with self._http.stream(
                 "POST",
@@ -209,15 +200,18 @@ class OpenAICompatibleClient:
                         return await self._complete_json_nonstream(payload)
                     raise LLMClientError(self._format_provider_error(response))
                 line_iterator = response.aiter_lines().__aiter__()
-                first_token_deadline = (
-                    time.monotonic() + self._first_token_timeout_seconds
-                )
+                first_token_deadline = time.monotonic() + self._first_token_timeout_seconds
+                content_idle_deadline: float | None = None
                 while True:
                     try:
                         if first_token_received:
+                            assert content_idle_deadline is not None
+                            remaining = content_idle_deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError
                             line = await asyncio.wait_for(
                                 line_iterator.__anext__(),
-                                timeout=self._stream_idle_timeout_seconds,
+                                timeout=remaining,
                             )
                         else:
                             remaining = first_token_deadline - time.monotonic()
@@ -234,6 +228,7 @@ class OpenAICompatibleClient:
                     if not data:
                         continue
                     if data == "[DONE]":
+                        stream_finished = True
                         break
                     try:
                         event = json.loads(data)
@@ -254,15 +249,17 @@ class OpenAICompatibleClient:
                         chunks.append(text)
                         on_delta(text)
                         first_token_received = True
+                        content_idle_deadline = (
+                            time.monotonic() + self._stream_idle_timeout_seconds
+                        )
                     if choice.get("finish_reason") is not None:
+                        stream_finished = True
                         break
         except LLMClientError:
             raise
         except TimeoutError as exc:
             result = "".join(chunks)
-            if _is_complete_json_object(result) or (
-                accept_started_text_on_idle and result.strip()
-            ):
+            if _is_complete_json_object(result):
                 return result
             message = (
                 "OpenAI-compatible stream idle timeout"
@@ -272,12 +269,12 @@ class OpenAICompatibleClient:
             raise LLMClientError(message, response_started=first_token_received) from exc
         except httpx.TimeoutException as exc:
             result = "".join(chunks)
-            if _is_complete_json_object(result) or (
-                accept_started_text_on_idle and result.strip()
-            ):
+            if _is_complete_json_object(result):
                 return result
             raise LLMClientError(
-                "OpenAI-compatible request timed out",
+                "OpenAI-compatible stream idle timeout"
+                if first_token_received
+                else "OpenAI-compatible request timed out",
                 response_started=first_token_received,
             ) from exc
         except httpx.RequestError as exc:
@@ -292,6 +289,13 @@ class OpenAICompatibleClient:
             # providers remain usable; the UI already received an activity
             # state and will display the validated final result.
             return await self._complete_json_nonstream(payload)
+        if _is_complete_json_object(result):
+            return result
+        if not stream_finished:
+            raise LLMClientError(
+                "OpenAI-compatible stream ended before completion",
+                response_started=first_token_received,
+            )
         return result
 
     async def list_models(self) -> tuple[str, ...]:
@@ -313,9 +317,7 @@ class OpenAICompatibleClient:
             model_ids = {
                 item["id"]
                 for item in data
-                if isinstance(item, dict)
-                and isinstance(item.get("id"), str)
-                and item["id"].strip()
+                if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
             }
         except (KeyError, TypeError, ValueError) as exc:
             raise LLMClientError("model listing does not contain a valid data array") from exc

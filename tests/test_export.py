@@ -7,7 +7,30 @@ from ai_video_generator.services.export import (
     ExportSpec,
     compile_export_plan,
     order_segment_ids_for_export,
+    probe_video_dimensions,
+    select_master_dimensions,
 )
+
+
+class _ProbeProcess:
+    returncode = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b'{"streams":[{"width":2048,"height":1216}]}', b""
+
+
+@pytest.mark.asyncio
+async def test_probe_video_dimensions_uses_encoded_stream(monkeypatch) -> None:
+    async def create_process(*_args, **_kwargs):
+        return _ProbeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
+
+    assert await probe_video_dimensions(Path("upscaled.mp4")) == (2048, 1216)
+
+
+def test_master_dimensions_preserve_largest_latent_upscaled_output() -> None:
+    assert select_master_dimensions(((1024, 608), (2048, 1217))) == (2048, 1216)
 
 
 def test_export_plan_normalizes_video_and_audio() -> None:
@@ -86,6 +109,31 @@ def test_export_segment_order_follows_workspace_not_opaque_shot_ids() -> None:
     )
 
     assert ordered == ("z-shot.C01", "z-shot.C02", "a-shot.C01")
+
+
+def test_export_uses_storyboard_order_when_prompts_are_breadth_first() -> None:
+    payload = {
+        "shots": [{"id": "shot-1"}, {"id": "shot-2"}],
+        "prompts": {
+            "h3Prompts": [
+                {"shotId": "shot-1", "segmentId": "shot-1.C01", "segmentIndex": 0},
+                {"shotId": "shot-2", "segmentId": "shot-2.C01", "segmentIndex": 0},
+                {"shotId": "shot-1", "segmentId": "shot-1.C02", "segmentIndex": 1},
+                {"shotId": "shot-2", "segmentId": "shot-2.C02", "segmentIndex": 1},
+            ]
+        },
+    }
+
+    ordered = order_segment_ids_for_export(
+        ("shot-1.C01", "shot-2.C01", "shot-1.C02", "shot-2.C02"), payload
+    )
+
+    assert ordered == (
+        "shot-1.C01",
+        "shot-1.C02",
+        "shot-2.C01",
+        "shot-2.C02",
+    )
 
 
 def test_export_segment_order_rejects_stale_or_incomplete_dependencies() -> None:

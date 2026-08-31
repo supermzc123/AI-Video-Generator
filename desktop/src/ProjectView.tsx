@@ -1,38 +1,47 @@
-import { RotateCcw, Save } from "lucide-react";
+import { ArrowDown, ArrowUp, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import {
-  saveProjectToControlPlane,
-  setProjectMode,
-  setProjectPaused,
-  setReviewMode,
-} from "./api";
-import { newProject } from "./project-store";
+import { listComfyuiModels } from "./api";
 import type { ProjectDraft } from "./types";
 
 type Props = {
   project: ProjectDraft;
   onChange: (project: ProjectDraft) => void;
-  embedded?: boolean;
   onValidationChange?: (valid: boolean) => void;
 };
 
-export function ProjectView({ project, onChange, embedded = false, onValidationChange }: Props) {
+export function ProjectView({ project, onChange, onValidationChange }: Props) {
   const [draft, setDraft] = useState(project);
-  const [saved, setSaved] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [widthInput, setWidthInput] = useState(String(project.width));
   const [heightInput, setHeightInput] = useState(String(project.height));
+  const [availableLoras, setAvailableLoras] = useState<string[]>([]);
+  const [loraLoading, setLoraLoading] = useState(true);
+  const [loraMessage, setLoraMessage] = useState<string | null>(null);
   const updateDraft = (transform: (current: ProjectDraft) => ProjectDraft) => {
     const changed = transform(draft);
     setDraft(changed);
-    if (embedded) onChange(changed);
+    onChange(changed);
   };
   useEffect(() => {
     setDraft(project);
     setWidthInput(String(project.width));
     setHeightInput(String(project.height));
   }, [project]);
+  async function refreshLoras() {
+    setLoraLoading(true);
+    setLoraMessage(null);
+    try {
+      const models = await listComfyuiModels();
+      setAvailableLoras(models.loras);
+      setLoraMessage(models.warning ?? `已读取 ${models.loras.length} 个 LoRA`);
+    } catch (cause) {
+      setAvailableLoras([]);
+      setLoraMessage(cause instanceof Error ? cause.message : "LoRA 列表读取失败");
+    } finally {
+      setLoraLoading(false);
+    }
+  }
+  useEffect(() => { void refreshLoras(); }, []);
   const number = (key: keyof ProjectDraft, minimum: number) => (value: string) =>
     updateDraft((current) => ({ ...current, [key]: Math.max(minimum, Number(value) || minimum) }));
 
@@ -62,11 +71,11 @@ export function ProjectView({ project, onChange, embedded = false, onValidationC
     if (otherValid) setError(null);
   }
 
-  return <section className={embedded ? "embedded-project-settings" : "workspace"}>
-    {!embedded && <div className="section-heading"><div><h2>项目设置</h2><span>控制平面不可变修订 · R{project.revision}</span></div></div>}
+  return <section className="embedded-project-settings">
     <div className="form-panel">
       {error && <div className="error-banner inline-banner field-wide">{error}</div>}
       <label className="field field-wide"><span>项目名称</span><input value={draft.name} onChange={(e) => updateDraft((current) => ({ ...current, name: e.target.value }))} /></label>
+      <label className="field field-wide"><span>最高指令</span><textarea rows={4} value={draft.highestInstruction} onChange={(e) => updateDraft((current) => ({ ...current, highestInstruction: e.target.value }))} placeholder="本项目所有 AI 阶段都必须遵守的最高级项目要求" /></label>
       <label className="field"><span>宽度</span><input inputMode="numeric" value={widthInput} onChange={(e) => setWidthInput(e.target.value)} onBlur={() => commitResolution("width", "宽度", widthInput)} /></label>
       <label className="field"><span>高度</span><input inputMode="numeric" value={heightInput} onChange={(e) => setHeightInput(e.target.value)} onBlur={() => commitResolution("height", "高度", heightInput)} /></label>
       <small className="field-wide resolution-hint">输入完成后自动四舍五入到最接近的 32 倍数。</small>
@@ -75,27 +84,33 @@ export function ProjectView({ project, onChange, embedded = false, onValidationC
       <label className="field"><span>音频策略</span><select value={draft.audioPolicy} onChange={(e) => updateDraft((current) => ({ ...current, audioPolicy: e.target.value as ProjectDraft["audioPolicy"], externalAudioAssetId: e.target.value === "h3_with_external" ? current.externalAudioAssetId : null }))}><option value="h3_native">H3 原生音频</option><option value="h3_with_external">H3 + 外部音轨</option><option value="muted">静音</option></select></label>
       <label className="field"><span>时间预算（分钟，留空不限）</span><input type="number" min="1" value={draft.timeBudgetSeconds ? draft.timeBudgetSeconds / 60 : ""} onChange={(e) => updateDraft((current) => ({ ...current, timeBudgetSeconds: e.target.value ? Math.max(60, Number(e.target.value) * 60) : null }))} /></label>
       {draft.audioPolicy === "h3_with_external" && <label className="field field-wide"><span>外部音频素材 ID</span><input value={draft.externalAudioAssetId ?? ""} onChange={(e) => updateDraft((current) => ({ ...current, externalAudioAssetId: e.target.value || null }))} /></label>}
-      <label className="field"><span>执行方式</span><select value={draft.executionMode} onChange={(e) => updateDraft((current) => ({ ...current, executionMode: e.target.value as ProjectDraft["executionMode"] }))}><option value="guided">精细化模式</option><option value="batch">批量模式</option></select></label>
       <label className="field"><span>审核模式</span><select value={draft.reviewPolicy.configuredMode} onChange={(e) => updateDraft((current) => ({ ...current, reviewPolicy: { ...current.reviewPolicy, configuredMode: e.target.value as ProjectDraft["reviewPolicy"]["configuredMode"], effectiveMode: e.target.value as ProjectDraft["reviewPolicy"]["effectiveMode"], aiTakeoverAt: null } }))}><option value="human_ai">AI + 人工</option><option value="ai_only">AI</option><option value="manual">手动</option><option value="none">无</option></select></label>
       {draft.reviewPolicy.configuredMode === "human_ai" && <label className="field"><span>人工审核超时（分钟）</span><input type="number" min="1" value={draft.reviewPolicy.humanTimeoutSeconds / 60} onChange={(e) => updateDraft((current) => ({ ...current, reviewPolicy: { ...current.reviewPolicy, humanTimeoutSeconds: Math.max(60, Number(e.target.value) * 60) } }))} /></label>}
-      {!embedded && <div className="form-actions">
-        <button className="secondary-button" disabled={busy} onClick={() => { const fresh = newProject(); setDraft(fresh); setWidthInput(String(fresh.width)); setHeightInput(String(fresh.height)); onChange(fresh); }}><RotateCcw size={16} />新建</button>
-        <button className="primary-button" disabled={busy || !draft.name.trim() || (draft.audioPolicy === "h3_with_external" && !draft.externalAudioAssetId)} onClick={() => void (async () => {
-          const width = resolutionValue("宽度", widthInput);
-          const height = resolutionValue("高度", heightInput);
-          if (width === null || height === null) return;
-          setBusy(true); setError(null);
-          try {
-            const next = await saveProjectToControlPlane({ ...draft, width, height, name: draft.name.trim() });
-            await setProjectMode(next.projectId, next.executionMode);
-            await setProjectPaused(next.projectId, next.paused);
-            await setReviewMode(next.projectId, next.reviewPolicy.configuredMode, next.reviewPolicy.humanTimeoutSeconds);
-            onChange(next); setDraft(next); setSaved(true);
-            window.setTimeout(() => setSaved(false), 1600);
-          } catch (cause) { setError(cause instanceof Error ? cause.message : "保存失败"); }
-          finally { setBusy(false); }
-        })()}><Save size={16} />{busy ? "保存中" : saved ? "已保存" : "保存修订"}</button>
-      </div>}
+      <div className="field field-wide">
+        <div className="inline-toolbar lora-toolbar">
+          <span>项目 LoRA（按顺序应用）</span>
+          <button className="icon-button" type="button" title="刷新 LoRA 列表" disabled={loraLoading} onClick={() => void refreshLoras()}><RefreshCw size={14} /></button>
+          <button className="secondary-button" type="button" disabled={loraLoading || !availableLoras.some((name) => !draft.h3Loras.some((item) => item.name === name))} onClick={() => {
+            const name = availableLoras.find((candidate) => !draft.h3Loras.some((item) => item.name === candidate));
+            if (name) updateDraft((current) => ({ ...current, h3Loras: [...current.h3Loras, { id: crypto.randomUUID(), name, strength: 1, enabled: true }] }));
+          }}><Plus size={14} />添加 LoRA</button>
+        </div>
+        <small>{loraLoading ? "正在读取 LoRA 列表..." : loraMessage ?? "没有找到可加载的 LoRA 文件。"}</small>
+        {draft.h3Loras.length === 0 && <small>当前项目不加载额外 LoRA。</small>}
+        {draft.h3Loras.map((lora, index) => <div className="inline-toolbar lora-row" key={lora.id}>
+          <input type="checkbox" checked={lora.enabled} aria-label={`启用 ${lora.name}`} onChange={(event) => updateDraft((current) => ({ ...current, h3Loras: current.h3Loras.map((item) => item.id === lora.id ? { ...item, enabled: event.target.checked } : item) }))} />
+          <select value={lora.name} onChange={(event) => updateDraft((current) => ({ ...current, h3Loras: current.h3Loras.map((item) => item.id === lora.id ? { ...item, name: event.target.value } : item) }))}>
+            {[lora.name, ...availableLoras.filter((name) => name !== lora.name && !draft.h3Loras.some((item) => item.name === name))].map((name) => <option key={name} value={name}>{name}</option>)}
+          </select>
+          <input type="number" min="-4" max="4" step="0.05" value={lora.strength} aria-label={`${lora.name} 强度`} onChange={(event) => {
+            const strength = Math.max(-4, Math.min(4, Number(event.target.value) || 0));
+            updateDraft((current) => ({ ...current, h3Loras: current.h3Loras.map((item) => item.id === lora.id ? { ...item, strength } : item) }));
+          }} />
+          <button className="icon-button" type="button" title="上移" disabled={index === 0} onClick={() => updateDraft((current) => { const items = [...current.h3Loras]; [items[index - 1], items[index]] = [items[index], items[index - 1]]; return { ...current, h3Loras: items }; })}><ArrowUp size={14} /></button>
+          <button className="icon-button" type="button" title="下移" disabled={index === draft.h3Loras.length - 1} onClick={() => updateDraft((current) => { const items = [...current.h3Loras]; [items[index], items[index + 1]] = [items[index + 1], items[index]]; return { ...current, h3Loras: items }; })}><ArrowDown size={14} /></button>
+          <button className="icon-button" type="button" title="删除" onClick={() => updateDraft((current) => ({ ...current, h3Loras: current.h3Loras.filter((item) => item.id !== lora.id) }))}><Trash2 size={14} /></button>
+        </div>)}
+      </div>
     </div>
   </section>;
 }

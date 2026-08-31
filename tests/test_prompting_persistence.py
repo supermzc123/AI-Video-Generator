@@ -166,7 +166,7 @@ def test_prompt_revisions_and_sets_round_trip_without_overwrite(tmp_path) -> Non
         harness_id="h3:default",
         harness_revision=2,
         reference_asset_ids=("asset-1",),
-        execution_prompt_zh=(
+        execution_prompt=(
             "subject_definitions: [角色1]保持参考图身份与服装。\n"
             "summary: 角色走进车站。\nretention_analysis: 保留身份，允许姿态变化。\n"
             "detailed_description: 0-4秒，中景跟拍角色走入车站，环境声连续。\n"
@@ -202,7 +202,7 @@ def test_prompt_revisions_and_sets_round_trip_without_overwrite(tmp_path) -> Non
 
     with pytest.raises(StoreConflictError, match="immutable"):
         store.put_h3_prompt_revision(
-            h3_prompt.model_copy(update={"execution_prompt_zh": "被覆盖"})
+            h3_prompt.model_copy(update={"execution_prompt": "被覆盖"})
         )
 
 
@@ -215,7 +215,7 @@ def test_approved_h3_prompt_requires_passing_review() -> None:
             generation_mode=GenerationMode.T2VA,
             harness_id="h3:default",
             harness_revision=2,
-            execution_prompt_zh="integrated_multimodal_description: 完整描述",
+            execution_prompt="integrated_multimodal_description: 完整描述",
             review=passing_review(with_error=True),
             state=PromptRevisionState.APPROVED,
             created_at=NOW,

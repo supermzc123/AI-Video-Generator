@@ -40,7 +40,7 @@ def motion_context_segments(payload: dict[str, Any]) -> tuple[dict[str, Any], ..
         for position, item in enumerate(values)
         if isinstance(item, dict) and str(item.get("segmentId") or "")
     ]
-    return tuple(
+    ordered = tuple(
         item
         for _, item in sorted(
             indexed,
@@ -50,6 +50,50 @@ def motion_context_segments(payload: dict[str, Any]) -> tuple[dict[str, Any], ..
             ),
         )
     )
+    return canonical_motion_context_chain(ordered)
+
+
+def canonical_motion_context_chain(
+    segments: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Derive continuation edges from the current shot topology."""
+    values = [dict(item) for item in segments]
+    by_id = {str(item.get("segmentId") or ""): item for item in values}
+
+    def shot_identity(segment: dict[str, Any]) -> str:
+        cursor = segment
+        seen: set[str] = set()
+        while True:
+            explicit = str(cursor.get("shotId") or "")
+            if explicit:
+                return explicit
+            segment_id = str(cursor.get("segmentId") or "")
+            if ".C" in segment_id:
+                return segment_id.split(".C", 1)[0]
+            if "-seg-" in segment_id:
+                return segment_id.rsplit("-seg-", 1)[0]
+            if segment_id in seen:
+                return min(seen)
+            seen.add(segment_id)
+            predecessor = str(cursor.get("continuationOf") or "")
+            if not predecessor or predecessor not in by_id:
+                return segment_id
+            cursor = by_id[predecessor]
+
+    by_shot: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for position, segment in enumerate(values):
+        shot_id = shot_identity(segment)
+        segment["shotId"] = shot_id
+        by_shot[shot_id].append((position, segment))
+    for shot in by_shot.values():
+        previous: str | None = None
+        for _, segment in sorted(
+            shot,
+            key=lambda item: (int(item[1].get("segmentIndex") or 0), item[0]),
+        ):
+            segment["continuationOf"] = previous
+            previous = str(segment["segmentId"])
+    return tuple(values)
 
 
 def frozen_segment_ids(
@@ -171,11 +215,20 @@ def create_rework_marker(
     project_id: str,
     version: SegmentGenerationVersion,
     action: ReworkAction,
-    feedback: str,
+    feedback: str | None,
     replacement_seed: int | None,
     source: str,
 ) -> ReworkMarker:
     now = datetime.now(UTC)
+    normalized_feedback = (feedback or "").strip()
+    if action == ReworkAction.REVISE_PROMPT and not normalized_feedback:
+        raise ValueError("修改提示词返工必须提供修改要求")
+    if not normalized_feedback:
+        normalized_feedback = (
+            "技术性失败，保持原提示词和 Seed 重新生成"
+            if action == ReworkAction.RETRY
+            else "更换 Seed 重新生成"
+        )
     marker = ReworkMarker(
         marker_id=f"rework-marker:{uuid4().hex}",
         project_id=project_id,
@@ -184,7 +237,7 @@ def create_rework_marker(
         segment_index=version.segment_index,
         source_version_id=version.version_id,
         action=action,
-        feedback=feedback,
+        feedback=normalized_feedback,
         replacement_seed=replacement_seed,
         source=source,
         created_at=now,
@@ -209,11 +262,9 @@ def create_rework_marker(
 
 
 def cancel_rework_marker(store: SQLiteTaskStore, marker: ReworkMarker) -> ReworkMarker:
-    if marker.state == ReworkMarkerState.SEALED:
-        raise ValueError("sealed rework marker cannot be withdrawn")
     if marker.state in {ReworkMarkerState.RESOLVED, ReworkMarkerState.CANCELLED}:
         return marker
-    if marker.state == ReworkMarkerState.PREPARING and marker.batch_id:
+    if marker.state in {ReworkMarkerState.PREPARING, ReworkMarkerState.SEALED} and marker.batch_id:
         batch = next(
             (
                 item
@@ -222,7 +273,11 @@ def cancel_rework_marker(store: SQLiteTaskStore, marker: ReworkMarker) -> Rework
             ),
             None,
         )
-        if batch and batch.state == GenerationBatchState.PREPARING:
+        if batch and batch.state in {
+            GenerationBatchState.PREPARING,
+            GenerationBatchState.SEALED,
+            GenerationBatchState.RUNNING,
+        }:
             batch_task_ids = (
                 *batch.task_ids,
                 *((batch.model_switch_task_id,) if batch.model_switch_task_id else ()),
@@ -240,6 +295,7 @@ def cancel_rework_marker(store: SQLiteTaskStore, marker: ReworkMarker) -> Rework
                 batch.model_copy(
                     update={
                         "state": GenerationBatchState.CANCELLED,
+                        "dispatch_requested": False,
                         "updated_at": datetime.now(UTC),
                     }
                 )
@@ -279,6 +335,28 @@ def cancel_rework_marker(store: SQLiteTaskStore, marker: ReworkMarker) -> Rework
                     "discard_reason": None,
                     "activated_at": now,
                 }
+            )
+        )
+    # Removing the marker releases the sequence immediately. Wake the latest
+    # active generation batch so the scheduler recomputes ready work instead
+    # of leaving the previously frozen segment idle.
+    active_batch = next(
+        (
+            item
+            for item in reversed(store.list_generation_batches(marker.project_id))
+            if item.state
+            in {
+                GenerationBatchState.PREPARING,
+                GenerationBatchState.SEALED,
+                GenerationBatchState.RUNNING,
+            }
+        ),
+        None,
+    )
+    if active_batch is not None:
+        store.put_generation_batch(
+            active_batch.model_copy(
+                update={"dispatch_requested": True, "updated_at": now}
             )
         )
     return cancelled
@@ -374,6 +452,7 @@ def confirm_rework_markers(
     batch_id = f"generation:{project_id}:{uuid4().hex}"
     affected_ids = {str(item["segmentId"]) for item in segments}
     source_by_segment: dict[str, SegmentGenerationVersion] = {}
+    source_affinities: set[str] = set()
     all_by_segment: dict[str, list[SegmentGenerationVersion]] = defaultdict(list)
     for version in versions:
         all_by_segment[version.segment_id].append(version)
@@ -382,6 +461,11 @@ def confirm_rework_markers(
             all_by_segment[segment_id], key=lambda item: item.generation_number
         )
         source_by_segment[segment_id] = source
+        source_affinity = store.get_task(source.task_id).affinity_key
+        if source_affinity:
+            source_affinities.add(source_affinity)
+    if len(source_affinities) > 1:
+        raise ValueError("rework source chain contains mixed H3 model stacks")
     encoding_ids: set[str] = set()
     for source_version in source_by_segment.values():
         source_task = store.get_task(source_version.task_id)
@@ -390,8 +474,12 @@ def confirm_rework_markers(
             if dependency.kind == TaskKind.CONDITIONING_ENCODING:
                 encoding_ids.add(dependency_id)
     switch_id = f"{batch_id}:model-switch"
+    h3_affinity = next(iter(source_affinities), "h3:diffusion:default")
     switch_fingerprint = hashlib.sha256(
-        json.dumps(sorted(encoding_ids), separators=(",", ":")).encode()
+        json.dumps(
+            {"encoding_ids": sorted(encoding_ids), "affinity": h3_affinity},
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()
     switch = TaskSpec(
         task_id=switch_id,
@@ -403,7 +491,7 @@ def confirm_rework_markers(
         idempotency_key=hashlib.sha256(f"{switch_id}:{switch_fingerprint}".encode()).hexdigest(),
         input_fingerprint=switch_fingerprint,
         depends_on=tuple(sorted(encoding_ids)),
-        affinity_key="h3:diffusion",
+        affinity_key=h3_affinity,
         max_attempts=2,
     )
     store.add_task(switch)
@@ -445,7 +533,7 @@ def confirm_rework_markers(
             input_fingerprint=fingerprint,
             workload_manifest_sha256=manifest_sha,
             depends_on=tuple(dependencies),
-            affinity_key="h3:diffusion",
+            affinity_key=h3_affinity,
             priority=100 - min(99, int(segment.get("segmentIndex") or 0) * 10 + stable_index),
         )
         store.add_task(task)

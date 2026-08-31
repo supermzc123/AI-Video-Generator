@@ -19,6 +19,7 @@ def test_remote_config_maps_all_runtime_connection_settings() -> None:
         llm_api_key=SecretStr("secret"),
         llm_timeout_seconds=45,
         llm_first_token_timeout_seconds=12,
+        llm_stream_idle_timeout_seconds=720,
         network_proxy="http://127.0.0.1:7890",
     )
 
@@ -28,6 +29,7 @@ def test_remote_config_maps_all_runtime_connection_settings() -> None:
         api_key="secret",
         timeout_seconds=45,
         first_token_timeout_seconds=12,
+        stream_idle_timeout_seconds=720,
         proxy="http://127.0.0.1:7890",
     )
 
@@ -48,9 +50,7 @@ async def test_remote_completion_uses_the_shared_client(monkeypatch) -> None:
             return '{"ok":true}'
 
     config = LLMRemoteConfig(base_url="https://llm.example/v1", model="model-a")
-    monkeypatch.setattr(
-        "ai_video_generator.llm.remote._client", lambda value: FakeClient()
-    )
+    monkeypatch.setattr("ai_video_generator.llm.remote._client", lambda value: FakeClient())
     messages = (ChatMessage(role="user", content="test"),)
 
     assert await complete_json(config, messages) == '{"ok":true}'

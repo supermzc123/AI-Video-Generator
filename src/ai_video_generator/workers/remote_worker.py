@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -213,58 +213,6 @@ class RemoteWorkerClient:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-
-    async def lease_events(
-        self,
-        heartbeat_factory: Callable[[], WorkerHeartbeat],
-        *,
-        stop_event: asyncio.Event | None = None,
-    ) -> AsyncIterator[TaskSpec | None]:
-        """Poll lease offers over WSS and reconnect with bounded backoff."""
-        try:
-            from websockets.asyncio.client import connect
-        except ImportError as exc:  # pragma: no cover - depends on Worker extra
-            raise RemoteWorkerError("install the 'worker' extra for WSS support") from exc
-
-        parsed = urlsplit(self.base_url)
-        websocket_url = urlunsplit(
-            (
-                "wss" if parsed.scheme == "https" else "ws",
-                parsed.netloc,
-                f"{parsed.path}/api/v1/workers/{heartbeat_factory().worker_id}/events",
-                "",
-                "",
-            )
-        )
-        delay = self.retry_policy.initial_delay_seconds
-        while stop_event is None or not stop_event.is_set():
-            try:
-                async with connect(
-                    websocket_url,
-                    additional_headers={"Authorization": f"Bearer {self.token}"},
-                ) as websocket:
-                    delay = self.retry_policy.initial_delay_seconds
-                    while stop_event is None or not stop_event.is_set():
-                        heartbeat = heartbeat_factory()
-                        await websocket.send(
-                            json.dumps({"heartbeat": heartbeat.model_dump(mode="json")})
-                        )
-                        payload = json.loads(await websocket.recv())
-                        if payload.get("type") == "error":
-                            raise RemoteWorkerError(f"Worker event error: {payload.get('code')}")
-                        task_payload = payload.get("task")
-                        yield (
-                            None if task_payload is None else TaskSpec.model_validate(task_payload)
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                if delay > self.retry_policy.maximum_delay_seconds:
-                    raise RemoteWorkerError("WSS reconnect budget exhausted") from exc
-                await asyncio.sleep(_jitter(delay, self.retry_policy.jitter_ratio))
-                delay *= self.retry_policy.multiplier
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         policy = self.retry_policy

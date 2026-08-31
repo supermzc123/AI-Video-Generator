@@ -487,7 +487,6 @@ class ProjectAssetStore:
     def list_assets(self, project_id: str) -> tuple[ProjectAsset, ...]:
         if not self.project_exists(project_id):
             raise ProjectNotFoundError(project_id)
-        self._migrate_legacy_workspace_assets(project_id)
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -562,70 +561,6 @@ class ProjectAssetStore:
             )
             self._insert(connection, updated)
         return updated
-
-    def _migrate_legacy_workspace_assets(self, project_id: str) -> None:
-        with self._transaction(immediate=True) as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM project_workspace_revisions "
-                "WHERE project_id = ? ORDER BY revision DESC LIMIT 1",
-                (project_id,),
-            ).fetchone()
-            if row is None:
-                return
-            payload = json.loads(row["payload_json"])
-            if isinstance(payload.get("payload"), dict):
-                payload = payload["payload"]
-            for index, raw in enumerate(payload.get("assets", [])):
-                if not isinstance(raw, dict):
-                    continue
-                asset_id = str(raw.get("id") or raw.get("asset_id") or "")
-                name = str(raw.get("name") or "").strip()
-                if not asset_id or not name:
-                    continue
-                if connection.execute(
-                    "SELECT 1 FROM project_asset_revisions WHERE asset_id = ? LIMIT 1",
-                    (asset_id,),
-                ).fetchone():
-                    continue
-                kind_value = str(raw.get("kind") or "reference")
-                try:
-                    kind = ProjectAssetPurpose(kind_value)
-                except ValueError:
-                    kind = ProjectAssetPurpose.REFERENCE
-                scope_value = str(raw.get("scope") or "common")
-                if scope_value == "public":
-                    scope_value = "common"
-                try:
-                    scope = AssetScope(scope_value)
-                except ValueError:
-                    scope = AssetScope.COMMON
-                shot_id = str(raw.get("shotId") or raw.get("shot_id") or "") or None
-                if scope == AssetScope.SHOT and shot_id is None:
-                    scope = AssetScope.COMMON
-                created_raw = raw.get("createdAt") or raw.get("created_at")
-                try:
-                    created_at = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
-                except (TypeError, ValueError):
-                    created_at = datetime.now(UTC)
-                asset = ProjectAsset(
-                    asset_id=asset_id,
-                    project_id=project_id,
-                    revision=1,
-                    name=name,
-                    original_name=str(raw.get("fileName") or raw.get("original_name") or name),
-                    state=ProjectAssetState.MISSING_BLOB,
-                    kind=kind,
-                    scope=scope,
-                    shot_id=shot_id if scope == AssetScope.SHOT else None,
-                    source=ProjectAssetSource.LEGACY,
-                    created_at=created_at,
-                )
-                try:
-                    self._ensure_unique_name(connection, project_id, name)
-                    self._insert(connection, asset)
-                except DuplicateProjectAssetNameError:
-                    asset = asset.model_copy(update={"name": f"{name}（旧素材 {index + 1}）"})
-                    self._insert(connection, asset)
 
     def get_asset(self, project_id: str, asset_id: str) -> ProjectAsset:
         with self._connect() as connection:

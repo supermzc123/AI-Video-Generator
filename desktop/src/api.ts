@@ -17,12 +17,10 @@ import type {
   WorkflowTemplateSummary,
   ArtifactDescriptor,
   ReviewDecision,
-  ReworkRequest,
   ReworkMarker,
   GenerationBatch,
   AssetGenerationCandidate,
   SetupStatus,
-  PostProcessingCapabilities,
 } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -72,8 +70,10 @@ async function requestForm<T>(path: string, body: FormData): Promise<T> {
 async function requestEventStream<T>(
   path: string,
   options: {
+    method?: "GET" | "POST";
     body?: unknown;
     signal?: AbortSignal;
+    operationId?: string;
     onDelta: (delta: string) => void;
     parseResult: (value: unknown) => T;
     errorMessage: string;
@@ -81,9 +81,10 @@ async function requestEventStream<T>(
 ): Promise<T> {
   const origin = await resolveApiOrigin();
   const response = await fetch(`${origin}${path}`, {
-    method: "POST",
+    method: options.method ?? "POST",
     headers: {
       Accept: "text/event-stream",
+      ...(options.operationId ? { "X-LLM-Operation-ID": options.operationId } : {}),
       ...(options.body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -257,36 +258,18 @@ export function deleteProjectAsset(projectId: string, assetId: string): Promise<
   return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
 }
 
-export async function generateProjectPromptStage(projectId: string): Promise<ProjectDraft> {
-  const response = await requestJson<{ payload: ProjectDraft }>(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/stages/prompts/generate`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-  return response.payload;
-}
-
-export async function regenerateH3Prompt(
-  projectId: string,
-  segmentId: string,
-  signal?: AbortSignal,
-): Promise<ProjectDraft> {
-  const response = await requestJson<{ payload: ProjectDraft }>(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/h3/${encodeURIComponent(segmentId)}/regenerate`,
-    { method: "POST", body: JSON.stringify({}), signal },
-  );
-  return response.payload;
-}
-
 export async function streamRegenerateH3Prompt(
   projectId: string,
   segmentId: string,
   onDelta: (delta: string) => void,
   signal?: AbortSignal,
 ): Promise<ProjectDraft> {
+  const operationId = crypto.randomUUID();
   return requestEventStream(
     `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/h3/${encodeURIComponent(segmentId)}/regenerate/stream`,
     {
       signal,
+      operationId,
       onDelta,
       errorMessage: "H3 流式生成失败",
       parseResult: (value) => {
@@ -307,19 +290,6 @@ export function translateH3Prompt(
   );
 }
 
-export async function generateImagePrompt(
-  projectId: string,
-  assetPlanId: string,
-  instruction: string | null = null,
-  workflowTemplateId: string | null = null,
-): Promise<ProjectDraft> {
-  const response = await requestJson<{ payload: ProjectDraft }>(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/images/${encodeURIComponent(assetPlanId)}/generate`,
-    { method: "POST", body: JSON.stringify({ instruction, workflow_template_id: workflowTemplateId }) },
-  );
-  return response.payload;
-}
-
 export async function streamGenerateImagePrompt(
   projectId: string,
   assetPlanId: string,
@@ -328,11 +298,13 @@ export async function streamGenerateImagePrompt(
   onDelta: (delta: string) => void,
   signal?: AbortSignal,
 ): Promise<ProjectDraft> {
+  const operationId = crypto.randomUUID();
   return requestEventStream(
     `/api/v1/projects/${encodeURIComponent(projectId)}/prompts/images/${encodeURIComponent(assetPlanId)}/generate/stream`,
     {
       body: { instruction, workflow_template_id: workflowTemplateId },
       signal,
+      operationId,
       onDelta,
       errorMessage: "图片提示词流式生成失败",
       parseResult: (value) => {
@@ -401,10 +373,6 @@ export function assembleDefaultH3Harness(): Promise<HarnessRevision> {
   });
 }
 
-export function getPostProcessingCapabilities(): Promise<PostProcessingCapabilities> {
-  return requestJson("/api/v1/postprocessing/capabilities");
-}
-
 export function getLocalWorkerCapabilities(): Promise<{
   server_online: boolean;
   full_pipeline_ready: boolean;
@@ -424,6 +392,7 @@ export type RuntimeSettings = {
   llmApiKeyConfigured: boolean;
   llmTimeoutSeconds: number;
   llmFirstTokenTimeoutSeconds: number;
+  llmStreamIdleTimeoutSeconds: number;
   llmVideoCapable: boolean;
   networkProxy: string;
   h3DiffusionModel: string;
@@ -432,9 +401,13 @@ export type RuntimeSettings = {
   h3AudioVae: string;
   h3TurboLora: string;
   h3TurboEnabled: boolean;
-  h3SageAttentionEnabled: boolean;
+  h3KitchenAttentionEnabled: boolean;
   h3LowVram: boolean;
   h3Steps: number;
+  h3ConditioningWorkflowTemplateId: string;
+  h3ConditioningWorkflowRevision: number | null;
+  h3DiffusionWorkflowTemplateId: string;
+  h3DiffusionWorkflowRevision: number | null;
 };
 
 export type ComfyNodeInstallResult = {
@@ -458,6 +431,7 @@ type BackendRuntimeSettings = {
   llm_api_key_configured: boolean;
   llm_timeout_seconds: number;
   llm_first_token_timeout_seconds: number;
+  llm_stream_idle_timeout_seconds: number;
   llm_video_capable: boolean;
   network_proxy: string | null;
   h3_diffusion_model: string;
@@ -469,6 +443,10 @@ type BackendRuntimeSettings = {
   h3_sage_attention_enabled: boolean;
   h3_low_vram: boolean;
   h3_steps: number;
+  h3_conditioning_workflow_template_id: string | null;
+  h3_conditioning_workflow_revision: number | null;
+  h3_diffusion_workflow_template_id: string | null;
+  h3_diffusion_workflow_revision: number | null;
 };
 
 function mapRuntimeSettings(value: BackendRuntimeSettings): RuntimeSettings {
@@ -481,6 +459,7 @@ function mapRuntimeSettings(value: BackendRuntimeSettings): RuntimeSettings {
     llmApiKeyConfigured: value.llm_api_key_configured,
     llmTimeoutSeconds: value.llm_timeout_seconds,
     llmFirstTokenTimeoutSeconds: value.llm_first_token_timeout_seconds ?? value.llm_timeout_seconds,
+    llmStreamIdleTimeoutSeconds: value.llm_stream_idle_timeout_seconds ?? 600,
     llmVideoCapable: value.llm_video_capable ?? false,
     networkProxy: value.network_proxy ?? "",
     h3DiffusionModel: value.h3_diffusion_model,
@@ -489,9 +468,13 @@ function mapRuntimeSettings(value: BackendRuntimeSettings): RuntimeSettings {
     h3AudioVae: value.h3_audio_vae,
     h3TurboLora: value.h3_turbo_lora,
     h3TurboEnabled: value.h3_turbo_enabled,
-    h3SageAttentionEnabled: value.h3_sage_attention_enabled,
+    h3KitchenAttentionEnabled: value.h3_sage_attention_enabled,
     h3LowVram: value.h3_low_vram,
     h3Steps: value.h3_steps,
+    h3ConditioningWorkflowTemplateId: value.h3_conditioning_workflow_template_id ?? "",
+    h3ConditioningWorkflowRevision: value.h3_conditioning_workflow_revision,
+    h3DiffusionWorkflowTemplateId: value.h3_diffusion_workflow_template_id ?? "",
+    h3DiffusionWorkflowRevision: value.h3_diffusion_workflow_revision,
   };
 }
 
@@ -504,7 +487,12 @@ export function listLlmModels(): Promise<{ models: string[]; count: number }> {
 }
 
 export function listComfyuiModels(): Promise<{
-  diffusion_models: string[]; text_encoders: string[]; vaes: string[]; loras: string[];
+  diffusion_models: string[];
+  text_encoders: string[];
+  vaes: string[];
+  loras: string[];
+  source: "comfyui" | "filesystem";
+  warning: string | null;
 }> {
   return requestJson("/api/v1/settings/comfyui-models");
 }
@@ -526,6 +514,7 @@ export async function updateRuntimeSettings(
       clear_llm_api_key: clearApiKey,
       llm_timeout_seconds: settings.llmTimeoutSeconds,
       llm_first_token_timeout_seconds: settings.llmFirstTokenTimeoutSeconds,
+      llm_stream_idle_timeout_seconds: settings.llmStreamIdleTimeoutSeconds,
       llm_video_capable: settings.llmVideoCapable,
       network_proxy: settings.networkProxy.trim() || null,
       h3_diffusion_model: settings.h3DiffusionModel,
@@ -534,9 +523,13 @@ export async function updateRuntimeSettings(
       h3_audio_vae: settings.h3AudioVae,
       h3_turbo_lora: settings.h3TurboLora,
       h3_turbo_enabled: settings.h3TurboEnabled,
-      h3_sage_attention_enabled: settings.h3SageAttentionEnabled,
+      h3_sage_attention_enabled: settings.h3KitchenAttentionEnabled,
       h3_low_vram: settings.h3LowVram,
       h3_steps: settings.h3Steps,
+      h3_conditioning_workflow_template_id: settings.h3ConditioningWorkflowTemplateId || null,
+      h3_conditioning_workflow_revision: settings.h3ConditioningWorkflowRevision,
+      h3_diffusion_workflow_template_id: settings.h3DiffusionWorkflowTemplateId || null,
+      h3_diffusion_workflow_revision: settings.h3DiffusionWorkflowRevision,
     }),
   });
   return mapRuntimeSettings(response);
@@ -567,10 +560,6 @@ export function listTasks(projectId?: string): Promise<TaskSpec[]> {
 
 export function getTask(taskId: string): Promise<TaskSpec> {
   return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}`);
-}
-
-export function createTask(task: TaskSpec): Promise<TaskSpec> {
-  return requestJson("/api/v1/tasks", { method: "POST", body: JSON.stringify(task) });
 }
 
 export function compileProjectTasks(projectId: string, restartH3 = false): Promise<{
@@ -621,7 +610,7 @@ export function createReworkMarker(
   request: {
     version_id: string;
     action: ReworkMarker["action"];
-    feedback: string;
+    feedback?: string;
     replacement_seed: number | null;
     source?: "human" | "ai";
   },
@@ -653,49 +642,12 @@ export function runTask(taskId: string): Promise<TaskSpec> {
   return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/run`, { method: "POST" });
 }
 
-export function pauseTask(taskId: string): Promise<TaskSpec> {
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/pause`, { method: "POST" });
-}
-
-export function resumeTask(taskId: string): Promise<TaskSpec> {
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/resume`, { method: "POST" });
-}
-
-export function redoTask(taskId: string): Promise<TaskSpec> {
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/redo`, { method: "POST" });
-}
-
-export function reviewTask(taskId: string, accepted: boolean, feedback = ""): Promise<TaskSpec> {
-  const action = accepted ? "accept" : "reject";
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/review/${action}`, {
-    method: "POST",
-    body: JSON.stringify({ feedback: feedback || null }),
-  });
-}
-
 export function listTaskArtifacts(taskId: string): Promise<ArtifactDescriptor[]> {
   return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/artifacts`);
 }
 
 export function listTaskReviewDecisions(taskId: string): Promise<ReviewDecision[]> {
   return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/review-decisions`);
-}
-
-export function createSegmentRework(
-  projectId: string,
-  segmentId: string,
-  request: {
-    source_h3_task_id: string;
-    review_task_id: string | null;
-    action: ReworkRequest["action"];
-    feedback: string;
-    replacement_seed: number | null;
-  },
-): Promise<ReworkRequest> {
-  return requestJson(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/segments/${encodeURIComponent(segmentId)}/rework`,
-    { method: "POST", body: JSON.stringify(request) },
-  );
 }
 
 export type BackendProjectSpec = {
@@ -784,35 +736,27 @@ export function setReviewMode(
   });
 }
 
-export function requestProjectAgentProposal(
-  projectId: string,
-  request: {
-    operationId: string;
-    operation: string;
-    instruction: string;
-    displayInstruction?: string;
-    allowedPaths: string[];
-    lockedPaths: string[];
-  },
-): Promise<{
+export type AgentProposalResult = {
   proposal: AgentProposal;
   input_sha256: string;
   output_sha256: string;
   committed_revision: number | null;
-}> {
-  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/agent/operate`, {
-    method: "POST",
-    body: JSON.stringify({
-      operation_id: request.operationId,
-      operation: request.operation,
-      instruction: request.instruction,
-      display_instruction: request.displayInstruction,
-      allowed_paths: request.allowedPaths,
-      locked_paths: request.lockedPaths,
-      commit: false,
-    }),
-  });
-}
+  committed_workspace: ProjectDraft | null;
+  user_event_id: string;
+  assistant_event_id: string;
+};
+
+export type LlmOperation = {
+  operation_id: string;
+  project_id: string;
+  kind: "project_agent" | "h3_prompt" | "image_prompt" | string;
+  scope: string;
+  state: "running" | "succeeded" | "failed";
+  text: string;
+  error: { status?: number; detail?: unknown } | null;
+  created_at: string;
+  updated_at: string;
+};
 
 export async function streamProjectAgentProposal(
   projectId: string,
@@ -821,16 +765,12 @@ export async function streamProjectAgentProposal(
     operation: string;
     instruction: string;
     displayInstruction?: string;
+    conversationParentEventId?: string | null;
     allowedPaths: string[];
     lockedPaths: string[];
   },
   onDelta: (delta: string) => void,
-): Promise<{
-  proposal: AgentProposal;
-  input_sha256: string;
-  output_sha256: string;
-  committed_revision: number | null;
-}> {
+): Promise<AgentProposalResult> {
   return requestEventStream(
     `/api/v1/projects/${encodeURIComponent(projectId)}/agent/operate/stream`,
     {
@@ -839,10 +779,12 @@ export async function streamProjectAgentProposal(
         operation: request.operation,
         instruction: request.instruction,
         display_instruction: request.displayInstruction,
+        conversation_parent_event_id: request.conversationParentEventId ?? null,
         allowed_paths: request.allowedPaths,
         locked_paths: request.lockedPaths,
-        commit: false,
+        commit: true,
       },
+      operationId: request.operationId,
       onDelta,
       errorMessage: "LLM 流式请求失败",
       parseResult: normalizeAgentStreamResult,
@@ -856,7 +798,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalizeAgentStreamResult(
   value: unknown,
-): Awaited<ReturnType<typeof requestProjectAgentProposal>> {
+): AgentProposalResult {
   if (!isRecord(value) || !isRecord(value.proposal)) {
     throw new ApiError(502, "LLM 最终结果缺少 proposal 对象", value);
   }
@@ -881,7 +823,44 @@ function normalizeAgentStreamResult(
     input_sha256: typeof value.input_sha256 === "string" ? value.input_sha256 : "",
     output_sha256: typeof value.output_sha256 === "string" ? value.output_sha256 : "",
     committed_revision: typeof value.committed_revision === "number" ? value.committed_revision : null,
+    committed_workspace: isRecord(value.committed_workspace)
+      ? value.committed_workspace as ProjectDraft
+      : null,
+    user_event_id: typeof value.user_event_id === "string" ? value.user_event_id : "",
+    assistant_event_id: typeof value.assistant_event_id === "string" ? value.assistant_event_id : "",
   };
+}
+
+export function listProjectLlmOperations(projectId: string): Promise<LlmOperation[]> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/llm-operations`,
+  );
+}
+
+export function cancelProjectLlmOperation(
+  projectId: string,
+  operationId: string,
+): Promise<LlmOperation> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/llm-operations/${encodeURIComponent(operationId)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+export function resumeProjectAgentOperation(
+  projectId: string,
+  operationId: string,
+  onDelta: (delta: string) => void,
+): Promise<AgentProposalResult> {
+  return requestEventStream(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/llm-operations/${encodeURIComponent(operationId)}/stream`,
+    {
+      method: "GET",
+      onDelta,
+      errorMessage: "LLM 流式请求恢复失败",
+      parseResult: normalizeAgentStreamResult,
+    },
+  );
 }
 
 export function listProjectMemory(
@@ -913,10 +892,6 @@ export function cancelBatchProject(batchId: string, projectId: string): Promise<
     `/api/v1/batches/${encodeURIComponent(batchId)}/projects/${encodeURIComponent(projectId)}/cancel`,
     { method: "POST" },
   );
-}
-
-export function listHarnesses(): Promise<HarnessBundle[]> {
-  return requestJson("/api/v1/harnesses");
 }
 
 export function registerHarness(bundle: HarnessBundle): Promise<HarnessBundle> {

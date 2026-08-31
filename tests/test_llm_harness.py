@@ -3,17 +3,25 @@ from collections.abc import Sequence
 
 import pytest
 
-from ai_video_generator.domain import ProjectSpec, ShotSpec
+from ai_video_generator.domain import (
+    BindingSemantic,
+    BindingValueType,
+    ProjectSpec,
+    ShotSpec,
+    WorkflowBindingDraft,
+)
 from ai_video_generator.llm import (
     ChatMessage,
     HarnessValidationError,
     LLMHarness,
     StructuredOperationRequest,
+    WorkflowMappingDraft,
     WorkflowMappingRequest,
     build_structured_operation_messages,
     build_workflow_mapping_messages,
     parse_structured_operation,
     parse_workflow_mapping,
+    validate_workflow_mapping,
 )
 
 
@@ -101,6 +109,57 @@ def test_workflow_mapping_prompt_is_deterministic_and_contains_contracts() -> No
     assert payload["context"]["shot"]["shot_revision_id"] == "shot-1@1"
     assert payload["context"]["raw_workflow"]["1"]["inputs"]["text"] == "old prompt"
     assert "response_schema" in payload["contract"]
+    assert "motion_context_input" in first[0].content
+    assert "indexes each start at 1 independently" in first[0].content
+
+
+def test_workflow_mapping_places_highest_instruction_before_harness() -> None:
+    messages = build_workflow_mapping_messages(
+        mapping_request().model_copy(update={"highest_instruction": "Keep every scene monochrome."})
+    )
+
+    system = str(messages[0].content)
+    assert system.startswith("PROJECT HIGHEST INSTRUCTION\nKeep every scene monochrome.")
+    assert system.index("Keep every scene monochrome.") < system.index("motion_context_input")
+
+
+def test_mapping_allows_reference_index_one_for_each_media_kind() -> None:
+    request = mapping_request().model_copy(
+        update={
+            "requested_semantics": (
+                BindingSemantic.REFERENCE_IMAGE,
+                BindingSemantic.REFERENCE_VIDEO,
+                BindingSemantic.REFERENCE_AUDIO,
+            ),
+            "raw_workflow": {
+                "1": {
+                    "class_type": "H3References",
+                    "inputs": {"image": "a.png", "video": "a.mp4", "audio": "a.wav"},
+                }
+            },
+        }
+    )
+    bindings = tuple(
+        WorkflowBindingDraft(
+            binding_id=semantic.value,
+            semantic=semantic,
+            node_id="1",
+            input_name=input_name,
+            value_type=value_type,
+            title=input_name,
+            default_value=default_value,
+            reference_index=1,
+        )
+        for semantic, input_name, value_type, default_value in (
+            (BindingSemantic.REFERENCE_IMAGE, "image", BindingValueType.IMAGE_PATH, "a.png"),
+            (BindingSemantic.REFERENCE_VIDEO, "video", BindingValueType.VIDEO_PATH, "a.mp4"),
+            (BindingSemantic.REFERENCE_AUDIO, "audio", BindingValueType.AUDIO_PATH, "a.wav"),
+        )
+    )
+    validate_workflow_mapping(
+        request,
+        WorkflowMappingDraft(operation_id=request.operation_id, bindings=bindings),
+    )
 
 
 def test_mapping_parser_rejects_invented_node_or_input() -> None:
@@ -253,15 +312,33 @@ def test_structured_prompt_contains_exact_workspace_contracts() -> None:
     asset_contract = payload["contract"]["workspace_value_contracts"]["asset_plan_item"]
     assert {"width", "height", "resolutionSource"}.issubset(asset_contract["required"])
     motion = payload["contract"]["motion_context_contract"]
+    asset_policy = payload["contract"]["asset_planning_policy"]
     assert motion["segment_duration_sum"] == "must equal shot.durationSeconds"
     assert motion["first_segment_seconds"] == {"minimum": 4, "maximum": 15}
     assert "motionSegments" not in shot_contract["required"]
     assert "motionSegments" in shot_contract["properties"]
     assert motion["optional_when"] == "ordinary single-segment shots"
+    assert "uninterrupted continuous take" in motion["topology_rule"]
+    assert "video model" in asset_policy["one_off_scene_or_prop"]
+    assert "at least two shots" in asset_policy["reusable_scene_or_prop"]
     assert "shotIds may be empty" in messages[0].content
     assert "absolutely never add" in messages[0].content
     assert "scope=public means reusable, not automatically used" in messages[0].content
+    assert "Do not create an asset plan for a scene or prop used only once" in messages[0].content
+    assert "never split an uninterrupted continuous take" in messages[0].content
     assert "an empty array is valid" in asset_contract["properties"]["shotIds"]
+
+
+def test_structured_prompt_places_highest_instruction_before_harness() -> None:
+    request = patch_request().model_copy(
+        update={"highest_instruction": "Never show readable brand names."}
+    )
+    system = str(build_structured_operation_messages(request)[0].content)
+
+    assert system.startswith("PROJECT HIGHEST INSTRUCTION\nNever show readable brand names.")
+    assert system.index("Never show readable brand names.") < system.index(
+        "immediately applies non-empty patches"
+    )
 
 
 def test_storyboard_contract_allows_single_segment_shot_without_motion_context() -> None:

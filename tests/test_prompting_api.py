@@ -6,12 +6,54 @@ from ai_video_generator.prompting_api import (
     _complete_image_prompt,
     _continuation_end_state,
     _creative_brief,
+    _h3_generation_summary,
     _image_prompt_drafts,
     _incomplete_asset_plan_names,
+    _merge_h3_prompt_entries,
     _prompt_terminal_context,
     _segment_constraints,
     _workspace_segments,
 )
+
+
+def _workspace_prompt(segment_id: str, prompt: str, *, ready: bool) -> dict[str, object]:
+    return {
+        "segmentId": segment_id,
+        "prompt": prompt,
+        "review": {"ready": ready, "issues": []},
+    }
+
+
+def test_empty_failed_prompt_cannot_erase_an_existing_draft() -> None:
+    existing = _workspace_prompt("segment-a", "streamed complete prompt", ready=True)
+    failed = _workspace_prompt("segment-a", "", ready=False)
+
+    merged = _merge_h3_prompt_entries([existing], [failed])
+
+    assert merged == [existing]
+    assert _h3_generation_summary(merged)["failedSegmentIds"] == []
+
+
+def test_concurrent_segment_results_merge_regardless_of_completion_order() -> None:
+    segment_a = _workspace_prompt("segment-a", "prompt A", ready=True)
+    segment_b = _workspace_prompt("segment-b", "prompt B", ready=True)
+
+    first_commit = _merge_h3_prompt_entries([], [segment_b])
+    second_commit = _merge_h3_prompt_entries(first_commit, [segment_a])
+
+    assert {item["segmentId"]: item["prompt"] for item in second_commit} == {
+        "segment-a": "prompt A",
+        "segment-b": "prompt B",
+    }
+
+
+def test_failed_new_segment_remains_visible_when_no_prior_draft_exists() -> None:
+    failed = _workspace_prompt("segment-a", "", ready=False)
+
+    merged = _merge_h3_prompt_entries([], [failed])
+
+    assert merged == [failed]
+    assert _h3_generation_summary(merged)["failedSegmentIds"] == ["segment-a"]
 
 
 def test_asset_plan_binding_never_propagates_an_unused_material() -> None:

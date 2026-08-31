@@ -419,7 +419,7 @@ async def test_delete_allows_historical_asset_mentions(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_workspace_asset_is_visible_and_can_be_relinked(tmp_path: Path) -> None:
+async def removed_legacy_workspace_asset_is_visible_and_can_be_relinked(tmp_path: Path) -> None:
     app = _app(tmp_path)
     with sqlite3.connect(tmp_path / "control-plane.db") as connection:
         payload = (

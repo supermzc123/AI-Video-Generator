@@ -27,6 +27,7 @@ def compile_h3_segment_manifests(
     height: int,
     asset_blobs: tuple[AssetBlob, ...],
     node_schema_sha256: str,
+    project_loras: tuple[dict[str, object], ...] = (),
 ) -> tuple[TaskWorkloadManifest, TaskWorkloadManifest]:
     """Compile the tested H3 cache/diffusion graphs with typed deployment values."""
     segment_id = str(prompt["segmentId"])
@@ -100,10 +101,16 @@ def compile_h3_segment_manifests(
         project_id=project_id,
         segment_id=segment_id,
         continuation_of=str(prompt.get("continuationOf") or ""),
+        project_loras=project_loras,
     )
     common_context = {
         "project_id": project_id,
         "segment_id": segment_id,
+        # The diffusion graph consumes cached conditioning and therefore does
+        # not contain the source text. Keep the exact prompt in the immutable
+        # workload context so downstream review can compare the video against
+        # what was actually executed.
+        "prompt_text": str(prompt.get("prompt") or ""),
         "conditioning_fingerprint": fingerprint,
         "visible_frames": str(visible_frames),
         "motion_context_frames": str(context_frames),
@@ -131,7 +138,11 @@ def compile_h3_segment_manifests(
         workflow_template_id=(
             "h3:controlled-v1:continuation" if continuation else "h3:controlled-v1:initial"
         ),
-        context={**common_context, "continuation_of": str(prompt.get("continuationOf") or "")},
+        context={
+            **common_context,
+            "continuation_of": str(prompt.get("continuationOf") or ""),
+            "project_loras": json.dumps(project_loras, ensure_ascii=False, separators=(",", ":")),
+        },
     )
     return encode_manifest, diffusion_manifest
 
@@ -254,6 +265,7 @@ def _configure_diffusion(
     project_id: str,
     segment_id: str,
     continuation_of: str,
+    project_loras: tuple[dict[str, object], ...],
 ) -> None:
     workflow["127"]["inputs"]["unet_name"] = settings.h3_diffusion_model
     workflow["119"]["inputs"]["vae_name"] = settings.h3_video_vae
@@ -283,8 +295,22 @@ def _configure_diffusion(
             "_meta": {"title": "H3 standard Euler sampler"},
         }
         base_model = ["127", 0]
+    for index, lora in enumerate(project_loras):
+        node_id = f"avg-project-lora-{index:03d}"
+        workflow[node_id] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": base_model,
+                "lora_name": str(lora["name"]),
+                "strength_model": float(lora["strength"]),
+            },
+            "_meta": {"title": f"Project LoRA {index + 1}"},
+        }
+        base_model = [node_id, 0]
     if settings.h3_sage_attention_enabled:
-        workflow["136"]["inputs"]["model"] = base_model
+        workflow["136"]["inputs"].update(
+            {"model": base_model, "attention": "comfy kitchen attention"}
+        )
     else:
         workflow["126"]["inputs"]["model"] = base_model
         workflow["124"]["inputs"]["model"] = base_model

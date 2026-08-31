@@ -8,14 +8,44 @@ from ai_video_generator.domain import (
     H3AttentionMode,
     H3InputTarget,
     H3TurboProfile,
+    H3WorkflowProfile,
     WorkflowApproval,
 )
-from ai_video_generator.workers import (
-    build_h3_profile,
-    compile_h3_workflow,
-    inspect_h3_workflow_profile,
+from ai_video_generator.workers import compile_h3_workflow, inspect_h3_workflow_profile
+from ai_video_generator.workers.workflow import (
+    WorkflowContractError,
+    canonical_json_sha256,
+    parse_api_workflow,
 )
-from ai_video_generator.workers.workflow import WorkflowContractError
+
+
+def build_profile(
+    *,
+    profile_id: str,
+    name: str,
+    raw_workflow: dict[str, object],
+    object_info: dict[str, object],
+    acceleration: H3AccelerationMode = H3AccelerationMode.STANDARD,
+    attention: H3AttentionMode = H3AttentionMode.NATIVE,
+    turbo: H3TurboProfile | None = None,
+    sage_attention_node_id: str | None = None,
+    approval: WorkflowApproval = WorkflowApproval.DRAFT,
+    revision: int = 1,
+) -> H3WorkflowProfile:
+    workflow = parse_api_workflow(raw_workflow)
+    return H3WorkflowProfile(
+        profile_id=profile_id,
+        revision=revision,
+        name=name,
+        approval=approval,
+        workflow_sha256=canonical_json_sha256(workflow),
+        node_schema_sha256=canonical_json_sha256(object_info),
+        raw_workflow=workflow,
+        acceleration=acceleration,
+        attention=attention,
+        turbo=turbo,
+        sage_attention_node_id=sage_attention_node_id,
+    )
 
 
 def object_info() -> dict[str, object]:
@@ -40,9 +70,14 @@ def object_info() -> dict[str, object]:
             "python_module": "comfy_extras.nodes_custom_sampler",
             "input": {"required": {"model": ["MODEL"]}},
         },
-        "MiniMaxH3MemoryEfficientSageAttentionPatch": {
-            "python_module": "custom_nodes.comfyui-kjnodes",
-            "input": {"required": {"model": ["MODEL"]}},
+        "ModelAttentionBackend": {
+            "python_module": "comfy_extras.nodes_model_advanced",
+            "input": {
+                "required": {
+                    "model": ["MODEL"],
+                    "attention": [["pytorch attention", "comfy kitchen attention"]],
+                }
+            },
         },
         "BasicGuider": {},
         "SamplerCustomAdvanced": {},
@@ -67,8 +102,11 @@ def turbo_workflow() -> dict[str, dict[str, object]]:
             "inputs": {"model": ["5", 0], "scheduler": "normal", "steps": 20},
         },
         "5": {
-            "class_type": "MiniMaxH3MemoryEfficientSageAttentionPatch",
-            "inputs": {"model": ["2", 0]},
+            "class_type": "ModelAttentionBackend",
+            "inputs": {
+                "model": ["2", 0],
+                "attention": "comfy kitchen attention",
+            },
         },
         "7": {
             "class_type": "BasicGuider",
@@ -96,7 +134,7 @@ def turbo_settings(steps: int = 6) -> H3TurboProfile:
 
 
 def test_external_h3_turbo_profile_compiles_only_declared_inputs() -> None:
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),
@@ -118,6 +156,28 @@ def test_external_h3_turbo_profile_compiles_only_declared_inputs() -> None:
     assert compiled["6"] == turbo_workflow()["6"]
 
 
+def test_kitchen_attention_requires_current_native_backend_choice() -> None:
+    info = object_info()
+    info["ModelAttentionBackend"]["input"]["required"]["attention"] = [
+        ["pytorch attention"]
+    ]
+    profile = build_profile(
+        profile_id="h3-kitchen",
+        name="H3 Kitchen",
+        raw_workflow=turbo_workflow(),
+        object_info=info,
+        acceleration=H3AccelerationMode.TURBO,
+        attention=H3AttentionMode.KITCHEN,
+        turbo=turbo_settings(),
+        sage_attention_node_id="5",
+    )
+
+    inspection = inspect_h3_workflow_profile(profile, info)
+
+    assert not inspection.compatible
+    assert any("does not expose" in issue for issue in inspection.issues)
+
+
 def test_turbo_rejects_teacache_and_warns_on_four_step_motion_risk() -> None:
     workflow = turbo_workflow()
     workflow["7"] = {
@@ -125,7 +185,7 @@ def test_turbo_rejects_teacache_and_warns_on_four_step_motion_risk() -> None:
         "inputs": {"model": ["2", 0]},
     }
     info = {**object_info(), "TeaCache": {}}
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=workflow,
@@ -147,7 +207,7 @@ def test_standard_profile_cannot_compile_teacache() -> None:
         "2": {"class_type": "TeaCacheForH3", "inputs": {"model": ["1", 0]}},
     }
     info = {"UNETLoader": {}, "TeaCacheForH3": {}}
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-standard",
         name="H3 standard",
         raw_workflow=workflow,
@@ -162,7 +222,7 @@ def test_same_named_experimental_turbo_provider_is_rejected() -> None:
     info = object_info()
     info["MiniMaxH3TurboLoRA"]["python_module"] = "custom_nodes.comfyui-minimax-h3-turbo"
     info["MiniMaxH3TurboSampler"]["python_module"] = "custom_nodes.comfyui-minimax-h3-turbo"
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),
@@ -181,7 +241,7 @@ def test_same_named_experimental_turbo_provider_is_rejected() -> None:
 
 def test_turbo_profile_records_and_validates_official_source_revision() -> None:
     turbo = turbo_settings().model_copy(update={"source_commit": "0" * 40})
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),
@@ -201,7 +261,7 @@ def test_turbo_profile_records_and_validates_official_source_revision() -> None:
 @pytest.mark.asyncio
 async def test_h3_profile_api_inspects_and_compiles_without_submitting_gpu(tmp_path) -> None:
     info = object_info()
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),
@@ -243,7 +303,7 @@ async def test_h3_profile_registration_uses_current_schema_and_keeps_revisions(
         assert request.url.path == "/object_info"
         return httpx.Response(200, json=current_info)
 
-    profile_v1 = build_h3_profile(
+    profile_v1 = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),
@@ -269,7 +329,7 @@ async def test_h3_profile_registration_uses_current_schema_and_keeps_revisions(
         # A Worker schema change is part of the profile fingerprint and therefore
         # must be registered as a separate immutable revision.
         current_info["BasicScheduler"]["display_name"] = "Basic Scheduler"
-        profile_v2 = build_h3_profile(
+        profile_v2 = build_profile(
             profile_id="h3-turbo",
             revision=2,
             name="H3 Turbo",
@@ -306,7 +366,7 @@ async def test_h3_profile_registration_requires_approval_and_current_schema(
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=current_info)
 
-    draft = build_h3_profile(
+    draft = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),
@@ -346,7 +406,7 @@ async def test_h3_profile_revision_is_immutable(tmp_path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=info)
 
-    profile = build_h3_profile(
+    profile = build_profile(
         profile_id="h3-turbo",
         name="H3 Turbo",
         raw_workflow=turbo_workflow(),

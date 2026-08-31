@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import json
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -10,6 +10,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from ai_video_generator.domain.chain import FrozenModel
+
+from .hashing import sha256_file
 
 
 class ExportInput(FrozenModel):
@@ -67,19 +69,92 @@ class ExportExecutionError(RuntimeError):
     pass
 
 
+async def probe_video_dimensions(
+    path: Path, *, ffprobe_binary: str = "ffprobe"
+) -> tuple[int, int]:
+    """Read the encoded video dimensions without assuming the generation canvas."""
+    process = await asyncio.create_subprocess_exec(
+        ffprobe_binary,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "json",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise ExportExecutionError(
+            "ffprobe could not read video dimensions: "
+            + stderr.decode("utf-8", errors="replace")[-1000:]
+        )
+    try:
+        streams = json.loads(stdout).get("streams", [])
+        width = int(streams[0]["width"])
+        height = int(streams[0]["height"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExportExecutionError("ffprobe returned no valid video dimensions") from exc
+    if width < 32 or height < 32:
+        raise ExportExecutionError("video dimensions are too small for delivery")
+    return width, height
+
+
+def select_master_dimensions(dimensions: Sequence[tuple[int, int]]) -> tuple[int, int]:
+    """Preserve the largest encoded canvas while keeping H.264 dimensions even."""
+    if not dimensions:
+        raise ValueError("at least one source video dimension is required")
+    width, height = max(dimensions, key=lambda value: value[0] * value[1])
+    width -= width % 2
+    height -= height % 2
+    if width < 32 or height < 32:
+        raise ValueError("source video dimensions are too small for delivery")
+    return width, height
+
+
 def order_segment_ids_for_export(
     segment_ids: Sequence[str], workspace_payload: dict[str, object]
 ) -> tuple[str, ...]:
-    """Resolve media order from the approved prompt list, never from opaque IDs."""
+    """Resolve narrative order independently from BFS execution order."""
     prompts = workspace_payload.get("prompts")
     h3_prompts = prompts.get("h3Prompts") if isinstance(prompts, dict) else None
     if not isinstance(h3_prompts, list):
         raise ValueError("workspace has no H3 prompt order for export")
-    expected = [
-        str(item.get("segmentId") or "")
+    prompt_rows = [
+        item
         for item in h3_prompts
         if isinstance(item, dict) and str(item.get("segmentId") or "")
     ]
+    shots = workspace_payload.get("shots")
+    shot_order = (
+        {
+            str(item.get("id")): index
+            for index, item in enumerate(shots)
+            if isinstance(item, dict) and str(item.get("id") or "")
+        }
+        if isinstance(shots, list)
+        else {}
+    )
+    if shot_order:
+        # The prompt list may be stored in breadth-first generation order. The
+        # storyboard is the narrative authority; Motion Context segments are
+        # ordered only within their owning shot.
+        original_order = {id(item): index for index, item in enumerate(prompt_rows)}
+        prompt_rows.sort(
+            key=lambda item: (
+                shot_order.get(
+                    str(item.get("shotId") or str(item.get("segmentId")).split(".", 1)[0]),
+                    len(shot_order) + original_order[id(item)],
+                ),
+                int(item.get("segmentIndex") or 0),
+                original_order[id(item)],
+            )
+        )
+    expected = [str(item.get("segmentId")) for item in prompt_rows]
     if len(expected) != len(set(expected)):
         raise ValueError("workspace H3 prompt order contains duplicate segment IDs")
     actual = tuple(segment_ids)
@@ -189,7 +264,7 @@ async def run_export(
             raise ExportExecutionError(f"FFmpeg export failed: {message}")
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise ExportExecutionError("FFmpeg completed without a non-empty output")
-        sha256_value = _sha256_file(temporary_output)
+        sha256_value = sha256_file(temporary_output)
         byte_size = temporary_output.stat().st_size
         temporary_output.replace(spec.output_path)
         return ExportResult(
@@ -201,11 +276,3 @@ async def run_export(
     finally:
         manifest_path.unlink(missing_ok=True)
         temporary_output.unlink(missing_ok=True)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()

@@ -338,6 +338,7 @@ async def test_streaming_client_applies_idle_timeout_after_first_delta() -> None
         model="test-model",
         timeout_seconds=0.001,
         first_token_timeout_seconds=1,
+        stream_idle_timeout_seconds=0.001,
         http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
     )
     with pytest.raises(LLMClientError, match="stream idle timeout"):
@@ -358,6 +359,7 @@ async def test_streaming_client_finishes_without_done_frame() -> None:
         model="test-model",
         timeout_seconds=0.001,
         first_token_timeout_seconds=1,
+        stream_idle_timeout_seconds=0.001,
         http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
     )
 
@@ -384,7 +386,7 @@ async def test_streaming_client_accepts_complete_json_when_gateway_stays_open() 
 
 
 @pytest.mark.asyncio
-async def test_plain_text_completion_accepts_received_text_when_gateway_stays_open() -> None:
+async def test_plain_text_completion_rejects_partial_text_when_gateway_stays_open() -> None:
     response = _FakeStreamResponse(
         [
             (0, 'data: {"choices":[{"delta":{"content":"image prompt"}}]}'),
@@ -396,9 +398,9 @@ async def test_plain_text_completion_accepts_received_text_when_gateway_stays_op
         model="test-model",
         timeout_seconds=0.001,
         first_token_timeout_seconds=1,
+        stream_idle_timeout_seconds=0.001,
         http_client=_FakeStreamingHttp(response),  # type: ignore[arg-type]
     )
 
-    assert await client._complete_json_stream(
-        {}, lambda _: None, accept_started_text_on_idle=True
-    ) == "image prompt"
+    with pytest.raises(LLMClientError, match="stream idle timeout"):
+        await client._complete_json_stream({}, lambda _: None)

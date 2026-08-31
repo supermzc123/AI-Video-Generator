@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
     llm_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     llm_first_token_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    llm_stream_idle_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
     llm_video_capable: bool = False
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
@@ -46,9 +47,14 @@ class Settings(BaseSettings):
     h3_audio_vae: str = "minimax_h3_audio_vae_fp32.safetensors"
     h3_turbo_lora: str = "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors"
     h3_turbo_enabled: bool = True
+    # Legacy persisted key retained so existing installations keep their toggle value.
     h3_sage_attention_enabled: bool = False
     h3_low_vram: bool = True
     h3_steps: int = Field(default=6, ge=4, le=50)
+    h3_conditioning_workflow_template_id: str | None = None
+    h3_conditioning_workflow_revision: int | None = Field(default=None, ge=1)
+    h3_diffusion_workflow_template_id: str | None = None
+    h3_diffusion_workflow_revision: int | None = Field(default=None, ge=1)
 
     @field_validator("comfyui_base_url")
     @classmethod
@@ -95,6 +101,7 @@ RUNTIME_SETTING_FIELDS = (
     "llm_api_key",
     "llm_timeout_seconds",
     "llm_first_token_timeout_seconds",
+    "llm_stream_idle_timeout_seconds",
     "llm_video_capable",
     "network_proxy",
     "h3_diffusion_model",
@@ -106,6 +113,10 @@ RUNTIME_SETTING_FIELDS = (
     "h3_sage_attention_enabled",
     "h3_low_vram",
     "h3_steps",
+    "h3_conditioning_workflow_template_id",
+    "h3_conditioning_workflow_revision",
+    "h3_diffusion_workflow_template_id",
+    "h3_diffusion_workflow_revision",
 )
 
 
@@ -129,9 +140,7 @@ def load_runtime_settings(settings: Settings) -> Settings:
     if isinstance(plaintext, str) and plaintext:
         store_secret(plaintext)
         payload.pop("llm_api_key", None)
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if settings.llm_api_key is None:
         stored = load_secret()
         if stored:

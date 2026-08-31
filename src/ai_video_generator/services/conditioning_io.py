@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -11,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from .hashing import sha256_file
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CONDITIONING_FORMAT = "safetensors+json-v1"
@@ -61,7 +62,7 @@ def write_conditioning_artifact(
     manifest_tmp = _temporary_peer(manifest_path)
     try:
         save_file(tensors, str(tensor_tmp), metadata={"format": CONDITIONING_FORMAT})
-        blob_sha256 = _sha256_file(tensor_tmp)
+        blob_sha256 = sha256_file(tensor_tmp)
         byte_size = tensor_tmp.stat().st_size
         manifest = {
             "format": CONDITIONING_FORMAT,
@@ -137,7 +138,7 @@ def read_conditioning_artifact(
     actual_size = tensor_path.stat().st_size
     if manifest.get("byte_size") != actual_size:
         raise ConditioningIntegrityError("conditioning tensor byte size does not match")
-    actual_sha256 = _sha256_file(tensor_path)
+    actual_sha256 = sha256_file(tensor_path)
     if manifest.get("blob_sha256") != actual_sha256:
         raise ConditioningIntegrityError("conditioning tensor SHA-256 does not match")
 
@@ -298,11 +299,3 @@ def _validate_distinct_paths(tensor_path: Path, manifest_path: Path) -> None:
 
 def _temporary_peer(path: Path) -> Path:
     return path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()

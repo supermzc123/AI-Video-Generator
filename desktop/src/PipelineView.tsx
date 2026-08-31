@@ -27,6 +27,7 @@ import {
 import { ChangeEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelTask,
+  cancelProjectLlmOperation,
   acceptAssetCandidate,
   assetCandidatePreviewUrl,
   compileProjectDeliveryTasks,
@@ -40,13 +41,13 @@ import {
   getProjectExecutionStatus,
   getTask,
   listProjectAssets,
+  listProjectLlmOperations,
   listAssetCandidates,
   listTaskArtifacts,
   listTaskReviewDecisions,
   artifactMediaUrl,
   projectAssetPreviewUrl,
   projectAssetMediaUrl,
-  regenerateH3Prompt,
   streamRegenerateH3Prompt,
   regenerateProjectAsset,
   relinkProjectAsset,
@@ -79,10 +80,23 @@ import type {
   ReviewDecision,
   ReworkMarker,
   SegmentGenerationVersion,
+  H3PromptRevision,
 } from "./types";
 
 function extractH3Description(stream: string): string | null {
   return stream || null;
+}
+
+function mergeH3PromptEntries(
+  existing: H3PromptRevision[],
+  incoming: H3PromptRevision[],
+): H3PromptRevision[] {
+  const merged = new Map(existing.map((item) => [item.segmentId, item]));
+  incoming.forEach((item) => {
+    const current = merged.get(item.segmentId);
+    if (!current?.prompt.trim() || item.prompt.trim()) merged.set(item.segmentId, item);
+  });
+  return [...merged.values()];
 }
 
 function detachAsset(project: ProjectDraft, assetId: string): ProjectDraft {
@@ -173,7 +187,7 @@ const reviewBoundaryKinds = new Set<TaskKind>([
 
 type Props = {
   project: ProjectDraft;
-  workflows: Array<{ name: string; id: string; revision: number; kind?: "image" | "interpolation" | "restoration" | "transcription" | "video" }>;
+  workflows: Array<{ name: string; id: string; revision: number; kind?: "image" | "interpolation" | "restoration" | "transcription" | "video" | "h3_conditioning" | "h3_diffusion" }>;
   workerOnline: boolean;
   onChange: (project: ProjectDraft) => void;
   onOpenWorkflows: () => void;
@@ -285,8 +299,8 @@ function GenerationSegmentCard({ segment, project, tasks, reviewTasks, artifacts
     <div className="review-media">{video ? <video controls preload="metadata" src={artifactMediaUrl(video)}>当前系统播放器不支持此视频格式。</video> : <div className="media-placeholder"><Film size={24} /><span>{task?.state === "succeeded" ? "视频产物未登记或已作废" : segment.freeze_reason ?? "等待片段生成完成"}</span></div>}</div>
     {prompt && <details className="review-prompt"><summary>查看生成提示词</summary><pre>{prompt.prompt}</pre></details>}
     {decision && showAi && <section className="review-decision"><div className="decision-summary"><strong>{decision.disposition === "accepted" ? "AI 建议通过" : "AI 建议返工"}</strong><span>置信度 {Math.round(decision.confidence * 100)}%</span></div>{decision.issues.map((issue, index) => <div className={`review-issue ${issue.severity}`} key={`${issue.category}:${index}`}><header><strong>{issue.message}</strong><span>{issue.start_seconds === null ? "未标注时间" : `${issue.start_seconds.toFixed(1)}s`}</span></header>{issue.suggested_action && <p>建议：{issue.suggested_action}</p>}</div>)}</section>}
-    {marker && <div className="rework-marker"><CircleAlert size={14} /><span>{marker.state === "draft" ? "等待统一确认返工" : marker.state === "preparing" ? "返工批次准备中" : "返工批次已封存"}：{marker.feedback}</span>{marker.state !== "sealed" && <button className="secondary-button" disabled={actionBusy} onClick={() => onWithdraw(marker.marker_id)}>撤销标记</button>}</div>}
-    {version && !marker && project.reviewPolicy.effectiveMode !== "none" && <footer><button className="secondary-button" disabled={actionBusy || !video} onClick={() => onMark(version)}><RotateCcw size={14} />标记返工</button></footer>}
+    {marker && <div className="rework-marker"><CircleAlert size={14} /><span>{marker.state === "draft" ? "等待统一确认返工" : marker.state === "preparing" ? "返工批次准备中" : "返工批次已封存"}：{marker.feedback}</span><button className="secondary-button" disabled={actionBusy} onClick={() => onWithdraw(marker.marker_id)}>取消返工</button></div>}
+    {version && !marker && project.reviewPolicy.effectiveMode !== "none" && <footer><button className="secondary-button" disabled={actionBusy} onClick={() => onMark(version)}><RotateCcw size={14} />标记返工</button></footer>}
   </article>;
 }
 
@@ -445,6 +459,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const [actionError, setActionError] = useState<string | null>(null);
   const [promptGenerationBusy, setPromptGenerationBusy] = useState(false);
   const [promptGenerationProgress, setPromptGenerationProgress] = useState({ completed: 0, total: 0 });
+  const [backgroundPromptCount, setBackgroundPromptCount] = useState(0);
+  const [activePromptOperationIds, setActivePromptOperationIds] = useState<string[]>([]);
   const [configFormValid, setConfigFormValid] = useState(true);
   const [promptTab, setPromptTab] = useState<"image" | "h3">("h3");
   const [promptTranslations, setPromptTranslations] = useState<Record<string, string>>({});
@@ -480,6 +496,23 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const promptGenerationStarted = useRef(new Set<string>());
   const promptGenerationAbort = useRef<AbortController | null>(null);
   const guidedRunAbort = useRef<AbortController | null>(null);
+  const detachedPromptActive = useRef(false);
+  const mergePromptWorkspace = (incoming: ProjectDraft) => {
+    const current = latestProject.current;
+    const changed = {
+      ...incoming,
+      activeStage: current.activeStage,
+      prompts: {
+        ...incoming.prompts,
+        h3Prompts: mergeH3PromptEntries(
+          current.prompts.h3Prompts,
+          incoming.prompts.h3Prompts,
+        ),
+      },
+    };
+    latestProject.current = changed;
+    onChange(changed);
+  };
   const activeIndex = pipelineOrder.indexOf(project.activeStage);
   const shotsDuration = useMemo(
     () => project.shots.reduce((total, shot) => total + shot.durationSeconds, 0),
@@ -571,18 +604,20 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       ?? null;
   };
 
-  const commitAssetResolution = (
+  const commitAssetResolution = async (
     plan: ProjectDraft["assetPlans"][number],
     field: "width" | "height",
     value: number,
   ) => {
     if (value === plan[field] && plan.resolutionSource === "manual") return;
-    update("assets", (current) => ({
-      ...current,
-      assetPlans: current.assetPlans.map((item) => item.id === plan.id
+    const resizedProject = {
+      ...project,
+      assetPlans: project.assetPlans.map((item) => item.id === plan.id
         ? { ...item, [field]: value, resolutionSource: "manual" as const }
         : item),
-    }));
+    };
+    const changed = invalidateFromStage(resizedProject, "assets", pipelineOrder);
+    onChange(await saveProjectToControlPlane(changed));
     const other = field === "width" ? plan.height : plan.width;
     setActionMessage(`已将“${plan.name}”设为手动分辨率，当前约 ${((value * other) / 1_000_000).toFixed(2)} MP`);
   };
@@ -593,14 +628,14 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       <label><span>宽</span><AssetResolutionInput
         value={plan.width}
         label={`${plan.name}图片宽度`}
-        onCommit={(value) => commitAssetResolution(plan, "width", value)}
+        onCommit={(value) => void commitAssetResolution(plan, "width", value)}
         onInvalid={() => setActionError("图片宽高必须是 64 到 4096 之间且能被 8 整除的整数")}
       /></label>
       <i>×</i>
       <label><span>高</span><AssetResolutionInput
         value={plan.height}
         label={`${plan.name}图片高度`}
-        onCommit={(value) => commitAssetResolution(plan, "height", value)}
+        onCommit={(value) => void commitAssetResolution(plan, "height", value)}
         onInvalid={() => setActionError("图片宽高必须是 64 到 4096 之间且能被 8 整除的整数")}
       /></label>
       <em>{plan.resolutionSource === "manual" ? "手动" : plan.resolutionSource === "ai" ? "AI" : "待 AI 决定"}</em>
@@ -680,8 +715,13 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           const task = await getTask(taskId);
           if (cancelled) return;
           if (task.state === "succeeded") {
-            if (candidateTaskPlans[planId]) {
-              const candidates = await listAssetCandidates(project.projectId, planId);
+            // The task and candidate rows are committed independently. Read the
+            // authoritative candidate list before deciding whether to replace
+            // the current asset; this also removes a React state race after
+            // regeneration where the old asset was briefly shown as satisfied.
+            const candidates = await listAssetCandidates(project.projectId, planId);
+            const hasPendingCandidate = candidates.some((candidate) => candidate.state === "pending");
+            if (candidateTaskPlans[planId] || hasPendingCandidate) {
               if (cancelled) return;
               setAssetCandidatesByPlan((current) => ({ ...current, [planId]: candidates }));
               setCandidateTaskPlans((current) => {
@@ -731,6 +771,48 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     if (project.activeStage === "prompts") setPromptTab("h3");
   }, [project.activeStage, project.projectId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    let initialWorkspaceChecked = false;
+    const poll = async () => {
+      try {
+        const operations = await listProjectLlmOperations(project.projectId);
+        if (cancelled) return;
+        const active = operations.filter((item) => (
+          item.state === "running"
+          && (item.kind === "h3_prompt" || item.kind === "image_prompt")
+        ));
+        setActivePromptOperationIds(active.map((item) => item.operation_id));
+        if (active.length) {
+          detachedPromptActive.current = true;
+          setBackgroundPromptCount(active.length);
+          setActionMessage(`后台正在生成 ${active.length} 项提示词；刷新页面不会中断`);
+          return;
+        }
+        setBackgroundPromptCount(0);
+        if (detachedPromptActive.current) {
+          detachedPromptActive.current = false;
+          const latest = await getProjectWorkspace(project.projectId);
+          if (!cancelled) {
+            mergePromptWorkspace(latest);
+            setActionMessage("后台提示词生成已完成，文本框已同步");
+          }
+        } else if (!initialWorkspaceChecked) {
+          initialWorkspaceChecked = true;
+          const latest = await getProjectWorkspace(project.projectId);
+          if (!cancelled && latest.revision > project.revision) mergePromptWorkspace(latest);
+        }
+      } catch (cause) {
+        if (!cancelled && detachedPromptActive.current) {
+          setActionError(cause instanceof Error ? cause.message : "读取后台 LLM 状态失败");
+        }
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [onChange, project.projectId]);
+
   async function runPromptGeneration(force: boolean) {
     const key = `${project.projectId}:${project.revision}:prompts`;
     if (!force && promptGenerationStarted.current.has(key)) return;
@@ -766,7 +848,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         );
         return { slot, generated };
       }));
-      const merged = new Map(project.prompts.h3Prompts.map((item) => [item.segmentId, item]));
+      const current = latestProject.current;
+      const merged = new Map(current.prompts.h3Prompts.map((item) => [item.segmentId, item]));
       results.forEach((result) => {
         if (result.status === "fulfilled") {
           const prompt = result.value.generated.prompts.h3Prompts.find((item) => (
@@ -776,8 +859,10 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           if (prompt?.prompt.trim()) { succeeded += 1; merged.set(prompt.segmentId, prompt); } else failed += 1;
         } else if (!controller.signal.aborted) failed += 1;
       });
-      if (merged.size !== project.prompts.h3Prompts.length || succeeded) {
-        onChange({ ...project, prompts: { ...project.prompts, h3Prompts: [...merged.values()] } });
+      if (merged.size !== current.prompts.h3Prompts.length || succeeded) {
+        const changed = { ...current, prompts: { ...current.prompts, h3Prompts: [...merged.values()] } };
+        latestProject.current = changed;
+        onChange(changed);
       }
       setPromptGenerationProgress({ completed: succeeded + failed, total: targets.length });
       if (controller.signal.aborted) {
@@ -801,9 +886,26 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     }
   }
 
-  const stopPromptGeneration = () => {
+  const stopPromptGeneration = async () => {
     promptGenerationAbort.current?.abort();
-    setActionMessage("正在停止视频提示词生成；已完成的片段会保留...");
+    let operationIds = activePromptOperationIds;
+    try {
+      const operations = await listProjectLlmOperations(project.projectId);
+      operationIds = operations
+        .filter((item) => item.state === "running" && (item.kind === "h3_prompt" || item.kind === "image_prompt"))
+        .map((item) => item.operation_id);
+    } catch {
+      // The local stream is still aborted even if the status lookup fails.
+    }
+    if (operationIds.length) {
+      await Promise.allSettled(operationIds.map((operationId) => (
+        cancelProjectLlmOperation(project.projectId, operationId)
+      ))).then(() => {
+        setActivePromptOperationIds([]);
+        setBackgroundPromptCount(0);
+      });
+    }
+    setActionMessage("正在停止提示词生成；已完成的内容会保留...");
   };
 
   const saveDraft = async (value = project) => {
@@ -1179,7 +1281,15 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     const changed = (() => {
       const next = existingIndex >= 0
         ? current.prompts.h3Prompts.map((item, index) => index === existingIndex
-          ? { ...item, prompt: promptText, review: { ...item.review, ready: false } }
+          ? {
+              ...item,
+              prompt: promptText,
+              // Editing an approved prompt creates a new draft. Unlock it so
+              // the next generation pass cannot silently reuse the old text.
+              locked: false,
+              revision: item.revision + 1,
+              review: { ...item.review, ready: false },
+            }
           : item)
         : [...current.prompts.h3Prompts, {
           id: `draft-${slot.segmentId}`,
@@ -1196,7 +1306,6 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           harnessRevision: null,
           locked: false,
           revision: 1,
-          legacy: false,
           review: { ready: false, issues: [], reviewedAt: null },
         }];
       return { ...current, prompts: { ...current.prompts, h3Prompts: next } };
@@ -1216,7 +1325,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         const preview = extractH3Description(streamed);
         if (preview) patchH3Prompt(slot, preview);
       });
-      onChange(generated);
+      mergePromptWorkspace(generated);
       const failed = generated.prompts.generationSummary?.failedSegmentIds?.includes(slot.segmentId);
       if (failed) {
         const issue = generated.prompts.h3Prompts.find((item) => item.segmentId === slot.segmentId)?.review.issues[0];
@@ -1272,15 +1381,16 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
     setActionBusy(true);
     try {
       const saved = await updateProjectAsset(project.projectId, asset.id, { ...next, name: next.name.trim() });
-      update("assets", (current) => ({
-        ...current,
+      const changed = {
+        ...project,
         idea: {
-          ...current.idea,
-          concept: current.idea.conceptDocument.nodes.map((node) => node.type === "asset_mention" && node.assetId === saved.id ? `@${saved.name}` : node.type === "asset_mention" ? `@${node.displayName}` : node.text).join(""),
-          conceptDocument: { nodes: current.idea.conceptDocument.nodes.map((node) => node.type === "asset_mention" && node.assetId === saved.id ? { ...node, displayName: saved.name } : node) },
+          ...project.idea,
+          concept: project.idea.conceptDocument.nodes.map((node) => node.type === "asset_mention" && node.assetId === saved.id ? `@${saved.name}` : node.type === "asset_mention" ? `@${node.displayName}` : node.text).join(""),
+          conceptDocument: { nodes: project.idea.conceptDocument.nodes.map((node) => node.type === "asset_mention" && node.assetId === saved.id ? { ...node, displayName: saved.name } : node) },
         },
-        assets: current.assets.map((item) => item.id === asset.id ? saved : item),
-      }));
+        assets: project.assets.map((item) => item.id === asset.id ? saved : item),
+      };
+      onChange(await saveProjectToControlPlane(changed));
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "素材修改失败");
     } finally { setActionBusy(false); }
@@ -1600,13 +1710,15 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   };
 
   const submitRework = async () => {
-    if (!reworkDialog || !reworkDialog.feedback.trim()) return;
+    if (!reworkDialog) return;
+    const requiresFeedback = reworkDialog.action === "revise_prompt";
+    if (requiresFeedback && !reworkDialog.feedback.trim()) return;
     setActionBusy(true);
     try {
       await createReworkMarker(project.projectId, {
         version_id: reworkDialog.version.version_id,
         action: reworkDialog.action,
-        feedback: reworkDialog.feedback.trim(),
+        feedback: requiresFeedback ? reworkDialog.feedback.trim() : undefined,
         replacement_seed: reworkDialog.action === "change_seed" ? reworkDialog.replacementSeed : null,
       });
       setReworkDialog(null);
@@ -1701,13 +1813,15 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         </header>
 
         {project.activeStage === "config" && <ProjectView
-          embedded
           project={project}
           onValidationChange={setConfigFormValid}
           onChange={(changed) => {
-            const next = project.stageApprovals.config
-              ? invalidateFromStage(changed, "config", pipelineOrder)
-              : changed;
+            const lorasChanged = JSON.stringify(changed.h3Loras) !== JSON.stringify(project.h3Loras);
+            const next = lorasChanged
+              ? invalidateFromStage(changed, "generation", pipelineOrder)
+              : project.stageApprovals.config
+                ? invalidateFromStage(changed, "config", pipelineOrder)
+                : changed;
             onChange(persistProject(next));
           }}
         />}
@@ -1923,13 +2037,13 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           <form className="asset-name-dialog rework-dialog" onSubmit={(event) => { event.preventDefault(); void submitRework(); }}>
             <header><div><strong>标记片段返工</strong><span>片段 {reworkDialog.segmentId} · 标记后立即冻结所属连续序列</span></div></header>
             <fieldset className="rework-actions"><legend>处理方式</legend>
-              <label><input type="radio" name="rework-action" checked={reworkDialog.action === "retry"} onChange={() => setReworkDialog({ ...reworkDialog, action: "retry" })} /><span><strong>重跑原任务</strong><small>用于文件损坏、黑帧或执行异常</small></span></label>
+              <label><input type="radio" name="rework-action" checked={reworkDialog.action === "retry"} onChange={() => setReworkDialog({ ...reworkDialog, action: "retry" })} /><span><strong>技术性失败</strong><small>保持原提示词和 Seed，通过统一返工队列重新生成</small></span></label>
               <label><input type="radio" name="rework-action" checked={reworkDialog.action === "change_seed"} onChange={() => setReworkDialog({ ...reworkDialog, action: "change_seed" })} /><span><strong>更换 Seed</strong><small>用于瞬态伪影、偶发形体或构图问题</small></span></label>
               <label><input type="radio" name="rework-action" checked={reworkDialog.action === "revise_prompt"} onChange={() => setReworkDialog({ ...reworkDialog, action: "revise_prompt" })} /><span><strong>修改提示词</strong><small>用于语义、身份或连续性偏差</small></span></label>
             </fieldset>
             {reworkDialog.action === "change_seed" && <label className="field"><span>新 Seed</span><input type="number" min="0" value={reworkDialog.replacementSeed} onChange={(event) => setReworkDialog({ ...reworkDialog, replacementSeed: Math.max(0, Number(event.target.value) || 0) })} /></label>}
-            <label className="field"><span>驳回反馈（必填）</span><textarea autoFocus rows={6} required value={reworkDialog.feedback} onChange={(event) => setReworkDialog({ ...reworkDialog, feedback: event.target.value })} placeholder="描述问题、出现时间和期望修改，例如：2.1–3.0 秒人物身份漂移，保持服装和脸部特征不变。" /></label>
-            <footer><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => setReworkDialog(null)}>取消</button><button type="submit" className="primary-button" disabled={actionBusy || !reworkDialog.feedback.trim()}>{actionBusy ? "正在标记..." : "标记返工"}</button></footer>
+            {reworkDialog.action === "revise_prompt" && <label className="field"><span>提示词修改要求（必填）</span><textarea autoFocus rows={6} required value={reworkDialog.feedback} onChange={(event) => setReworkDialog({ ...reworkDialog, feedback: event.target.value })} placeholder="描述问题、出现时间和期望修改，例如：2.1–3.0 秒人物身份漂移，保持服装和脸部特征不变。" /></label>}
+            <footer><button type="button" className="secondary-button" disabled={actionBusy} onClick={() => setReworkDialog(null)}>取消</button><button type="submit" className="primary-button" disabled={actionBusy || (reworkDialog.action === "revise_prompt" && !reworkDialog.feedback.trim())}>{actionBusy ? "正在标记..." : "标记返工"}</button></footer>
           </form>
         </div>}
 
@@ -1938,11 +2052,11 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             <button className={promptTab === "image" ? "active" : ""} onClick={() => setPromptTab("image")}>图片提示词 <span>{project.prompts.imagePrompts.length}</span></button>
             <button className={promptTab === "h3" ? "active" : ""} onClick={() => setPromptTab("h3")}>H3 视频提示词 <span>{project.prompts.h3Prompts.length}/{segmentCount}</span></button>
           </div>
-          {promptGenerationBusy && <div className="prompt-generating" aria-live="polite"><Sparkles size={17} /><span>正在分析素材并编写提示词；已完成 {promptGenerationProgress.completed}/{promptGenerationProgress.total}，结果会逐项写入文本框。</span></div>}
+          {(promptGenerationBusy || backgroundPromptCount > 0) && <div className="prompt-generating" aria-live="polite"><Sparkles size={17} /><span>{promptGenerationBusy && promptGenerationProgress.total > 0 ? `正在分析素材并编写提示词；已完成 ${promptGenerationProgress.completed}/${promptGenerationProgress.total}，结果会逐项写入文本框。` : `后台正在生成 ${backgroundPromptCount} 项提示词；刷新页面不会中断，完成后文本框会自动同步。`}</span>{backgroundPromptCount > 0 && <button type="button" className="secondary-button" onClick={stopPromptGeneration}><Square size={14} />停止生成</button>}</div>}
           {promptTab === "image" && <div className="prompt-list">
             <div className="inline-toolbar prompt-stage-toolbar">
               <span>{project.assetPlans.length} 份图片素材需求 · AI 请求并发执行</span>
-              <button className="primary-button" disabled={actionBusy || !project.assetPlans.length} onClick={() => void generateAllImagePrompts()}><Sparkles size={15} />生成全部图片提示词</button>
+              <button className="primary-button" disabled={actionBusy || promptGenerationBusy || backgroundPromptCount > 0 || !project.assetPlans.length} onClick={() => void generateAllImagePrompts()}><Sparkles size={15} />生成全部图片提示词</button>
             </div>
             {project.prompts.imagePrompts.map((prompt, index) => <article className="prompt-card" key={prompt.id}>
               <header><div><span>图片 {String(index + 1).padStart(2, "0")}</span><strong>{project.assetPlans.find((plan) => plan.id === prompt.assetPlanId)?.name ?? "待生成素材"}</strong></div><span className="state">已编写</span></header>
@@ -1959,7 +2073,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
               <span>{project.shots.length} 个电影分镜 · {h3SegmentSlots.length} 份独立视频提示词</span>
               <button
                 className="primary-button"
-                disabled={actionBusy || !h3SegmentSlots.length}
+                disabled={actionBusy || backgroundPromptCount > 0 || !h3SegmentSlots.length}
                 onClick={() => promptGenerationBusy ? stopPromptGeneration() : void runPromptGeneration(true)}
               >
                 {promptGenerationBusy ? <Square size={14} /> : <Sparkles size={15} />}
@@ -1981,11 +2095,11 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
                   return <section className="h3-segment-editor" key={slot.segmentId}>
                     <div className="h3-segment-heading">
                       <div><strong>视频提示词 {slot.segmentIndex + 1}/{slot.segmentCount}</strong><span>{slot.durationSeconds} 秒 · Seed {slot.seed}{slot.continuationOf ? " · Motion Context 续段" : slot.segmentCount > 1 ? " · 连续链首段" : " · 独立片段"}</span></div>
-                      <div className="h3-segment-actions"><span className={`state ${prompt?.prompt.trim() ? "state-ready" : ""}`}>{prompt?.prompt.trim() ? "已填写" : "待编写"}</span><button className="secondary-button" disabled={actionBusy || promptGenerationBusy} onClick={() => void generateOneH3Prompt(slot)}>{prompt?.prompt.trim() ? <RotateCcw size={14} /> : <Sparkles size={14} />}{prompt?.prompt.trim() ? "AI 重新编写" : "AI 编写"}</button></div>
+                      <div className="h3-segment-actions"><span className={`state ${prompt?.prompt.trim() ? "state-ready" : ""}`}>{prompt?.prompt.trim() ? "已填写" : "待编写"}</span><button className="secondary-button" disabled={actionBusy || promptGenerationBusy || backgroundPromptCount > 0} onClick={() => void generateOneH3Prompt(slot)}>{prompt?.prompt.trim() ? <RotateCcw size={14} /> : <Sparkles size={14} />}{prompt?.prompt.trim() ? "AI 重新编写" : "AI 编写"}</button></div>
                     </div>
                     <textarea
                       rows={9}
-                      disabled={actionBusy || promptGenerationBusy}
+                      disabled={actionBusy || promptGenerationBusy || backgroundPromptCount > 0}
                       value={prompt?.prompt ?? ""}
                       onChange={(event) => patchH3Prompt(slot, event.target.value)}
                       placeholder="可在此手动编写 H3 视频提示词，或使用右上角按钮让 AI 按官方规范编写。执行描述建议使用英文；中文对白、歌词和画面文字保持原文。文本框中的最终内容会直接传给 MiniMax。"
@@ -2089,6 +2203,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
           project={project}
           onAutomaticGenerationChange={handleAutomaticGenerationChange}
           prepareProject={() => saveDraft()}
+          acceptCommittedProject={onChange}
           applyProject={async (changed) => {
             const invalidated = invalidateFromStage(changed, project.activeStage, pipelineOrder);
             const saved = await saveDraft(invalidated);

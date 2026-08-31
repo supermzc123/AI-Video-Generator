@@ -6,6 +6,7 @@ import {
   installRequiredComfyNodes,
   listComfyuiModels,
   listLlmModels,
+  listWorkflowTemplates,
   updateRuntimeSettings,
 } from "./api";
 import type { ComfyNodeInstallResult, RuntimeSettings } from "./api";
@@ -19,6 +20,7 @@ const fallback: RuntimeSettings = {
   llmApiKeyConfigured: false,
   llmTimeoutSeconds: 30,
   llmFirstTokenTimeoutSeconds: 30,
+  llmStreamIdleTimeoutSeconds: 600,
   llmVideoCapable: false,
   networkProxy: "",
   h3DiffusionModel: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -27,9 +29,13 @@ const fallback: RuntimeSettings = {
   h3AudioVae: "minimax_h3_audio_vae_fp32.safetensors",
   h3TurboLora: "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
   h3TurboEnabled: true,
-  h3SageAttentionEnabled: false,
+  h3KitchenAttentionEnabled: false,
   h3LowVram: true,
   h3Steps: 6,
+  h3ConditioningWorkflowTemplateId: "",
+  h3ConditioningWorkflowRevision: null,
+  h3DiffusionWorkflowTemplateId: "",
+  h3DiffusionWorkflowRevision: null,
 };
 
 function splitComfyUrl(value: string): { origin: string; port: string } {
@@ -57,6 +63,7 @@ export function SettingsView() {
   const [savedSnapshot, setSavedSnapshot] = useState("");
   const [workerBlockers, setWorkerBlockers] = useState<string[]>([]);
   const [nodeInstallResult, setNodeInstallResult] = useState<ComfyNodeInstallResult | null>(null);
+  const [workflowTemplates, setWorkflowTemplates] = useState<Array<{ template_id: string; revision: number; name: string; kind?: string }>>([]);
 
   useEffect(() => {
     void getRuntimeSettings()
@@ -68,6 +75,9 @@ export function SettingsView() {
         setSavedSnapshot(JSON.stringify({ value, origin: comfy.origin, port: comfy.port }));
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "无法读取设置"));
+  }, []);
+  useEffect(() => {
+    void listWorkflowTemplates().then(setWorkflowTemplates).catch(() => setWorkflowTemplates([]));
   }, []);
 
   const portValid = useMemo(() => {
@@ -84,6 +94,8 @@ export function SettingsView() {
     vaes: comfyModels.vaes.filter((item) => item.toLowerCase().includes("minimax")),
     loras: comfyModels.loras.filter((item) => item.toLowerCase().includes("minimax_h3_turbo")),
   }), [comfyModels]);
+  const h3ConditioningWorkflows = workflowTemplates.filter((item) => item.kind === "h3_conditioning");
+  const h3DiffusionWorkflows = workflowTemplates.filter((item) => item.kind === "h3_diffusion");
 
   async function save(showSuccess = true): Promise<boolean> {
     if (!portValid) {
@@ -204,7 +216,7 @@ export function SettingsView() {
         <label className="field"><span>端口</span><input inputMode="numeric" value={comfyPort} onChange={(event) => setComfyPort(event.target.value)} /></label>
         <label className="field"><span>请求超时（秒）</span><input type="number" min="1" max="60" value={settings.requestTimeoutSeconds} onChange={(event) => setSettings({ ...settings, requestTimeoutSeconds: Number(event.target.value) })} /></label>
         <label className="field field-wide"><span>ComfyUI 文件夹</span><input value={settings.comfyuiRoot} placeholder="D:\\Comfy_new\\ComfyUI" onChange={(event) => { setSettings({ ...settings, comfyuiRoot: event.target.value }); setNodeInstallResult(null); }} /></label>
-        <div className="node-install-row field-wide"><div><strong>安装视频生成所需节点</strong><span>安装项目专属节点、H3 Motion Context和官方Turbo节点；不安装SageAttention</span></div><button className="secondary-button" disabled={busy || !settings.comfyuiRoot.trim()} onClick={() => void installNodes()}><Blocks size={16} />{busy ? "处理中" : "保存路径并安装"}</button></div>
+        <div className="node-install-row field-wide"><div><strong>安装视频生成所需节点</strong><span>安装项目专属节点、H3 Motion Context 和官方 Turbo 节点；注意力后端由 ComfyUI 原生提供</span></div><button className="secondary-button" disabled={busy || !settings.comfyuiRoot.trim()} onClick={() => void installNodes()}><Blocks size={16} />{busy ? "处理中" : "保存路径并安装"}</button></div>
         {nodeInstallResult && <div className="node-install-results field-wide">{nodeInstallResult.steps.map((step) => <div className={step.succeeded ? "installed" : "failed"} key={step.component}>{step.succeeded ? <Check size={15} /> : <CircleAlert size={15} />}<span><strong>{step.label}</strong><small>{step.message}</small></span></div>)}</div>}
       </div>
     </div>
@@ -219,14 +231,20 @@ export function SettingsView() {
         <label className="field field-wide"><span>Turbo LoRA</span><select disabled={!settings.h3TurboEnabled} value={settings.h3TurboLora} onChange={(event) => setSettings({ ...settings, h3TurboLora: event.target.value })}><option value={settings.h3TurboLora}>{settings.h3TurboLora}</option>{h3Models.loras.filter((item) => item !== settings.h3TurboLora).map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
         <label className="field"><span>采样步数</span><input type="number" min="4" max="50" value={settings.h3Steps} onChange={(event) => setSettings({ ...settings, h3Steps: Number(event.target.value) })} /></label>
         <label className="check-field"><input type="checkbox" checked={settings.h3TurboEnabled} onChange={(event) => setSettings({ ...settings, h3TurboEnabled: event.target.checked, h3Steps: event.target.checked ? 6 : 20 })} />启用官方 Turbo（可选）</label>
-        <label className="check-field"><input type="checkbox" checked={settings.h3SageAttentionEnabled} onChange={(event) => setSettings({ ...settings, h3SageAttentionEnabled: event.target.checked })} />启用 SageAttention</label>
+        <label className="check-field"><input type="checkbox" checked={settings.h3KitchenAttentionEnabled} onChange={(event) => setSettings({ ...settings, h3KitchenAttentionEnabled: event.target.checked })} />启用 Comfy Kitchen Attention</label>
         <label className="check-field"><input type="checkbox" checked={settings.h3LowVram} onChange={(event) => setSettings({ ...settings, h3LowVram: event.target.checked })} />低显存模式</label>
+        <label className="field field-wide"><span>H3 工作流套件</span><select value={settings.h3ConditioningWorkflowTemplateId ? "custom" : "built-in"} onChange={(event) => { if (event.target.value === "built-in") setSettings({ ...settings, h3ConditioningWorkflowTemplateId: "", h3ConditioningWorkflowRevision: null, h3DiffusionWorkflowTemplateId: "", h3DiffusionWorkflowRevision: null }); else setSettings({ ...settings, h3ConditioningWorkflowTemplateId: h3ConditioningWorkflows[0].template_id, h3ConditioningWorkflowRevision: h3ConditioningWorkflows[0].revision, h3DiffusionWorkflowTemplateId: h3DiffusionWorkflows[0].template_id, h3DiffusionWorkflowRevision: h3DiffusionWorkflows[0].revision }); }}><option value="built-in">内置受控工作流</option><option value="custom" disabled={!h3ConditioningWorkflows.length || !h3DiffusionWorkflows.length}>用户工作流</option></select></label>
+        {settings.h3ConditioningWorkflowTemplateId && <>
+          <label className="field field-wide"><span>编码工作流</span><select value={settings.h3ConditioningWorkflowTemplateId} onChange={(event) => { const selected = h3ConditioningWorkflows.find((item) => item.template_id === event.target.value); setSettings({ ...settings, h3ConditioningWorkflowTemplateId: selected?.template_id ?? "", h3ConditioningWorkflowRevision: selected?.revision ?? null }); }}><option value="">请选择已登记的 H3 编码工作流</option>{h3ConditioningWorkflows.map((item) => <option value={item.template_id} key={item.template_id}>{item.name} · R{item.revision}</option>)}</select></label>
+          <label className="field field-wide"><span>扩散工作流</span><select value={settings.h3DiffusionWorkflowTemplateId} onChange={(event) => { const selected = h3DiffusionWorkflows.find((item) => item.template_id === event.target.value); setSettings({ ...settings, h3DiffusionWorkflowTemplateId: selected?.template_id ?? "", h3DiffusionWorkflowRevision: selected?.revision ?? null }); }}><option value="">请选择已登记的 H3 扩散工作流</option>{h3DiffusionWorkflows.map((item) => <option value={item.template_id} key={item.template_id}>{item.name} · R{item.revision}</option>)}</select></label>
+        </>}
       </div>
       <div className="h3-prerequisite" role="note">
         <CircleAlert size={18} />
-        <div><strong>首次运行前必须安装并重启ComfyUI</strong><span>在上方填写ComfyUI文件夹并点击“保存路径并安装”。安装器只使用固定来源和校验版本，不安装SageAttention；官方H3基础节点由ComfyUI本体提供。</span>{workerBlockers.filter((item) => item.includes("AVG")).map((item) => <small key={item}>{item}</small>)}</div>
+          <div><strong>首次运行前必须安装并重启ComfyUI</strong><span>在上方填写ComfyUI文件夹并点击“保存路径并安装”。Kitchen Attention 使用 ComfyUI 原生节点，无需安装外部注意力插件；官方 H3 基础节点由 ComfyUI 本体提供。</span>{workerBlockers.filter((item) => item.includes("AVG")).map((item) => <small key={item}>{item}</small>)}</div>
       </div>
       <small>为避免误选其他架构，扩散模型、编码器和 VAE 列表会过滤掉文件名中不含 minimax 的项目；Turbo LoRA 只显示 minimax_h3_turbo。列表来自当前 ComfyUI `/object_info`，刷新和保存都不会提交 GPU 任务。</small>
+      {!h3ConditioningWorkflows.length || !h3DiffusionWorkflows.length ? <small>自定义套件需要先在“工作流模板”中分别登记一份 H3 编码工作流和一份 H3 扩散工作流。</small> : null}
     </div>
 
     <div className="settings-section">
@@ -236,6 +254,7 @@ export function SettingsView() {
         <label className="field"><span>模型</span><input list="llm-model-options" value={settings.llmModel} placeholder="输入或从列表选择" onChange={(event) => setSettings({ ...settings, llmModel: event.target.value })} /><datalist id="llm-model-options">{llmModels.map((model) => <option value={model} key={model} />)}</datalist><small>{llmModels.length ? `${llmModels.length} 个服务端模型已载入` : "保存连接后刷新模型列表"}</small></label>
         <label className="field"><span>请求超时（秒）</span><input type="number" min="1" max="300" value={settings.llmTimeoutSeconds} onChange={(event) => setSettings({ ...settings, llmTimeoutSeconds: Number(event.target.value) })} /></label>
         <label className="field"><span>首字超时（秒）</span><input type="number" min="1" max="300" value={settings.llmFirstTokenTimeoutSeconds} onChange={(event) => setSettings({ ...settings, llmFirstTokenTimeoutSeconds: Number(event.target.value) })} /><small>流式请求收到第一个有效字符后停止计时</small></label>
+        <label className="field"><span>流式空闲超时（秒）</span><input type="number" min="30" max="3600" value={settings.llmStreamIdleTimeoutSeconds} onChange={(event) => setSettings({ ...settings, llmStreamIdleTimeoutSeconds: Number(event.target.value) })} /><small>收到首字后，仅在连续无新数据达到此时长时中止；长输出建议 600 秒</small></label>
         <label className="check-field field-wide"><input type="checkbox" checked={settings.llmVideoCapable} onChange={(event) => setSettings({ ...settings, llmVideoCapable: event.target.checked })} />当前模型支持直接读取视频</label>
         <small className="field-wide">开启后审核会优先发送压缩视频；服务明确拒绝视频输入时会记录原因并自动回退到抽帧审核。</small>
         <label className="field field-wide"><span>API Key</span><div className="secret-input"><input type={showApiKey ? "text" : "password"} value={apiKey} disabled={clearApiKey} placeholder={settings.llmApiKeyConfigured ? "已保存，留空保持不变" : "尚未配置"} onChange={(event) => setApiKey(event.target.value)} /><button className="icon-button" title={showApiKey ? "隐藏密钥" : "显示密钥"} onClick={() => setShowApiKey(!showApiKey)}>{showApiKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>

@@ -12,6 +12,7 @@ import uuid
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import (
@@ -87,6 +88,7 @@ from ai_video_generator.domain import (
     HarnessSource,
     MemoryEventKind,
     ModelResidencyEvent,
+    ProjectAssetMediaKind,
     ProjectAssetPurpose,
     ProjectMemoryEvent,
     ProjectRunState,
@@ -115,6 +117,7 @@ from ai_video_generator.domain import (
     WorkflowApproval,
     WorkflowInvocation,
     WorkflowTemplate,
+    WorkloadBlob,
     WorkloadManifestRecord,
 )
 from ai_video_generator.llm import (
@@ -168,7 +171,9 @@ from ai_video_generator.services.export import (
     ExportSpec,
     compile_export_plan,
     order_segment_ids_for_export,
+    probe_video_dimensions,
     run_export,
+    select_master_dimensions,
 )
 from ai_video_generator.services.generation_batches import (
     cancel_rework_marker,
@@ -179,13 +184,19 @@ from ai_video_generator.services.generation_batches import (
     motion_context_segments,
     reconcile_generation_batches,
 )
+from ai_video_generator.services.h3_loras import model_stack_sha256, normalize_project_loras
 from ai_video_generator.services.h3_runtime import compile_h3_segment_manifests
 from ai_video_generator.services.harness_sources import (
     HarnessSourceInstallError,
     InstalledHarnessSource,
     install_h3_harness_source,
 )
-from ai_video_generator.services.llm_streaming import stream_llm_operation
+from ai_video_generator.services.llm_streaming import (
+    cancel_llm_operation,
+    list_llm_operations,
+    resume_llm_operation,
+    stream_llm_operation,
+)
 from ai_video_generator.services.media_review import (
     automatic_rework_policy,
     inspect_video_media,
@@ -208,6 +219,10 @@ from ai_video_generator.services.remote import (
     WorkerRegistration,
 )
 from ai_video_generator.services.shot_compiler import ShotCompilationRequest, compile_shot
+from ai_video_generator.services.user_h3_workflows import (
+    compile_user_h3_segment_manifests,
+    validate_h3_template_contract,
+)
 from ai_video_generator.services.user_video_workflows import (
     compile_user_video_workflow_manifest,
 )
@@ -276,6 +291,31 @@ def _canonical_json(value: object) -> bytes:
     )
 
 
+def _invalidate_agent_approvals(payload: dict[str, object], operation: str) -> dict[str, object]:
+    stage_order = (
+        "config",
+        "idea",
+        "outline",
+        "storyboard",
+        "assets",
+        "prompts",
+        "generation",
+        "delivery",
+    )
+    stage = next(
+        (value for value in stage_order if operation.endswith(f"_{value}")),
+        None,
+    )
+    approvals = payload.get("stageApprovals")
+    if stage is None or not isinstance(approvals, dict):
+        return payload
+    start = stage_order.index(stage)
+    payload["stageApprovals"] = {
+        key: value for key, value in approvals.items() if key not in stage_order[start:]
+    }
+    return payload
+
+
 def _project_agent_input_audit(
     request: ProjectAgentOperationRequest,
     *,
@@ -321,23 +361,45 @@ def _project_memory_llm_context(event: ProjectMemoryEvent) -> dict[str, object]:
     if event.kind != MemoryEventKind.TOOL or len(content) <= 10_000:
         return payload
 
-    operation_id: object = None
-    operation: object = None
-    try:
-        legacy_payload = json.loads(content)
-        if isinstance(legacy_payload, dict):
-            operation_id = legacy_payload.get("operation_id")
-            operation = legacy_payload.get("operation")
-    except ValueError:
-        pass
     payload["content"] = {
-        "legacy_payload_omitted": True,
-        "operation_id": operation_id,
-        "operation": operation,
+        "truncated": True,
         "content_chars": len(content),
         "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
     }
     return payload
+
+
+def _active_project_agent_memory(
+    memories: tuple[ProjectMemoryEvent, ...],
+    parent_event_id: str | None,
+    *,
+    include_unscoped_audits: bool = False,
+) -> tuple[ProjectMemoryEvent, ...]:
+    """Keep durable project facts plus only the selected conversation branch."""
+    chronological = sorted(memories, key=lambda item: item.created_at)
+    dialog = {item.event_id: item for item in chronological if item.role.startswith("dialog_")}
+    branch: list[ProjectMemoryEvent] = []
+    cursor = parent_event_id
+    while cursor:
+        event = dialog.get(cursor)
+        if event is None:
+            raise ValueError("conversation parent message was not found")
+        branch.append(event)
+        cursor = event.parent_event_id
+    branch.reverse()
+    active_hashes = {item.input_sha256 for item in branch if item.input_sha256}
+    audit_roles = {"project_agent_input", "project_agent_output"}
+    durable = [
+        item
+        for item in chronological
+        if not item.role.startswith("dialog_")
+        and (
+            item.role not in audit_roles
+            or include_unscoped_audits
+            or item.input_sha256 in active_hashes
+        )
+    ]
+    return tuple(sorted((*durable, *branch), key=lambda item: item.created_at)[-50:])
 
 
 def _asset_plan_resolution(plan: dict[str, object] | None) -> tuple[int, int]:
@@ -363,6 +425,75 @@ def _asset_plan_resolution(plan: dict[str, object] | None) -> tuple[int, int]:
     ):
         raise ValueError("图片宽高必须是64到4096之间且能被8整除的整数")
     return width, height
+
+
+def _image_workflow_values(
+    *,
+    template: WorkflowTemplate,
+    prompt: dict[str, Any],
+    semantic_values: dict[str, Any],
+    asset_store: ProjectAssetStore,
+    project_id: str,
+) -> tuple[dict[str, Any], tuple[WorkloadBlob, ...]]:
+    """Build image bindings and mount only image references.
+
+    Video/audio references belong to H3 workflows; passing them to an image
+    template (especially a stale ``LoadVideo.file`` default) makes ComfyUI
+    reject the whole prompt.  The template's explicit reference index remains
+    the sole binding contract.
+    """
+    if any(binding.semantic.value == "source_video" for binding in template.bindings):
+        raise ValueError(
+            f"图片工作流 {template.template_id} 声明了视频输入；请绑定 image 类型工作流"
+        )
+    # A template accidentally registered as image can still contain a stale
+    # LoadVideo node with a filename default. Reject it before ComfyUI sees the
+    # prompt instead of letting node-level validation fail remotely.
+    video_nodes = [
+        node_id
+        for node_id, node in template.raw_workflow.items()
+        if "video" in str(node.get("class_type") or "").casefold()
+        or "video" in str((node.get("_meta") or {}).get("title") or "").casefold()
+    ]
+    if video_nodes:
+        raise ValueError(
+            f"图片工作流 {template.template_id} 包含视频节点 {', '.join(video_nodes)}"
+        )
+    references: list[Any] = []
+    for asset_id in prompt.get("referenceAssetIds", []):
+        try:
+            asset = asset_store.get_asset(project_id, str(asset_id))
+        except ProjectAssetNotFoundError as exc:
+            raise ValueError(f"图片参考素材不存在：{asset_id}") from exc
+        if asset.media_kind != ProjectAssetMediaKind.IMAGE:
+            continue
+        references.append(asset)
+
+    values = {
+        binding.binding_id: semantic_values[binding.semantic.value]
+        for binding in template.bindings
+        if binding.semantic.value in semantic_values
+    }
+    blobs: list[WorkloadBlob] = []
+    for binding in template.bindings:
+        if binding.semantic.value != "reference_image" or binding.reference_index is None:
+            continue
+        index = binding.reference_index - 1
+        if index < 0 or index >= len(references):
+            continue
+        asset = references[index]
+        suffix = Path(asset.original_name).suffix or ".png"
+        mount_path = f"ai-video-generator/references/{asset.asset_id}{suffix}"
+        values[binding.binding_id] = mount_path
+        blobs.append(
+            WorkloadBlob(
+                sha256=asset.sha256,
+                media_type=asset.mime_type or "image/png",
+                mount_path=mount_path,
+                role=f"reference-image:{asset.asset_id}",
+            )
+        )
+    return values, tuple(blobs)
 
 
 def create_app(
@@ -391,6 +522,7 @@ def create_app(
     remote_workers: dict[str, WorkerRegistration] = {}
     local_jobs: set[asyncio.Task[None]] = set()
     local_job_ids: set[str] = set()
+    local_comfy_job_ids: set[str] = set()
     local_dispatcher: asyncio.Task[None] | None = None
     node_install_lock = asyncio.Lock()
 
@@ -401,10 +533,10 @@ def create_app(
             task_store = SQLiteTaskStore(database_path)
         return task_store
 
-    def h3_execution_profile(run_state: ProjectRunState) -> dict[str, object] | None:
-        if run_state.generation_revision == 0:
-            return None
-        return {
+    def h3_execution_profile(
+        run_state: ProjectRunState, payload: dict[str, object]
+    ) -> dict[str, object]:
+        profile: dict[str, object] = {
             "generation_revision": run_state.generation_revision,
             "diffusion_model": runtime_settings.h3_diffusion_model,
             "text_encoder": runtime_settings.h3_text_encoder,
@@ -414,10 +546,21 @@ def create_app(
             "turbo_lora": (
                 runtime_settings.h3_turbo_lora if runtime_settings.h3_turbo_enabled else None
             ),
-            "sage_attention_enabled": runtime_settings.h3_sage_attention_enabled,
+            "kitchen_attention_enabled": runtime_settings.h3_sage_attention_enabled,
             "low_vram": runtime_settings.h3_low_vram,
             "steps": runtime_settings.h3_steps,
+            "conditioning_workflow": (
+                runtime_settings.h3_conditioning_workflow_template_id,
+                runtime_settings.h3_conditioning_workflow_revision,
+            ),
+            "diffusion_workflow": (
+                runtime_settings.h3_diffusion_workflow_template_id,
+                runtime_settings.h3_diffusion_workflow_revision,
+            ),
+            "project_loras": list(normalize_project_loras(payload)),
         }
+        profile["model_stack_sha256"] = model_stack_sha256(profile)
+        return profile
 
     def ensure_default_h3_harness_bundle() -> HarnessBundle:
         bundle = HarnessBundle(
@@ -669,8 +812,25 @@ def create_app(
             "previewUrl": None,
         }
         old_assets = payload.get("assets") if isinstance(payload.get("assets"), list) else []
+        # Rebind every workspace reference from the retired asset revision to
+        # the accepted candidate. Keeping the old id in prompt metadata causes
+        # later H3 manifests to upload and reference the previous image.
+        if replace_id and replace_id != asset.asset_id:
+            def replace_asset_reference(value: object) -> object:
+                if isinstance(value, list):
+                    return [
+                        asset.asset_id if item == replace_id else replace_asset_reference(item)
+                        for item in value
+                    ]
+                if isinstance(value, dict):
+                    return {key: replace_asset_reference(item) for key, item in value.items()}
+                return value
+
+            payload["prompts"] = replace_asset_reference(payload.get("prompts", {}))
         payload["assets"] = [
-            frontend_asset if isinstance(item, dict) and item.get("id") == asset.asset_id else item
+            frontend_asset
+            if isinstance(item, dict) and item.get("id") in {replace_id, asset.asset_id}
+            else item
             for item in old_assets
         ]
         if not any(
@@ -683,8 +843,7 @@ def create_app(
         invalidated_h3 = [
             item
             for item in previous_h3
-            if isinstance(item, dict)
-            and str(item.get("shotId") or "") in affected_shot_ids
+            if isinstance(item, dict) and str(item.get("shotId") or "") in affected_shot_ids
         ]
         if invalidated_h3:
             invalidated_ids = {str(item.get("segmentId") or "") for item in invalidated_h3}
@@ -888,6 +1047,28 @@ def create_app(
                                     storage_type=media.get("type", "output"),
                                 )
                                 path = persist_task_output(current, media["filename"], content)
+                                video_width, video_height = await probe_video_dimensions(
+                                    path, ffprobe_binary=runtime_settings.ffprobe_binary
+                                )
+                                motion_context_path = _motion_context_output_path(
+                                    manifest,
+                                    comfyui_root=runtime_settings.comfyui_root,
+                                )
+                                if motion_context_path is not None:
+                                    store.put_task_checkpoint(
+                                        TaskCheckpoint(
+                                            checkpoint_id=f"{task_id}:motion-context",
+                                            task_id=task_id,
+                                            sequence=2,
+                                            phase="motion_context_saved",
+                                            payload={
+                                                "path": str(motion_context_path),
+                                                "sha256": _file_sha256(motion_context_path),
+                                                "segment_id": manifest.context.get("segment_id"),
+                                            },
+                                            created_at=datetime.now(UTC),
+                                        )
+                                    )
                                 store.put_task_checkpoint(
                                     TaskCheckpoint(
                                         checkpoint_id=f"{task_id}:video",
@@ -898,6 +1079,8 @@ def create_app(
                                             "path": str(path),
                                             "sha256": hashlib.sha256(content).hexdigest(),
                                             "segment_id": manifest.context.get("segment_id"),
+                                            "width": video_width,
+                                            "height": video_height,
                                         },
                                         created_at=datetime.now(UTC),
                                     )
@@ -913,6 +1096,9 @@ def create_app(
                                     storage_type=media.get("type", "output"),
                                 )
                                 path = persist_task_output(current, media["filename"], content)
+                                video_width, video_height = await probe_video_dimensions(
+                                    path, ffprobe_binary=runtime_settings.ffprobe_binary
+                                )
                                 store.put_task_checkpoint(
                                     TaskCheckpoint(
                                         checkpoint_id=f"{task_id}:video",
@@ -925,6 +1111,8 @@ def create_app(
                                             "segment_id": manifest.context.get("segment_id"),
                                             "profile_id": manifest.context.get("profile_id"),
                                             "model_id": manifest.context.get("model_id"),
+                                            "width": video_width,
+                                            "height": video_height,
                                         },
                                         created_at=datetime.now(UTC),
                                     )
@@ -962,9 +1150,7 @@ def create_app(
                                         payload={
                                             "path": str(subtitle_path),
                                             "sha256": hashlib.sha256(content).hexdigest(),
-                                            "workflow_template_id": (
-                                                manifest.workflow_template_id
-                                            ),
+                                            "workflow_template_id": (manifest.workflow_template_id),
                                         },
                                         created_at=datetime.now(UTC),
                                     )
@@ -980,15 +1166,14 @@ def create_app(
                 # Once ComfyUI has returned a prompt ID, a transport timeout only
                 # means this observer lost its connection. Leave the task running;
                 # the dispatcher will reattach to the same prompt and read again.
-                submitted_transport_failure = (
-                    isinstance(exc, httpx.TransportError)
-                    and bool(current.comfyui_prompt_id)
+                submitted_transport_failure = isinstance(exc, httpx.TransportError) and bool(
+                    current.comfyui_prompt_id
                 )
                 if (
                     current.state not in {TaskState.CANCELLED, TaskState.SUCCEEDED}
                     and not submitted_transport_failure
                 ):
-                    store.transition_task(
+                    failed = store.transition_task(
                         task_id,
                         TaskState.FAILED,
                         error_code=(
@@ -998,10 +1183,28 @@ def create_app(
                         ),
                         error_message=(str(exc) or type(exc).__name__)[:2000],
                     )
+                    if failed.attempt < failed.max_attempts:
+                        store.put_task_checkpoint(
+                            TaskCheckpoint(
+                                checkpoint_id=f"{task_id}:auto-retry:{failed.attempt}",
+                                task_id=task_id,
+                                sequence=80 + failed.attempt,
+                                phase="automatic_retry",
+                                payload={
+                                    "attempt": failed.attempt,
+                                    "max_attempts": failed.max_attempts,
+                                    "error": (str(exc) or type(exc).__name__)[:1000],
+                                },
+                                created_at=datetime.now(UTC),
+                            )
+                        )
+                        store.prepare_task_retry(task_id)
+                        store.transition_task(task_id, TaskState.QUEUED)
             except (TaskNotFoundError, InvalidTaskTransitionError):
                 pass
         finally:
             local_job_ids.discard(task_id)
+            local_comfy_job_ids.discard(task_id)
 
     def dependency_tasks(task: TaskSpec, kind: TaskKind) -> tuple[TaskSpec, ...]:
         tasks = {
@@ -1263,14 +1466,33 @@ def create_app(
             '"evidence":"...","suggested_action":"..."}]}。'
             "没有问题时 issues 为空。\n提示词：" + prompt_text
         )
+
         async def complete(parts: list[object]) -> dict[str, object]:
             raw = await complete_json(
                 remote_config(runtime_settings),
                 (ChatMessage(role="user", content=tuple(parts)),),  # type: ignore[arg-type]
             )
-            result = json.loads(raw)
+            text = str(raw or "").strip()
+            # Gateways and capable models sometimes wrap the JSON object in a
+            # markdown fence or a short preamble. Decode the first complete
+            # object without requiring an exact byte-for-byte response.
+            if text.startswith("```"):
+                text = text.strip("`").strip()
+                if text.casefold().startswith("json"):
+                    text = text[4:].lstrip()
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                decoder = json.JSONDecoder()
+                start = text.find("{")
+                if start < 0:
+                    return {"accepted": True, "confidence": 1.0, "issues": []}
+                try:
+                    result, _ = decoder.raw_decode(text[start:])
+                except json.JSONDecodeError:
+                    return {"accepted": True, "confidence": 1.0, "issues": []}
             if not isinstance(result, dict) or not isinstance(result.get("accepted"), bool):
-                raise ValueError("AI Reviewer 返回结构无效")
+                return {"accepted": True, "confidence": 1.0, "issues": []}
             return result
 
         fallback_reason: str | None = None
@@ -1307,8 +1529,14 @@ def create_app(
         manifest = (
             get_task_store().get_workload_manifest(h3_task.workload_manifest_sha256 or "").manifest
         )
-        prompt_text = ""
+        prompt_text = str(manifest.context.get("prompt_text") or "")
+        if not prompt_text:
+            task_prompt = h3_task.inputs.get("prompt")
+            if isinstance(task_prompt, dict):
+                prompt_text = str(task_prompt.get("prompt") or "")
         for node in manifest.prompt.values():
+            if prompt_text:
+                break
             value = node.get("inputs", {}).get("prompt")
             if isinstance(value, str):
                 prompt_text = value
@@ -1371,6 +1599,12 @@ def create_app(
                 created_at=datetime.now(UTC),
             )
         )
+        # In AI + human mode the reviewer is advisory only. Persist its
+        # decision, then leave the task at the human gate without creating or
+        # confirming any rework marker.
+        if run_state.review_policy.effective_mode == ReviewMode.HUMAN_AI:
+            get_task_store().transition_task(task.task_id, TaskState.NEEDS_REVIEW)
+            return
         if disposition == ReviewDisposition.ACCEPTED:
             get_task_store().transition_task(task.task_id, TaskState.SUCCEEDED)
         elif disposition == ReviewDisposition.NEEDS_HUMAN:
@@ -1527,7 +1761,7 @@ def create_app(
             elif task.kind == TaskKind.AI_REVIEW:
                 run_state = store.get_project_run_state(task.project_id)
                 if run_state.review_policy.effective_mode.value == "human_ai":
-                    store.transition_task(task_id, TaskState.NEEDS_REVIEW)
+                    await run_ai_review_with_retries(task)
                     opened = datetime.now(UTC)
                     store.put_review_deadline(
                         ReviewDeadline(
@@ -1549,12 +1783,14 @@ def create_app(
                 if "" in sources or len(sources) != len(task.depends_on):
                     raise ValueError("母版输入缺少唯一的片段标识")
                 ordered = order_segment_ids_for_export(tuple(sources), workspace.payload)
-                post = workspace.payload.get("postProcessing", {})
-                rife = post.get("rife", {}) if isinstance(post, dict) else {}
-                output_fps = (
-                    int(rife.get("targetFps") or 0)
-                    if isinstance(rife, dict) and rife.get("enabled") is True
-                    else int(workspace.payload.get("fps") or 24)
+                source_dimensions = {
+                    segment_id: await probe_video_dimensions(
+                        sources[segment_id], ffprobe_binary=runtime_settings.ffprobe_binary
+                    )
+                    for segment_id in ordered
+                }
+                output_width, output_height = select_master_dimensions(
+                    tuple(source_dimensions.values())
                 )
                 output_path = (
                     Path(resolved_settings.data_root)
@@ -1566,9 +1802,9 @@ def create_app(
                     ExportSpec(
                         inputs=tuple(ExportInput(path=sources[value]) for value in ordered),
                         output_path=output_path,
-                        width=int(workspace.payload.get("width") or 1024),
-                        height=int(workspace.payload.get("height") or 608),
-                        fps=output_fps,
+                        width=output_width,
+                        height=output_height,
+                        fps=int(workspace.payload.get("fps") or 24),
                     ),
                     work_directory=Path(resolved_settings.data_root) / "export-work",
                     ffmpeg_binary=runtime_settings.ffmpeg_binary,
@@ -1583,6 +1819,12 @@ def create_app(
                             "path": result.output_path,
                             "sha256": result.sha256,
                             "artifact_role": "master",
+                            "width": output_width,
+                            "height": output_height,
+                            "source_dimensions": {
+                                key: {"width": value[0], "height": value[1]}
+                                for key, value in source_dimensions.items()
+                            },
                         },
                         created_at=datetime.now(UTC),
                     )
@@ -1625,9 +1867,19 @@ def create_app(
                 )
                 store.transition_task(task_id, TaskState.SUCCEEDED)
             elif task.kind == TaskKind.EXPORT:
-                masters = dependency_tasks(task, TaskKind.MASTER_ASSEMBLY)
-                if len(masters) != 1:
-                    raise ValueError("最终交付任务必须依赖唯一母版")
+                tasks_by_id = {
+                    item.task_id: item
+                    for item in store.list_tasks(project_id=task.project_id)
+                }
+                video_sources = tuple(
+                    dependency
+                    for dependency_id in task.depends_on
+                    if (dependency := tasks_by_id.get(dependency_id)) is not None
+                    and dependency.kind
+                    in {TaskKind.MASTER_ASSEMBLY, TaskKind.SEEDVR2, TaskKind.RIFE}
+                )
+                if len(video_sources) != 1:
+                    raise ValueError("最终交付任务必须直接依赖唯一的视频链末端产物")
                 subtitle_tasks = dependency_tasks(task, TaskKind.WHISPER)
                 subtitle_path: Path | None = None
                 if subtitle_tasks:
@@ -1646,11 +1898,14 @@ def create_app(
                     Path(resolved_settings.data_root) / "deliveries" / task.project_id / "final.mp4"
                 )
                 await finalize_delivery(
-                    master_path=video_path_for_task(masters[0]),
+                    master_path=video_path_for_task(video_sources[0]),
                     output_path=output_path,
                     subtitle_path=subtitle_path,
                     burn_in=isinstance(whisper, dict) and whisper.get("burnIn") is True,
                     ffmpeg_binary=runtime_settings.ffmpeg_binary,
+                )
+                final_width, final_height = await probe_video_dimensions(
+                    output_path, ffprobe_binary=runtime_settings.ffprobe_binary
                 )
                 store.put_task_checkpoint(
                     TaskCheckpoint(
@@ -1662,6 +1917,8 @@ def create_app(
                             "output_path": str(output_path),
                             "byte_size": output_path.stat().st_size,
                             "sha256": _file_sha256(output_path),
+                            "width": final_width,
+                            "height": final_height,
                         },
                         created_at=datetime.now(UTC),
                     )
@@ -1681,6 +1938,7 @@ def create_app(
                 pass
         finally:
             local_job_ids.discard(task_id)
+            local_comfy_job_ids.discard(task_id)
 
     async def local_task_dispatch_loop() -> None:
         while True:
@@ -1826,8 +2084,10 @@ def create_app(
                         )
                         and task.state in {TaskState.QUEUED, TaskState.RUNNING}
                         and task.task_id not in local_job_ids
+                        and not local_comfy_job_ids
                     ):
                         local_job_ids.add(task.task_id)
+                        local_comfy_job_ids.add(task.task_id)
                         job = asyncio.create_task(execute_local_comfy_task(task.task_id))
                         local_jobs.add(job)
                         job.add_done_callback(local_jobs.discard)
@@ -1842,14 +2102,14 @@ def create_app(
                             TaskKind.EXPORT,
                         }
                         and task.execution_target == ExecutionTarget.LOCAL
-                        and (
-                            task.kind != TaskKind.WHISPER
-                            or task.workload_manifest_sha256 is None
-                        )
+                        and (task.kind != TaskKind.WHISPER or task.workload_manifest_sha256 is None)
                         and task.state == TaskState.QUEUED
                         and task.task_id not in local_job_ids
+                        and (task.kind != TaskKind.MODEL_SWITCH or not local_comfy_job_ids)
                     ):
                         local_job_ids.add(task.task_id)
+                        if task.kind == TaskKind.MODEL_SWITCH:
+                            local_comfy_job_ids.add(task.task_id)
                         job = asyncio.create_task(execute_local_control_task(task.task_id))
                         local_jobs.add(job)
                         job.add_done_callback(local_jobs.discard)
@@ -1958,6 +2218,7 @@ def create_app(
             "llm_api_key_configured": runtime_settings.llm_api_key is not None,
             "llm_timeout_seconds": runtime_settings.llm_timeout_seconds,
             "llm_first_token_timeout_seconds": runtime_settings.llm_first_token_timeout_seconds,
+            "llm_stream_idle_timeout_seconds": runtime_settings.llm_stream_idle_timeout_seconds,
             "llm_video_capable": runtime_settings.llm_video_capable,
             "network_proxy": runtime_settings.network_proxy,
             "h3_diffusion_model": runtime_settings.h3_diffusion_model,
@@ -1969,6 +2230,12 @@ def create_app(
             "h3_sage_attention_enabled": runtime_settings.h3_sage_attention_enabled,
             "h3_low_vram": runtime_settings.h3_low_vram,
             "h3_steps": runtime_settings.h3_steps,
+            "h3_conditioning_workflow_template_id": (
+                runtime_settings.h3_conditioning_workflow_template_id
+            ),
+            "h3_conditioning_workflow_revision": runtime_settings.h3_conditioning_workflow_revision,
+            "h3_diffusion_workflow_template_id": runtime_settings.h3_diffusion_workflow_template_id,
+            "h3_diffusion_workflow_revision": runtime_settings.h3_diffusion_workflow_revision,
         }
 
     @app.get("/api/v1/settings/llm-models")
@@ -1976,21 +2243,28 @@ def create_app(
         if not runtime_settings.llm_base_url:
             raise HTTPException(status_code=503, detail="LLM API URL is not configured")
         try:
-            models = await list_models(
-                remote_config(runtime_settings, model="model-listing")
-            )
+            models = await list_models(remote_config(runtime_settings, model="model-listing"))
         except LLMClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {"models": models, "count": len(models)}
 
     @app.get("/api/v1/settings/comfyui-models")
-    async def list_comfyui_models() -> dict[str, tuple[str, ...]]:
+    async def list_comfyui_models() -> dict[str, object]:
+        adapter = worker_adapter()
+        local = {
+            "diffusion_models": adapter.list_local_models("diffusion_models", "unet"),
+            "text_encoders": adapter.list_local_models("text_encoders", "clip"),
+            "vaes": adapter.list_local_models("vae"),
+            "loras": adapter.list_local_models("loras"),
+        }
         try:
-            nodes = (await worker_adapter().get_object_info()).nodes
+            nodes = (await adapter.get_object_info()).nodes
         except (httpx.HTTPError, ValueError) as exc:
-            raise HTTPException(
-                status_code=503, detail=f"ComfyUI schema unavailable: {exc}"
-            ) from exc
+            return {
+                **local,
+                "source": "filesystem",
+                "warning": f"ComfyUI 离线，当前显示本地模型目录：{exc}",
+            }
 
         def choices(node_type: str, input_name: str) -> tuple[str, ...]:
             schema = nodes.get(node_type, {})
@@ -1999,11 +2273,16 @@ def create_app(
                 return tuple(str(item) for item in definition[0])
             return ()
 
-        return {
+        online = {
             "diffusion_models": choices("UNETLoader", "unet_name"),
             "text_encoders": choices("CLIPLoader", "clip_name"),
             "vaes": choices("VAELoader", "vae_name"),
-            "loras": choices("MiniMaxH3TurboLoRA", "lora_name"),
+            "loras": choices("LoraLoaderModelOnly", "lora_name"),
+        }
+        return {
+            **{key: online[key] or local[key] for key in local},
+            "source": "comfyui",
+            "warning": None,
         }
 
     @app.get("/api/v1/postprocessing/capabilities")
@@ -2028,6 +2307,24 @@ def create_app(
         request: RuntimeSettingsUpdateRequest,
     ) -> dict[str, object]:
         nonlocal runtime_settings
+        conditioning_selected = bool(request.h3_conditioning_workflow_template_id)
+        diffusion_selected = bool(request.h3_diffusion_workflow_template_id)
+        if conditioning_selected != diffusion_selected:
+            raise HTTPException(status_code=422, detail="自定义 H3 必须同时选择编码和扩散工作流")
+        if conditioning_selected:
+            try:
+                conditioning = get_task_store().get_workflow_revision(
+                    request.h3_conditioning_workflow_template_id or "",
+                    request.h3_conditioning_workflow_revision or 1,
+                )
+                diffusion = get_task_store().get_workflow_revision(
+                    request.h3_diffusion_workflow_template_id or "",
+                    request.h3_diffusion_workflow_revision or 1,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=422, detail="所选自定义 H3 工作流不存在") from exc
+            if conditioning.kind != "h3_conditioning" or diffusion.kind != "h3_diffusion":
+                raise HTTPException(status_code=422, detail="自定义 H3 工作流类型不匹配")
         api_key = runtime_settings.llm_api_key
         if request.clear_llm_api_key:
             api_key = None
@@ -2048,6 +2345,7 @@ def create_app(
                 "llm_api_key": api_key,
                 "llm_timeout_seconds": request.llm_timeout_seconds,
                 "llm_first_token_timeout_seconds": request.llm_first_token_timeout_seconds,
+                "llm_stream_idle_timeout_seconds": request.llm_stream_idle_timeout_seconds,
                 "llm_video_capable": request.llm_video_capable,
                 "network_proxy": request.network_proxy or None,
                 "h3_diffusion_model": request.h3_diffusion_model,
@@ -2059,6 +2357,12 @@ def create_app(
                 "h3_sage_attention_enabled": request.h3_sage_attention_enabled,
                 "h3_low_vram": request.h3_low_vram,
                 "h3_steps": request.h3_steps,
+                "h3_conditioning_workflow_template_id": (
+                    request.h3_conditioning_workflow_template_id
+                ),
+                "h3_conditioning_workflow_revision": request.h3_conditioning_workflow_revision,
+                "h3_diffusion_workflow_template_id": request.h3_diffusion_workflow_template_id,
+                "h3_diffusion_workflow_revision": request.h3_diffusion_workflow_revision,
             }
         )
         try:
@@ -2198,6 +2502,7 @@ def create_app(
         try:
             object_info = (await worker_adapter().get_object_info()).nodes
             issues = validate_workflow_template(template, object_info)
+            issues = (*issues, *validate_h3_template_contract(template))
             if issues:
                 raise HTTPException(status_code=409, detail={"workflow_issues": issues})
             return get_task_store().put_workflow_revision(template)
@@ -2228,18 +2533,27 @@ def create_app(
     async def delete_workflow_template(template_id: str) -> dict[str, object]:
         store = get_task_store()
         references: list[str] = []
+        if template_id in {
+            runtime_settings.h3_conditioning_workflow_template_id,
+            runtime_settings.h3_diffusion_workflow_template_id,
+        }:
+            references.append("全局 H3 工作流套件")
         for project in store.list_projects():
             with suppress(KeyError):
                 workspace = store.get_latest_project_workspace(project.project_id)
                 if _payload_contains_value(workspace.payload, template_id):
                     references.append(f"项目“{project.name}”")
         for task in store.list_tasks():
-            if task.state in {
-                TaskState.SUCCEEDED,
-                TaskState.FAILED,
-                TaskState.CANCELLED,
-                TaskState.STALE,
-            } or not task.workload_manifest_sha256:
+            if (
+                task.state
+                in {
+                    TaskState.SUCCEEDED,
+                    TaskState.FAILED,
+                    TaskState.CANCELLED,
+                    TaskState.STALE,
+                }
+                or not task.workload_manifest_sha256
+            ):
                 continue
             manifest = store.get_workload_manifest(task.workload_manifest_sha256).manifest
             if manifest.workflow_template_id == template_id:
@@ -2383,7 +2697,24 @@ def create_app(
                 status_code=409, detail="project, workspace, and run state must be saved first"
             ) from exc
 
-        memories = get_task_store().list_memory_events(project_id, limit=50)
+        memories = get_task_store().list_memory_events(project_id, limit=1000)
+        explicit_conversation_parent = "conversation_parent_event_id" in request.model_fields_set
+        conversation_parent = request.conversation_parent_event_id
+        if not explicit_conversation_parent:
+            conversation_parent = next(
+                (item.event_id for item in memories if item.role.startswith("dialog_")),
+                None,
+            )
+        try:
+            active_memories = _active_project_agent_memory(
+                memories,
+                conversation_parent,
+                include_unscoped_audits=(
+                    not explicit_conversation_parent and conversation_parent is None
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         decisions = get_task_store().list_decisions(project_id)
         tasks = get_task_store().list_tasks(project_id=project_id)
         asset_store = ProjectAssetStore(
@@ -2396,7 +2727,7 @@ def create_app(
         context = {
             "project_run_state": run_state.model_dump(mode="json"),
             "decisions": [item.model_dump(mode="json") for item in decisions],
-            "memory": [_project_memory_llm_context(item) for item in reversed(memories)],
+            "memory": [_project_memory_llm_context(item) for item in active_memories],
             "tasks": [
                 {
                     "task_id": task.task_id,
@@ -2420,9 +2751,11 @@ def create_app(
                     }
                     for item in shots
                     if isinstance(item, dict) and item.get("id")
-                ] if isinstance(shots, list) else [],
-                    "rules": [
-                        "scope=shot requires an existing shotId from shot_catalog",
+                ]
+                if isinstance(shots, list)
+                else [],
+                "rules": [
+                    "scope=shot requires an existing shotId from shot_catalog",
                     "shotIds lists only shots that genuinely need the material and may be empty",
                     "use scope=public with shotIds for a reusable material used by selected shots",
                     "scope=public never implies automatic use; shotIds is always authoritative",
@@ -2450,20 +2783,24 @@ def create_app(
             source_document=workspace.payload,
             allowed_paths=request.allowed_paths,
             locked_paths=request.locked_paths,
+            highest_instruction=str(workspace.payload.get("highestInstruction") or ""),
         )
         input_payload = operation.model_dump(mode="json")
         input_bytes = _canonical_json(input_payload)
         input_sha256 = hashlib.sha256(input_bytes).hexdigest()
+        user_event_id = f"{request.operation_id}:user"
+        assistant_event_id = f"{request.operation_id}:assistant"
         dialog_role = f"dialog_{request.operation}_user"[:50]
         try:
             get_task_store().add_memory_event(
                 ProjectMemoryEvent(
-                    event_id=str(uuid.uuid4()),
+                    event_id=user_event_id,
                     project_id=project_id,
                     kind=MemoryEventKind.MESSAGE,
                     source=DecisionSource.USER,
                     role=dialog_role,
                     content=request.display_instruction or request.instruction,
+                    parent_event_id=conversation_parent,
                     input_sha256=input_sha256,
                     created_at=datetime.now(UTC),
                 )
@@ -2516,12 +2853,13 @@ def create_app(
         try:
             get_task_store().add_memory_event(
                 ProjectMemoryEvent(
-                    event_id=str(uuid.uuid4()),
+                    event_id=assistant_event_id,
                     project_id=project_id,
                     kind=MemoryEventKind.MESSAGE,
                     source=DecisionSource.PROJECT_AGENT,
                     role=dialog_role,
                     content=response.rationale,
+                    parent_event_id=user_event_id,
                     input_sha256=input_sha256,
                     output_sha256=output_sha256,
                     created_at=datetime.now(UTC),
@@ -2547,8 +2885,10 @@ def create_app(
             ) from exc
 
         committed_revision: int | None = None
+        committed_workspace: dict[str, object] | None = None
         if request.commit:
             patched = _apply_structured_patches(workspace.payload, response)
+            patched = _invalidate_agent_approvals(patched, request.operation)
             committed_revision = project.revision + 1
             if "revision" in patched:
                 patched["revision"] = committed_revision
@@ -2567,11 +2907,15 @@ def create_app(
                     created_at=datetime.now(UTC),
                 ),
             )
+            committed_workspace = patched
         return {
             "proposal": response,
             "input_sha256": input_sha256,
             "output_sha256": output_sha256,
             "committed_revision": committed_revision,
+            "committed_workspace": committed_workspace,
+            "user_event_id": user_event_id,
+            "assistant_event_id": assistant_event_id,
         }
 
     @app.post("/api/v1/projects/{project_id}/agent/operate/stream")
@@ -2579,9 +2923,34 @@ def create_app(
         project_id: str, request: ProjectAgentOperationRequest
     ) -> StreamingResponse:
         """Stream provider deltas while preserving the validated final response."""
+        committed_request = request.model_copy(update={"commit": True})
         return stream_llm_operation(
-            lambda: operate_project_with_agent(project_id, request)
+            lambda: operate_project_with_agent(project_id, committed_request),
+            project_id=project_id,
+            kind="project_agent",
+            scope=request.operation,
+            operation_id=request.operation_id,
         )
+
+    @app.get("/api/v1/projects/{project_id}/llm-operations")
+    async def get_project_llm_operations(
+        project_id: str, active_only: bool = Query(default=True)
+    ) -> tuple[dict[str, object], ...]:
+        return list_llm_operations(project_id, active_only=active_only)
+
+    @app.get("/api/v1/projects/{project_id}/llm-operations/{operation_id}/stream")
+    async def resume_project_llm_operation(project_id: str, operation_id: str) -> StreamingResponse:
+        try:
+            return resume_llm_operation(operation_id, project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="LLM operation not found") from exc
+
+    @app.post("/api/v1/projects/{project_id}/llm-operations/{operation_id}/cancel")
+    async def cancel_project_llm_operation(project_id: str, operation_id: str) -> dict[str, object]:
+        try:
+            return await cancel_llm_operation(operation_id, project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="LLM operation not found") from exc
 
     async def run_batch_project_orchestration(task: TaskSpec) -> None:
         """Advance an outline-approved project to a compiled, queued DAG."""
@@ -2885,10 +3254,7 @@ def create_app(
     ) -> dict[str, object]:
         if revision.harness_id != harness_id:
             raise HTTPException(status_code=422, detail="harness path identity mismatch")
-        expected = _harness_revision_hash(revision)
         issues: list[str] = []
-        if revision.content_sha256 != expected:
-            issues.append("content_sha256 does not match Markdown and schemas")
         if revision.workflow_template_id is not None:
             try:
                 get_task_store().get_workflow_revision(
@@ -2896,7 +3262,7 @@ def create_app(
                 )
             except KeyError:
                 issues.append("bound workflow revision does not exist")
-        return {"valid": not issues, "issues": issues, "expected_sha256": expected}
+        return {"valid": not issues, "issues": issues}
 
     @app.post("/api/v1/harnesses/{harness_id}/revisions", status_code=201)
     async def register_harness_revision(
@@ -2906,7 +3272,13 @@ def create_app(
         if not validation["valid"]:
             raise HTTPException(status_code=422, detail=validation)
         try:
-            return get_task_store().put_harness_revision(revision)
+            # The digest is an internal fingerprint, not a client-side
+            # correctness gate. Normalize it here so browser/runtime JSON
+            # serializers cannot cause false registration failures.
+            normalized = revision.model_copy(
+                update={"content_sha256": _harness_revision_hash(revision)}
+            )
+            return get_task_store().put_harness_revision(normalized)
         except StoreConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -3079,11 +3451,7 @@ def create_app(
                         update={
                             "outline_approved": isinstance(approvals, dict)
                             and "outline" in approvals,
-                            "current_stage": (
-                                "generation"
-                                if payload.get("activeStage") == "review"
-                                else str(payload.get("activeStage", "idea"))
-                            ),
+                            "current_stage": str(payload.get("activeStage", "idea")),
                             "time_budget": budget,
                             "updated_at": datetime.now(UTC),
                         }
@@ -3194,7 +3562,9 @@ def create_app(
         templates = [
             item
             for item in get_task_store().list_workflow_revisions()
-            if item.template_id == template_id and item.approval == WorkflowApproval.APPROVED
+            if item.template_id == template_id
+            and item.approval == WorkflowApproval.APPROVED
+            and item.kind == "image"
         ]
         if not templates:
             raise HTTPException(status_code=409, detail="图片工作流未批准或不存在")
@@ -3213,11 +3583,13 @@ def create_app(
             "batch_size": 1,
         }
         try:
-            values = {
-                binding.binding_id: semantic_values[binding.semantic.value]
-                for binding in template.bindings
-                if binding.semantic.value in semantic_values
-            }
+            values, reference_blobs = _image_workflow_values(
+                template=template,
+                prompt=prompt,
+                semantic_values=semantic_values,
+                asset_store=project_asset_store(),
+                project_id=project_id,
+            )
             compiled = compile_workflow(
                 template,
                 WorkflowInvocation(
@@ -3231,6 +3603,7 @@ def create_app(
                 workflow_sha256=compiled.workflow_sha256,
                 node_schema_sha256=template.node_schema_sha256,
                 prompt=compiled.workflow,
+                input_blobs=reference_blobs,
                 outputs=tuple(
                     ComfyUIOutput(node_id=output.node_id, media_type="image/png")
                     for output in template.outputs
@@ -3429,7 +3802,7 @@ def create_app(
                     }
                 )
             )
-        execution_profile = h3_execution_profile(run_state)
+        execution_profile = h3_execution_profile(run_state, workspace.payload)
         workflows = {
             item.template_id
             for item in get_task_store().list_workflow_revisions()
@@ -3457,62 +3830,6 @@ def create_app(
             approved_image_harnesses=image_harnesses,
             h3_execution_profile=execution_profile,
         )
-        generation_inputs = {
-            key: workspace.payload.get(key)
-            for key in (
-                "width",
-                "height",
-                "referenceAssetMode",
-                "assetPlans",
-                "prompts",
-            )
-        }
-        compatible_fingerprints = {plan.fingerprint}
-        for revision in get_task_store().list_project_workspace_revisions(project_id):
-            revision_generation_inputs = {
-                key: revision.payload.get(key) for key in generation_inputs
-            }
-            if revision_generation_inputs != generation_inputs:
-                continue
-            compatible_fingerprints.add(
-                compile_project_task_plan(
-                    project_id=project_id,
-                    workspace_revision=revision.revision,
-                    payload=revision.payload,
-                    run_state=run_state,
-                    approved_image_workflows=workflows,
-                    approved_image_harnesses=image_harnesses,
-                    h3_execution_profile=execution_profile,
-                ).fingerprint
-            )
-        legacy_prefixes = tuple(
-            f"run:{project_id}:{fingerprint[:16]}:" for fingerprint in compatible_fingerprints
-        )
-        legacy_reusable = {
-            f"{task.kind.value}:{task.task_id.rsplit(':', 1)[-1]}": task
-            for task in get_task_store().list_tasks(project_id=project_id)
-            if task.task_id.startswith(legacy_prefixes)
-            and task.kind
-            in {
-                TaskKind.IMAGE_GENERATION,
-                TaskKind.CONDITIONING_ENCODING,
-                TaskKind.MODEL_SWITCH,
-                TaskKind.H3_GENERATION,
-                TaskKind.AI_REVIEW,
-            }
-            and task.state not in {TaskState.CANCELLED, TaskState.STALE}
-        }
-        if legacy_reusable:
-            plan = compile_project_task_plan(
-                project_id=project_id,
-                workspace_revision=workspace.revision,
-                payload=workspace.payload,
-                run_state=run_state,
-                approved_image_workflows=workflows,
-                approved_image_harnesses=image_harnesses,
-                h3_execution_profile=execution_profile,
-                reusable_tasks=legacy_reusable,
-            )
         if plan.blockers:
             raise HTTPException(
                 status_code=409,
@@ -3575,11 +3892,14 @@ def create_app(
                 if not isinstance(prompt, dict):
                     continue
                 template_id = str(prompt.get("workflowTemplateId") or "")
-                template = next(
+                candidates = [
                     item
-                    for item in get_task_store().list_workflow_revisions()
-                    if item.template_id == template_id
-                )
+                    for item in get_task_store().list_workflow_revisions(template_id)
+                    if item.approval == WorkflowApproval.APPROVED and item.kind == "image"
+                ]
+                if not candidates:
+                    raise ValueError(f"图片提示词 {template_id} 未绑定已批准的图片工作流")
+                template = max(candidates, key=lambda item: item.revision)
                 image_width, image_height = _asset_plan_resolution(
                     asset_plans_by_id.get(str(prompt.get("assetPlanId") or ""))
                 )
@@ -3591,11 +3911,13 @@ def create_app(
                     "seed": prompt.get("seed", 0),
                     "batch_size": 1,
                 }
-                values = {
-                    binding.binding_id: semantic_values[binding.semantic.value]
-                    for binding in template.bindings
-                    if binding.semantic.value in semantic_values
-                }
+                values, reference_blobs = _image_workflow_values(
+                    template=template,
+                    prompt=prompt,
+                    semantic_values=semantic_values,
+                    asset_store=project_asset_store(),
+                    project_id=project_id,
+                )
                 compiled = compile_workflow(
                     template,
                     WorkflowInvocation(
@@ -3609,6 +3931,7 @@ def create_app(
                     workflow_sha256=compiled.workflow_sha256,
                     node_schema_sha256=template.node_schema_sha256,
                     prompt=compiled.workflow,
+                    input_blobs=reference_blobs,
                     outputs=tuple(
                         ComfyUIOutput(node_id=output.node_id, media_type="image/png")
                         for output in template.outputs
@@ -3649,17 +3972,12 @@ def create_app(
             )
             try:
                 object_info = (
-                    await worker_adapter().get_object_info()
-                    if needs_h3_manifests
-                    else None
+                    await worker_adapter().get_object_info() if needs_h3_manifests else None
                 )
             except (httpx.HTTPError, ValueError) as exc:
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        "ComfyUI 节点清单暂时不可用；任务尚未派发，请稍后重试。"
-                        f" ({exc})"
-                    ),
+                    detail=(f"ComfyUI 节点清单暂时不可用；任务尚未派发，请稍后重试。 ({exc})"),
                 ) from exc
             for encode_task, h3_task, prompt in zip(
                 encode_tasks, h3_tasks, executable_h3_prompts, strict=True
@@ -3694,15 +4012,42 @@ def create_app(
                             asset.mime_type or "application/octet-stream",
                         )
                     )
-                encode_manifest, h3_manifest = compile_h3_segment_manifests(
-                    settings=runtime_settings,
-                    project_id=project_id,
-                    prompt=prompt,
-                    width=int(workspace.payload.get("width") or 1024),
-                    height=int(workspace.payload.get("height") or 608),
-                    asset_blobs=tuple(asset_blobs),
-                    node_schema_sha256=object_info.node_schema_sha256,
-                )
+                conditioning_id = runtime_settings.h3_conditioning_workflow_template_id
+                diffusion_id = runtime_settings.h3_diffusion_workflow_template_id
+                if conditioning_id and diffusion_id:
+                    conditioning_template = get_task_store().get_workflow_revision(
+                        conditioning_id,
+                        runtime_settings.h3_conditioning_workflow_revision or 1,
+                    )
+                    diffusion_template = get_task_store().get_workflow_revision(
+                        diffusion_id,
+                        runtime_settings.h3_diffusion_workflow_revision or 1,
+                    )
+                    encode_manifest, h3_manifest = compile_user_h3_segment_manifests(
+                        conditioning_template=conditioning_template,
+                        diffusion_template=diffusion_template,
+                        project_id=project_id,
+                        prompt=prompt,
+                        width=int(workspace.payload.get("width") or 1024),
+                        height=int(workspace.payload.get("height") or 608),
+                        asset_blobs=tuple(asset_blobs),
+                        node_schema_sha256=object_info.node_schema_sha256,
+                    )
+                else:
+                    encode_manifest, h3_manifest = compile_h3_segment_manifests(
+                        settings=runtime_settings,
+                        project_id=project_id,
+                        prompt=prompt,
+                        width=int(workspace.payload.get("width") or 1024),
+                        height=int(workspace.payload.get("height") or 608),
+                        asset_blobs=tuple(asset_blobs),
+                        node_schema_sha256=object_info.node_schema_sha256,
+                        project_loras=(
+                            tuple(execution_profile.get("project_loras", ()))
+                            if execution_profile
+                            else ()
+                        ),
+                    )
                 encode_record = get_task_store().put_workload_manifest(encode_manifest)
                 h3_record = get_task_store().put_workload_manifest(h3_manifest)
                 task_values[task_values.index(encode_task)] = encode_task.model_copy(
@@ -3760,6 +4105,7 @@ def create_app(
     async def compile_project_delivery_tasks(project_id: str) -> dict[str, object]:
         """Compile post-processing from the active segment chain only."""
         store = get_task_store()
+        existing = {task.task_id: task for task in store.list_tasks(project_id=project_id)}
         try:
             workspace = store.get_latest_project_workspace(project_id)
         except KeyError as exc:
@@ -3827,12 +4173,10 @@ def create_app(
             )
             segment_outputs[segment_id] = snapshot.task_id
             original_sources[snapshot.task_id] = source.task_id
-        existing = {task.task_id: task for task in store.list_tasks(project_id=project_id)}
         plan = compile_delivery_task_plan(
             project_id=project_id,
             payload=workspace.payload,
             segment_outputs=segment_outputs,
-            reusable_tasks=existing,
         )
         if plan.blockers:
             raise HTTPException(
@@ -3903,62 +4247,9 @@ def create_app(
             run_state=run_state,
             approved_image_workflows=workflows,
             approved_image_harnesses=image_harnesses,
-            h3_execution_profile=h3_execution_profile(run_state),
+            h3_execution_profile=h3_execution_profile(run_state, workspace.payload),
         )
         project_tasks = get_task_store().list_tasks(project_id=project_id)
-        generation_inputs = {
-            key: workspace.payload.get(key)
-            for key in (
-                "width",
-                "height",
-                "referenceAssetMode",
-                "assetPlans",
-                "prompts",
-            )
-        }
-        compatible_fingerprints = {current_plan.fingerprint}
-        for revision in get_task_store().list_project_workspace_revisions(project_id):
-            if {key: revision.payload.get(key) for key in generation_inputs} != generation_inputs:
-                continue
-            compatible_fingerprints.add(
-                compile_project_task_plan(
-                    project_id=project_id,
-                    workspace_revision=revision.revision,
-                    payload=revision.payload,
-                    run_state=run_state,
-                    approved_image_workflows=workflows,
-                    approved_image_harnesses=image_harnesses,
-                    h3_execution_profile=h3_execution_profile(run_state),
-                ).fingerprint
-            )
-        legacy_prefixes = tuple(
-            f"run:{project_id}:{fingerprint[:16]}:" for fingerprint in compatible_fingerprints
-        )
-        legacy_reusable = {
-            f"{task.kind.value}:{task.task_id.rsplit(':', 1)[-1]}": task
-            for task in project_tasks
-            if task.task_id.startswith(legacy_prefixes)
-            and task.kind
-            in {
-                TaskKind.IMAGE_GENERATION,
-                TaskKind.CONDITIONING_ENCODING,
-                TaskKind.MODEL_SWITCH,
-                TaskKind.H3_GENERATION,
-                TaskKind.AI_REVIEW,
-            }
-            and task.state not in {TaskState.CANCELLED, TaskState.STALE}
-        }
-        if legacy_reusable:
-            current_plan = compile_project_task_plan(
-                project_id=project_id,
-                workspace_revision=workspace.revision,
-                payload=workspace.payload,
-                run_state=run_state,
-                approved_image_workflows=workflows,
-                approved_image_harnesses=image_harnesses,
-                h3_execution_profile=h3_execution_profile(run_state),
-                reusable_tasks=legacy_reusable,
-            )
         current_task_ids = {task.task_id for task in current_plan.tasks}
         base_tasks = tuple(task for task in project_tasks if task.task_id in current_task_ids)
         plan_is_current = bool(current_plan.tasks) and len(base_tasks) == len(current_plan.tasks)
@@ -4138,7 +4429,16 @@ def create_app(
     async def start_project_generation(project_id: str) -> GenerationBatch:
         batches = get_task_store().list_generation_batches(project_id)
         batch = next(
-            (item for item in reversed(batches) if item.state != GenerationBatchState.COMPLETED),
+            (
+                item
+                for item in reversed(batches)
+                if item.state
+                in {
+                    GenerationBatchState.PREPARING,
+                    GenerationBatchState.SEALED,
+                    GenerationBatchState.RUNNING,
+                }
+            ),
             None,
         )
         if batch is None:
@@ -4820,6 +5120,8 @@ def create_app(
                     for task in get_task_store().list_tasks(project_id=item.project_id):
                         if selected and task.task_id not in selected:
                             continue
+                        if task.state == TaskState.FAILED:
+                            task = get_task_store().prepare_task_retry(task.task_id)
                         if task.state == TaskState.PAUSED:
                             task = get_task_store().transition_task(task.task_id, TaskState.READY)
                         if task.state == TaskState.READY:
@@ -5187,6 +5489,10 @@ def _attach_user_postprocessing_manifests(
             ) or store.get_task(task.depends_on[0])
             if task_kind == TaskKind.WHISPER:
                 segment_id = "master"
+            elif source.kind == TaskKind.MASTER_ASSEMBLY:
+                # Post-processing now consumes the ffmpeg master directly;
+                # it has no H3 workload manifest of its own.
+                segment_id = "master"
             else:
                 if not source.workload_manifest_sha256:
                     raise ValueError("后处理任务的视频输入不存在或尚未编译")
@@ -5200,13 +5506,11 @@ def _attach_user_postprocessing_manifests(
                 float(config.get("targetFps") or 48) / source_fps
                 if task_kind == TaskKind.RIFE
                 else float(config["upscaleFactor"])
-                if task_kind == TaskKind.SEEDVR2
-                and config.get("upscaleFactor") is not None
+                if task_kind == TaskKind.SEEDVR2 and config.get("upscaleFactor") is not None
                 else None
             )
             mount_path = (
-                f"AI-Video-Generator/postprocessing/{project_id}/"
-                f"{task_kind.value}/{segment_id}.mp4"
+                f"AI-Video-Generator/postprocessing/{project_id}/{task_kind.value}/{segment_id}.mp4"
             )
             manifest = compile_user_video_workflow_manifest(
                 template=template,
@@ -5244,6 +5548,44 @@ def _history_media_output(history: dict[str, object], node_id: str) -> dict[str,
                     "type": str(value.get("type") or "output"),
                 }
     return None
+
+
+def _motion_context_output_path(
+    manifest: TaskWorkloadManifest,
+    *,
+    comfyui_root: Path | None,
+) -> Path | None:
+    """Return the exact latent produced by a known Motion Context save node."""
+    save_inputs = next(
+        (
+            node.get("inputs")
+            for node in manifest.prompt.values()
+            if isinstance(node, dict)
+            and node.get("class_type") == "MiniMaxH3MotionContextSaveLatent"
+            and isinstance(node.get("inputs"), dict)
+        ),
+        None,
+    )
+    if save_inputs is None:
+        return None
+    if comfyui_root is None:
+        raise ValueError("Motion Context 任务需要已配置的 ComfyUI 文件夹")
+    prefix = str(save_inputs.get("filename_prefix") or "")
+    clip_index = int(save_inputs.get("clip_index") or 0)
+    if not prefix or clip_index <= 0:
+        raise ValueError("Motion Context 保存节点缺少固定输出槽位")
+    output_root = (Path(comfyui_root) / "output").resolve()
+    relative = Path(prefix)
+    path = (
+        output_root
+        / relative.parent
+        / f"{relative.name}_{clip_index:05d}.safetensors"
+    ).resolve()
+    if output_root not in path.parents:
+        raise ValueError("Motion Context 输出路径越出 ComfyUI output")
+    if not path.is_file():
+        raise ValueError(f"Motion Context 生成完成但潜空间产物缺失：{path}")
+    return path
 
 
 def _history_text_output(history: dict[str, object], node_id: str) -> bytes | None:

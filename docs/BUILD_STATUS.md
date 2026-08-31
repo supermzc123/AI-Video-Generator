@@ -10,7 +10,7 @@
 - 项目不可变修订、任务 DAG、审核决定、幂等、租约、恢复、血缘和 stale 传播。
 - 用户 ComfyUI API 工作流导入、LLM或手动字段标定、类型化编译和版本指纹；不依赖特殊节点标题。
 - ComfyUI V3 `COMFY_AUTOGROW_V3` 点路径输入的确定性校验。
-- H3 外部 Profile、官方 Turbo provider 校验、可选 KJ SageAttention 和 TeaCache 阻断。
+- H3 外部 Profile、官方 Turbo provider 校验、可选 ComfyUI 原生 Kitchen Attention 和 TeaCache 阻断。
 - H3 static conditioning 与初始 AV latent 的安全 `safetensors+json-v1` 缓存。
 - 全部 conditioning 编码完成后卸载编码器，再加载扩散模型的阶段屏障。
 - Niko H3 Motion Context v0.3.1 provider、双流 AV latent、续段裁切和能力探测。
@@ -38,7 +38,7 @@
 
 ## GPU 验证
 
-全部 H3 批次使用 RTX 3080 Ti、416x256、124 帧、24fps、6 步 `simple` scheduler、官方 Turbo 节点、`low_vram=true` 和 KJ SageAttention。每批完成后调用 `/free` 卸载模型。Z-Image 使用 256x256、9 步。
+历史基线 H3 批次曾使用 RTX 3080 Ti、416x256、124 帧、24fps、6 步 `simple` scheduler、官方 Turbo 节点、`low_vram=true` 和 KJ SageAttention。当前工作流已改用 ComfyUI 原生 Kitchen Attention，旧结果仅保留为历史基线。每批完成后调用 `/free` 卸载模型。Z-Image 使用 256x256、9 步。
 
 | 批次 | 结果 | 耗时 | 峰值显存 | 最低空闲 RAM |
 |---|---:|---:|---:|---:|

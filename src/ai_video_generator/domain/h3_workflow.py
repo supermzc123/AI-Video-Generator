@@ -14,6 +14,8 @@ class H3AccelerationMode(StrEnum):
 
 class H3AttentionMode(StrEnum):
     NATIVE = "native"
+    KITCHEN = "kitchen"
+    # Accepted for stored v1 profiles. It now resolves to the native Kitchen backend.
     SAGE = "sage"
 
 
@@ -95,8 +97,9 @@ class H3WorkflowProfile(FrozenModel):
             raise ValueError("turbo acceleration requires a turbo profile")
         if self.acceleration != H3AccelerationMode.TURBO and self.turbo is not None:
             raise ValueError("turbo settings require turbo acceleration")
-        if self.attention == H3AttentionMode.SAGE and not self.sage_attention_node_id:
-            raise ValueError("SageAttention requires sage_attention_node_id")
-        if self.attention != H3AttentionMode.SAGE and self.sage_attention_node_id:
-            raise ValueError("sage_attention_node_id requires SageAttention mode")
+        uses_backend = self.attention in {H3AttentionMode.KITCHEN, H3AttentionMode.SAGE}
+        if uses_backend and not self.sage_attention_node_id:
+            raise ValueError("Kitchen Attention requires an attention backend node id")
+        if not uses_backend and self.sage_attention_node_id:
+            raise ValueError("attention backend node id requires Kitchen Attention mode")
         return self

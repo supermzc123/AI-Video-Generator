@@ -33,8 +33,8 @@ def _credential(name: str) -> str | None:
 async def _unsupported(task: TaskSpec) -> WorkerExecutionOutcome:
     return WorkerExecutionOutcome(
         status=WorkerResultStatus.FAILED,
-        error_code="legacy_task_unsupported",
-        error_message=f"experimental Worker only accepts workload manifests ({task.kind.value})",
+        error_code="workload_manifest_required",
+        error_message=f"worker requires a workload manifest ({task.kind.value})",
     )
 
 

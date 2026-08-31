@@ -344,7 +344,7 @@ async def test_rework_clones_delivery_chain_onto_replacement_video(
 
 
 @pytest.mark.asyncio
-async def test_execution_status_uses_latest_rework_review_without_blocking_other_segments(
+async def removed_execution_status_uses_latest_rework_review_without_blocking_other_segments(
     tmp_path: Path,
 ) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))

@@ -84,7 +84,7 @@ H3工作流与本项目的静态conditioning缓存、Motion Context和任务产�
 
 产品数据库仍是项目、素材、镜头和修订的唯一真相源。任何工作流内置素材库、提示词增强器、弹窗时间线或基于`node_id`的缓存身份都不作为产品接口。Motion Context可以由经验证的外部节点提供，但同一Profile必须只有一套明确的继承路径和patch owner。
 
-Worker 的`custom_nodes`必须报告来源、提交和节点Schema。Turbo只接受锁定官方`ComfyUI-MiniMax-H3-Turbo`的LoRA加载器与sampler；SageAttention可使用KJNodes的H3专用patch并显式标记实验风险；TeaCache在标准和Turbo Profile中都被拒绝。发现重复、未知或来源不符的实现时拒绝接任务。
+Worker 的`custom_nodes`必须报告来源、提交和节点Schema。Turbo只接受锁定官方`ComfyUI-MiniMax-H3-Turbo`的LoRA加载器与sampler；注意力切换只接受 ComfyUI 原生 `ModelAttentionBackend` 的 `comfy kitchen attention`；TeaCache在标准和Turbo Profile中都被拒绝。发现重复、未知或来源不符的实现时拒绝接任务。
 
 主应用只依赖稳定 Adapter API：
 

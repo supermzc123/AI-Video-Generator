@@ -39,6 +39,9 @@ _TERMINAL_STATES = frozenset(
 _UNSUCCESSFUL_STATES = frozenset(
     {TaskState.FAILED, TaskState.CANCELLED, TaskState.STALE}
 )
+_NO_LONGER_ACTIONABLE_STATES = frozenset(
+    {TaskState.SUCCEEDED, TaskState.CANCELLED, TaskState.STALE}
+)
 
 
 def resolve_batch_run(store: SQLiteTaskStore, batch: BatchRun) -> BatchRun:
@@ -72,7 +75,7 @@ def resolve_batch_run(store: SQLiteTaskStore, batch: BatchRun) -> BatchRun:
             TaskKind.EXPORT,
         }
         if not any(
-            task.kind in orchestration_kinds and task.state not in _TERMINAL_STATES
+            task.kind in orchestration_kinds and task.state not in _NO_LONGER_ACTIONABLE_STATES
             for task in tasks
         ):
             try:
@@ -207,7 +210,9 @@ def _resolve_item_tasks(tasks: tuple[TaskSpec, ...], boundary: str) -> set[str]:
                 children[dependency].add(task.task_id)
 
     if boundary == "next_ready":
-        selected = {task.task_id for task in tasks if task.state not in _TERMINAL_STATES}
+        selected = {
+            task.task_id for task in tasks if task.state not in _NO_LONGER_ACTIONABLE_STATES
+        }
     else:
         kinds = _BOUNDARY_KINDS.get(boundary)
         if kinds is None:

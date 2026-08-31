@@ -37,14 +37,14 @@ Turbo加载器和采样器只接受官方 `ComfyUI-MiniMax-H3-Turbo` 节点：
 ```text
 Load Diffusion Model
 -> MiniMaxH3TurboLoRA
--> optional MiniMaxH3MemoryEfficientSageAttentionPatch
+-> optional ModelAttentionBackend (`comfy kitchen attention`)
 -> guider / BasicScheduler model path
 
 MiniMaxH3TurboSampler -> SamplerCustomAdvanced.sampler
 BasicScheduler(simple, 4..8 steps) -> SamplerCustomAdvanced.sigmas
 ```
 
-默认使用 6 步。4 步速度更快，但快速大动作更容易拖影；6 至 8 步通常更稳。SageAttention可选，低显存模式用于Windows内存压力较高的环境。
+默认使用 6 步。4 步速度更快，但快速大动作更容易拖影；6 至 8 步通常更稳。Comfy Kitchen Attention 可选且由新版 ComfyUI 原生提供，低显存模式用于 Windows 内存压力较高的环境。
 
 TeaCache始终禁止。Turbo少步图叠加TeaCache会明显降低质量，因此运行时和能力预检都不得接受包含TeaCache的受控图修订。
 
@@ -61,3 +61,64 @@ POST /api/v1/h3/workflows/profiles
 ```
 
 产品GUI不会调用这些接口要求用户上传H3图。正常执行直接使用发行包内资源，并在调度前对目标Worker的节点、模型和版本能力重新校验。
+# 用户 H3 双工作流套件
+
+内置受控 H3 工作流继续作为默认实现。用户也可以在“工作流模板”中导入两份
+ComfyUI API 格式 JSON，分别将用途设为“H3 编码”和“H3 扩散”，完成字段映射并登记。
+
+编码工作流必须暴露以下标准绑定：
+
+- `prompt`：最终执行提示词。
+- `width`、`height`：生成尺寸。
+- `frame_count`：包含 Motion Context 预算的采样总帧数。
+- `conditioning_fingerprint`：编码与扩散阶段共享的稳定缓存键。
+- 输出节点必须标记为 `conditioning`。
+
+扩散工作流必须暴露以下标准绑定：
+
+- `conditioning_fingerprint`：读取编码阶段产物的同一个缓存键。
+- `seed`：当前分段 Seed。
+- `output_prefix`：最终视频输出前缀。
+- `motion_context_input`：首段为空；续段为上一段保存的锚点路径。
+- `motion_context_output_prefix`：当前段供下一段继承的锚点输出前缀。
+- 输出节点必须标记为 `video`。
+
+参考图片、视频和音频可在编码模板中按各自模态从索引 1 开始映射。工作流必须把
+conditioning 写入 `output/ai-video-generator/conditioning/<fingerprint>.safetensors`
+及同名 JSON 元数据，并按传入的 Motion Context 路径读取和保存锚点。登记只验证
+字段、节点 Schema 和输出契约；ComfyUI 图内部的模型兼容性仍由工作流作者负责。
+
+登记两份模板后，在“全局设置 -> MiniMax H3 工作流 -> H3 工作流套件”选择
+“用户工作流”并分别选择编码和扩散模板。两份模板必须同时选择；切回“内置受控
+工作流”即可恢复原实现。更换套件会改变执行指纹，新任务不会复用旧套件产物。
+
+## 使用 LLM 标定用户工作流
+
+1. 在 ComfyUI 中分别准备编码图和扩散图，并使用“保存（API 格式）”导出 JSON。普通 UI 工作流 JSON 不能登记。
+2. 需要由程序赋值的字段必须保留为未连接的字面量输入。LLM 不会、也不允许拆开已有连线后重新接线。
+3. 在“工作流模板”导入编码 JSON，将用途选为“H3 编码”，确认节点后点击“LLM 标定 H3”。检查映射并补齐提示的缺失字段，再选择 conditioning 保存节点作为输出并登记。
+4. 导入扩散 JSON，将用途选为“H3 扩散”，再次点击“LLM 标定 H3”。选择最终视频保存节点作为输出并登记。
+5. 在“全局设置”选择这对工作流并保存。系统不允许只选择其中一份。
+6. 先运行 4 秒无参考素材测试，再分别测试图片、视频和音频参考，最后测试至少两个 Motion Context 分段。
+
+LLM 标定只识别“哪个现有节点输入对应哪个标准字段”，不会改写 ComfyUI 拓扑，也不会证明模型、VAE 或自定义节点彼此兼容。无法可靠识别的字段会被省略并显示 warning；登记时确定性契约会再次阻止缺字段或错误输出类型的模板。
+
+### 工作流作者约定
+
+- 编码图必须使用 `conditioning_fingerprint` 写入固定缓存目录，扩散图使用同一值读取。
+- 扩散图必须能处理空的 `motion_context_input`：空值表示首段，不能无条件执行文件加载节点；非空值表示续段，必须读取该锚点。
+- 每段都必须使用 `motion_context_output_prefix` 保存供下一段继承的锚点。
+- `output_prefix` 只用于最终视频，不得与 Motion Context 锚点目录混用。
+- 三种参考模态分别从索引 1 开始；图片 1、视频 1 和音频 1 可以同时存在。
+- 动态组合字段必须先在 ComfyUI 中选择实际存在的父选项，再暴露对应子字段。
+- `width` 和 `height` 是 H3 编码输入画布，不是最终 MP4 分辨率承诺。潜空间放大可以
+  输出不同尺寸；系统会使用 ffprobe 记录每段实际尺寸，并以活动片段中像素数最高的
+  尺寸合并母版。其他片段按比例缩放和填充到该画布，不会降回项目输入尺寸。
+
+### 标定失败排查
+
+- “缺少标准绑定”：手动添加映射，或回到 ComfyUI 暴露该输入。
+- “目标是已连接输入”：该字段属于图内部拓扑，运行时不能安全覆盖。
+- “input is not exposed by object_info”：检查自定义节点版本和动态父选项。
+- “conditioning 完成但缓存产物缺失”：编码图没有按固定指纹目录保存 safetensors 和 JSON 元数据。
+- 第二段 Motion Context 失败：检查首段是否保存锚点，且续段没有写死输入文件名。

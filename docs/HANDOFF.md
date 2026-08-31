@@ -43,7 +43,7 @@
 - 继承头占用下一段采样预算，续段必须至少预留约 2 秒冗余，不能把 15 秒全部写成新内容。
 - 分段不要求机械地采用 `15+15`，例如 30 秒可以按叙事节奏拆成 `10+10+10`，可以由AI或者用户决定。如果用户的划分超出限制必须显式提醒并阻止通过。
 - 条件编码、模型卸载和模型切换属于系统任务，不需要用户审批。
-- Turbo 是可选项，不能强制开启。TeaCache 禁用。SageAttention 可选，但新安装不强制要求。
+- Turbo 是可选项，不能强制开启。TeaCache 禁用。Kitchen Attention 可选，使用 ComfyUI 原生 `ModelAttentionBackend`，不依赖外部注意力插件。
 - H3 工作流与缓存、Motion Context和任务契约高度耦合，使用项目维护的受控拓扑；GUI只暴露模型、Turbo和受支持参数，不提供图形拓扑编辑。
 
 ### 2.2 提示词与 Harness
@@ -55,7 +55,7 @@
 - 当前 MiniMax 官方规范要求 H3 执行描述使用英文；只有对白、歌词和画面内文字保留原语言。
 - Ref2VA 的 `detailed_description` 通常应达到 350 至 500 个英文词；当前确定性最低门槛为 300 词。
 - Ref2VA必须明确限制参考特征的作用范围，禁止服装纹理、图案或材质传播到脸、皮肤、肢体、其他主体或背景。
-- 旧中文 H3 提示词不做破坏性迁移；用户点击“AI重新编写”后才产生符合新规范的版本。
+- 旧数据库与旧提示词不进入新运行时；使用 `scripts/reset-control-plane.ps1` 创建干净控制库后重新建立项目。
 
 ### 2.3 素材与图片工作流
 
@@ -150,7 +150,7 @@ Python 3.11/3.12 + FastAPI + Pydantic
 - 全局ComfyUI路径和项目节点一键安装。
 - 项目级LLM对话、流式输出、FTS5记忆、受限Patch和调用审计。
 - H3提示词专用Harness、超过15秒镜头拆段和Motion Context续段描述。
-- H3静态条件编码、模型切换、Turbo可选、Sage可选、TeaCache阻断。
+- H3静态条件编码、模型切换、Turbo可选、原生 Kitchen Attention 可选、TeaCache阻断。
 - H3生成、ComfyUI取消/历史对账、产物登记和局部失效。
 - AI审核、人工审核、审核超时接管、局部返工接口和媒体Artifact API。
 - 精细化DAG、批量DAG、租约、模式切换、暂停、恢复、取消和重试基础。
@@ -463,12 +463,13 @@ SageAttention：关闭
 
 本轮已完成代码改造，但尚未执行真实 GPU 生成：
 
-- H3 Harness revision 已升级为冻结的 v2 manifest；新任务只使用被批准修订中的文档快照，v1 仅保留历史读取兼容。
+- H3 Harness revision 使用冻结的 v2 manifest；新任务只使用被批准修订中的文档快照，不回读安装目录或旧 revision。
 - 运行链已拆为 Preflight、Director、可选 Planner、Writer、确定性 Validator、Reviewer、定向 Repair 和 Finalize，并记录阶段轨迹、假设、错误和调用统计。
-- H3 英文稿字段改为 `execution_prompt`；旧 `execution_prompt_zh` 可读取映射。中文对照改为按需生成并按提示词哈希缓存，不参与执行或审核。
+- H3 英文稿字段为 `execution_prompt`；中文对照按需生成，不参与执行或审核。
 - 图片、视频和音频均已成为正式参考模态。受控 ComfyUI 编译链分别使用 `LoadImage`、`LoadVideo + GetVideoComponents` 和 `LoadAudio`，上限为 9 张图片、3 个视频、3 段独立音频。
 - 视频上传使用 ffprobe 验证可解码视频流、2 至 15 秒时长和精确 24fps，并记录宽高、时长、帧率及音轨状态；音频上传验证可解码音频流和正时长。
 - 带音轨视频会占用对应 `<Audio N>` 标签，独立音频从后续编号开始，避免提示词标签与 H3 tokenizer 的实际顺序不一致。
+- Motion Context 的 `continuationOf` 不再信任提示词中的可编辑字符串；任务编译和批次调度统一按当前分镜的 `shotId + segmentIndex` 推导紧邻前驱。H3 任务同时登记视频与实际 latent 路径，缺少 latent 时不会把前段误记为成功。
 - 桌面端支持图片、视频和音频上传、播放/预览，并展示素材职责、自动假设、阶段轨迹和按需中文对照。
 - 新增 30 例脱敏离线 H3 路由评测集，以及多模态工作流、manifest 防篡改、翻译缓存和 Validator 回归测试。
 

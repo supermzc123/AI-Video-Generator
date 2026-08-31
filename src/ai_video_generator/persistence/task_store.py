@@ -82,6 +82,10 @@ class LeaseError(TaskStoreError):
     pass
 
 
+CONTROL_PLANE_SCHEMA_VERSION = "6"
+RUNTIME_CHAIN_VERSION = "h3-generation-v2"
+
+
 @dataclass(frozen=True, slots=True)
 class ComfyPromptRecord:
     task_id: str
@@ -163,6 +167,25 @@ class SQLiteTaskStore:
             connection.close()
 
     def _initialize(self) -> None:
+        # A control-plane database is intentionally disposable.  Never mutate an
+        # older test database in place: callers must create a clean data root.
+        if self.database_path.exists() and self.database_path.stat().st_size:
+            probe = sqlite3.connect(self.database_path)
+            try:
+                table = probe.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_metadata'"
+                ).fetchone()
+                if table:
+                    row = probe.execute(
+                        "SELECT value FROM schema_metadata WHERE key='schema_version'"
+                    ).fetchone()
+                    if row and str(row[0]) != CONTROL_PLANE_SCHEMA_VERSION:
+                        raise TaskStoreError(
+                            f"unsupported control-plane schema {row[0]}; "
+                            "create a clean database before starting"
+                        )
+            finally:
+                probe.close()
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = NORMAL")
@@ -172,7 +195,7 @@ class SQLiteTaskStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-                INSERT OR IGNORE INTO schema_metadata(key, value) VALUES ('schema_version', '1');
+                INSERT OR IGNORE INTO schema_metadata(key, value) VALUES ('schema_version', '6');
 
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY,
@@ -548,33 +571,9 @@ class SQLiteTaskStore:
                     ON rework_markers(project_id, state, created_at);
                 """
             )
-            task_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
-            }
-            if "workload_manifest_sha256" not in task_columns:
-                connection.execute("ALTER TABLE tasks ADD COLUMN workload_manifest_sha256 TEXT")
-            if "affinity_key" not in task_columns:
-                connection.execute("ALTER TABLE tasks ADD COLUMN affinity_key TEXT")
-            if "priority" not in task_columns:
-                connection.execute(
-                    "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
-                )
-            run_state_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(project_run_states)").fetchall()
-            }
-            if "execution_mode" not in run_state_columns:
-                connection.execute(
-                    "ALTER TABLE project_run_states ADD COLUMN execution_mode "
-                    "TEXT NOT NULL DEFAULT 'guided'"
-                )
-            if "paused" not in run_state_columns:
-                connection.execute(
-                    "ALTER TABLE project_run_states ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
-                )
             connection.execute(
-                "UPDATE schema_metadata SET value = '5' WHERE key = 'schema_version'"
+                "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+                (CONTROL_PLANE_SCHEMA_VERSION,),
             )
 
     def put_generation_batch(self, batch: GenerationBatch) -> GenerationBatch:
@@ -1241,11 +1240,6 @@ class SQLiteTaskStore:
                 (attempt, int(retain_comfyui_job), _timestamp(changed_at), task_id),
             )
             return self._task_from_row(connection, self._require_task_row(connection, task_id))
-
-    def refresh_ready_tasks(self, *, now: datetime | None = None) -> tuple[str, ...]:
-        changed_at = _ensure_utc(now or _utc_now())
-        with self._transaction(immediate=True) as connection:
-            return self._promote_ready_tasks(connection, changed_at)
 
     def claim_next(
         self,
@@ -2233,10 +2227,15 @@ class SQLiteTaskStore:
                 (bundle.harness_id,),
             ).fetchone()
             if existing is not None:
-                stored = HarnessBundle.model_validate_json(existing["payload_json"])
-                if stored != bundle:
-                    raise StoreConflictError("harness bundle identity is immutable")
-                return stored
+                # A bundle ID identifies the logical Harness, while its
+                # descriptive metadata and source binding may evolve. Keep
+                # revisions immutable, but allow the bundle envelope to be
+                # refreshed when the editor saves again.
+                connection.execute(
+                    "UPDATE harness_bundles SET payload_json = ? WHERE harness_id = ?",
+                    (bundle.model_dump_json(), bundle.harness_id),
+                )
+                return bundle
             connection.execute(
                 "INSERT INTO harness_bundles(harness_id, payload_json, created_at) "
                 "VALUES (?, ?, ?)",
