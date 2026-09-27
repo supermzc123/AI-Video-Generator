@@ -30,10 +30,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from ai_video_generator import __version__
 from ai_video_generator.api_models import (
     ComfyNodeInstallResult,
+    ConfirmTaskRetryRequest,
     DryRunRequest,
     ExportPlanRequest,
     H3WorkflowCompileRequest,
     H3WorkflowInspectRequest,
+    ImageTaskRunRequest,
     PerformanceEstimateRequest,
     PerformanceSampleRequest,
     ProjectAgentOperationRequest,
@@ -46,7 +48,9 @@ from ai_video_generator.api_models import (
     ReworkMarkerUpdateRequest,
     RuntimeSettingsUpdateRequest,
     SegmentReworkRequest,
+    TaskCommandRequest,
     TaskReviewRequest,
+    WorkerLeaseRenewRequest,
     WorkerLeaseRequest,
     WorkerRegisterRequest,
     WorkerResultRequest,
@@ -149,22 +153,35 @@ from ai_video_generator.persistence import (
     StoreConflictError,
     TaskNotFoundError,
 )
+from ai_video_generator.persistence.execution_runtime import execution_guard
 from ai_video_generator.persistence.project_assets import (
     ProjectAssetNotFoundError,
     ProjectAssetStore,
 )
 from ai_video_generator.project_assets_api import create_project_assets_router
 from ai_video_generator.prompting_api import create_prompting_router
+from ai_video_generator.services.batch_orchestration import (
+    OrchestrationNeedsAttention,
+)
+from ai_video_generator.services.batch_orchestration import (
+    run_batch_project_orchestration as run_batch_project_orchestration_service,
+)
 from ai_video_generator.services.batch_runs import (
+    batch_dispatch_frontier,
     batch_project_tasks,
     reconcile_batch_runs,
     resolve_batch_run,
-    resolve_batch_task_ids,
 )
 from ai_video_generator.services.comfy_node_installer import (
     ComfyNodeInstallValidationError,
     install_required_comfy_nodes,
 )
+from ai_video_generator.services.control_commands import (
+    begin_control_command,
+    initialize_control_commands,
+    save_control_command,
+)
+from ai_video_generator.services.dispatch_policy import dispatch_order
 from ai_video_generator.services.export import (
     ExportInput,
     ExportPlan,
@@ -291,6 +308,55 @@ def _canonical_json(value: object) -> bytes:
     )
 
 
+def _batch_settings_for_task(store: SQLiteTaskStore, task: TaskSpec) -> dict[str, object]:
+    for batch in store.list_batch_runs():
+        member = next(
+            (
+                item
+                for item in batch.items
+                if item.project_id == task.project_id and task.task_id in item.task_ids
+            ),
+            None,
+        )
+        if member is not None:
+            return {**batch.settings, **member.settings}
+    return {}
+
+
+def _reactivate_completed_batch_for_task(store: SQLiteTaskStore, task: TaskSpec) -> BatchRun | None:
+    # A task can occur in several historical batches. Never resurrect an older
+    # envelope when a newer active batch already owns its execution.
+    if any(
+        batch.state in {BatchState.RUNNING, BatchState.PAUSED, BatchState.DRAFT}
+        and any(task.task_id in item.task_ids for item in batch.items)
+        for batch in store.list_batch_runs()
+    ):
+        return None
+    for batch in store.list_batch_runs():
+        if batch.state != BatchState.COMPLETED:
+            continue
+        if any(
+            item.project_id == task.project_id and task.task_id in item.task_ids
+            for item in batch.items
+        ):
+            return store.put_batch_run(
+                batch.model_copy(
+                    update={"state": BatchState.RUNNING, "updated_at": datetime.now(UTC)}
+                )
+            )
+    return None
+
+
+def _retry_task_and_batch(store: SQLiteTaskStore, task_id: str) -> TaskSpec:
+    # Validate/retry before changing the batch: an exhausted or ambiguous task
+    # must not leave its completed batch spuriously running.
+    task = store.prepare_task_retry(task_id)
+    _reactivate_completed_batch_for_task(store, task)
+    if task.state == TaskState.READY:
+        task = store.transition_task(task_id, TaskState.QUEUED)
+    return task
+
+
 def _invalidate_agent_approvals(payload: dict[str, object], operation: str) -> dict[str, object]:
     stage_order = (
         "config",
@@ -402,6 +468,21 @@ def _active_project_agent_memory(
     return tuple(sorted((*durable, *branch), key=lambda item: item.created_at)[-50:])
 
 
+def _asset_plan_input_fingerprint(plan: dict[str, object]) -> str:
+    # State and binding are outputs. All semantic plan fields remain inputs.
+    semantic = {
+        key: value for key, value in plan.items() if key not in {"state", "fulfilledByAssetId"}
+    }
+    return hashlib.sha256(
+        json.dumps(
+            semantic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
 def _asset_plan_resolution(plan: dict[str, object] | None) -> tuple[int, int]:
     defaults = {
         "character": (1024, 1600),
@@ -456,9 +537,7 @@ def _image_workflow_values(
         or "video" in str((node.get("_meta") or {}).get("title") or "").casefold()
     ]
     if video_nodes:
-        raise ValueError(
-            f"图片工作流 {template.template_id} 包含视频节点 {', '.join(video_nodes)}"
-        )
+        raise ValueError(f"图片工作流 {template.template_id} 包含视频节点 {', '.join(video_nodes)}")
     references: list[Any] = []
     for asset_id in prompt.get("referenceAssetIds", []):
         try:
@@ -521,16 +600,137 @@ def create_app(
     task_store: SQLiteTaskStore | None = None
     remote_workers: dict[str, WorkerRegistration] = {}
     local_jobs: set[asyncio.Task[None]] = set()
+    local_execution_jobs: dict[str, asyncio.Task[None]] = {}
     local_job_ids: set[str] = set()
     local_comfy_job_ids: set[str] = set()
     local_dispatcher: asyncio.Task[None] | None = None
     node_install_lock = asyncio.Lock()
+    dispatcher_owner = str(uuid.uuid4())
+    dispatcher_health: dict[str, object] = {"status": "starting", "last_tick": None}
+    dispatcher_owned = False
+    residency: dict[str, object] = {"key": None, "count": 0, "since": None}
+    dispatcher_wake = asyncio.Event()
+    cancellation_observers: dict[str, asyncio.Task[None]] = {}
+
+    @app.middleware("http")
+    async def wake_after_command(request: Request, call_next):
+        response = await call_next(request)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            dispatcher_wake.set()
+        return response
+
+    async def observe_cancellation(task_id: str) -> None:
+        try:
+            await reconcile_task_execution(task_id)
+            await asyncio.sleep(5)
+        except (httpx.HTTPError, ValueError, InvalidTaskTransitionError):
+            logger.exception("cancellation_reconciliation_pending")
+        finally:
+            cancellation_observers.pop(task_id, None)
+
+    async def run_owned_local_task(
+        claimed: TaskSpec, *, comfy: bool, observing: bool = False
+    ) -> None:
+        store = get_task_store()
+        task_id = claimed.task_id
+        if (
+            comfy or claimed.kind == TaskKind.MODEL_SWITCH
+        ) and not observing:
+            if residency["key"] == claimed.affinity_key:
+                residency["count"] = int(residency["count"]) + 1
+            else:
+                residency.update(key=claimed.affinity_key, count=1, since=datetime.now(UTC))
+        token = execution_guard.set((task_id, str(claimed.attempt_id)))
+        execution = asyncio.current_task()
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(20)
+                if not store.renew_local_attempt(
+                    task_id, str(claimed.attempt_id), dispatcher_owner
+                ):
+                    current = store.get_task(task_id)
+                    if current.state == TaskState.RUNNING and execution is not None:
+                        execution.cancel()
+                    return
+
+        renewal = asyncio.create_task(heartbeat())
+        try:
+            remaining = (
+                (claimed.deadline_at - datetime.now(UTC)).total_seconds()
+                if claimed.deadline_at
+                else 300
+            )
+            collect_completed = False
+            if comfy and remaining <= 0 and claimed.comfyui_prompt_id:
+                history = await worker_adapter().get_history(claimed.comfyui_prompt_id)
+                status = history.get("status") if isinstance(history, dict) else None
+                collect_completed = isinstance(status, dict) and status.get("completed") is True
+                if collect_completed:
+                    remaining = 60
+            async with asyncio.timeout(max(0.01, remaining)):
+                if comfy:
+                    await execute_local_comfy_task(task_id, collect_completed=collect_completed)
+                else:
+                    await execute_local_control_task(task_id)
+        except TimeoutError:
+            current = store.get_task(task_id)
+            if current.state == TaskState.RUNNING:
+                store.transition_task(
+                    task_id,
+                    TaskState.NEEDS_ATTENTION,
+                    error_code="execution_deadline",
+                    error_message="任务超过截止时间；请核对外部执行状态后处理",
+                )
+        except Exception as exc:
+            current = store.get_task(task_id)
+            if current.state == TaskState.RUNNING:
+                with suppress(ValueError, InvalidTaskTransitionError):
+                    store.transition_task(
+                        task_id,
+                        TaskState.NEEDS_ATTENTION,
+                        error_code="execution_observation_failed",
+                        error_message=(str(exc) or type(exc).__name__)[:2000],
+                    )
+            logger.exception("owned_execution_observation_failed")
+        finally:
+            renewal.cancel()
+            await asyncio.gather(renewal, return_exceptions=True)
+            execution_guard.reset(token)
+            local_job_ids.discard(task_id)
+            local_comfy_job_ids.discard(task_id)
+
+    def track_local_execution_job(task_id: str, job: asyncio.Task[None]) -> None:
+        local_jobs.add(job)
+        local_execution_jobs[task_id] = job
+
+        def forget(completed: asyncio.Task[None]) -> None:
+            local_jobs.discard(completed)
+            if not completed.cancelled() and completed.exception() is not None:
+                failure = completed.exception()
+                logger.error(
+                    "local_execution_failed",
+                    exc_info=(
+                        type(failure),
+                        failure,
+                        failure.__traceback__,
+                    ),
+                )
+            if local_execution_jobs.get(task_id) is completed:
+                local_execution_jobs.pop(task_id, None)
+
+        job.add_done_callback(forget)
 
     def get_task_store() -> SQLiteTaskStore:
         nonlocal task_store
         if task_store is None:
             database_path = Path(resolved_settings.data_root) / "control-plane.db"
-            task_store = SQLiteTaskStore(database_path)
+            task_store = SQLiteTaskStore(
+                database_path,
+                llm_slots=runtime_settings.llm_concurrency,
+                llm_operation_timeout_seconds=runtime_settings.llm_operation_timeout_seconds,
+            )
+            initialize_control_commands(task_store)
         return task_store
 
     def h3_execution_profile(
@@ -584,7 +784,9 @@ def create_app(
         )
         return get_task_store().put_harness_bundle(bundle)
 
-    def project_preflight(project_id: str) -> dict[str, object]:
+    def project_preflight(
+        project_id: str, *, tasks: tuple[TaskSpec, ...] | None = None
+    ) -> dict[str, object]:
         blockers: list[str] = []
         warnings: list[str] = []
         try:
@@ -598,10 +800,19 @@ def create_app(
             }
         if not run_state.outline_approved:
             blockers.append("outline must be approved before automated execution")
-        if not runtime_settings.llm_base_url or not runtime_settings.llm_model:
+        pending = tuple(
+            task
+            for task in (
+                tasks if tasks is not None else get_task_store().list_tasks(project_id=project_id)
+            )
+            if task.state not in {TaskState.SUCCEEDED, TaskState.CANCELLED, TaskState.STALE}
+        )
+        needs_planning = not pending or any(task.kind == TaskKind.LLM_PLANNING for task in pending)
+        needs_llm = needs_planning or any(task.kind == TaskKind.AI_REVIEW for task in pending)
+        if needs_llm and (not runtime_settings.llm_base_url or not runtime_settings.llm_model):
             blockers.append("LLM provider is not configured")
         h3_revisions = get_task_store().list_harness_revisions("h3:default")
-        if not any(
+        if needs_planning and not any(
             item.approval == ApprovalState.APPROVED
             and item.schema_version == "2.0"
             and item.runtime_manifest is not None
@@ -613,7 +824,12 @@ def create_app(
             warnings.append("project has no reference assets yet")
         if run_state.time_budget and run_state.time_budget.retry_budget_exhausted:
             warnings.append("time budget only permits the required path; AI retries are disabled")
-        return {"ready": not blockers, "blockers": blockers, "warnings": warnings}
+        return {
+            "ready": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+            "requires_llm": needs_llm,
+        }
 
     async def project_execution_preflight(project_id: str) -> dict[str, object]:
         result = project_preflight(project_id)
@@ -768,6 +984,39 @@ def create_app(
         existing_id = str(plan.get("fulfilledByAssetId") or "") or None
         asset_store = project_asset_store()
         existing = asset_store.get_asset(project_id, existing_id) if existing_id else None
+        source = store.get_task(task_id)
+        if source.workload_manifest_sha256:
+            frozen = store.get_workload_manifest(source.workload_manifest_sha256).manifest.context
+            expected_plan = frozen.get("asset_plan_input_fingerprint")
+            expected_asset = frozen.get("binding_asset_id")
+            expected_revision = frozen.get("binding_asset_revision")
+            same_result = bool(
+                existing
+                and existing.source_task_id == task_id
+                and existing.sha256 == hashlib.sha256(content).hexdigest()
+            )
+            binding_changed = (
+                expected_asset is not None and expected_asset != (existing_id or "")
+            ) or (
+                expected_revision is not None
+                and expected_revision != (str(existing.revision) if existing else "")
+            )
+            if (expected_plan and expected_plan != _asset_plan_input_fingerprint(plan)) or (
+                binding_changed and not same_result
+            ):
+                register_generated_asset_candidate(project_id, asset_plan_id, task_id, content)
+                raise OrchestrationNeedsAttention(
+                    "图片完成前素材需求或绑定版本已改变；已保留候选，请确认后再采用"
+                )
+            if same_result and workspace.payload.get("referenceAssetMode") != "none":
+                recorded_assets = workspace.payload.get("assets", [])
+                if any(
+                    isinstance(item, dict)
+                    and item.get("id") == existing.asset_id
+                    and item.get("sha256") == existing.sha256
+                    for item in recorded_assets
+                ):
+                    return
         replace_id = existing.asset_id if existing is not None else None
         kind = ProjectAssetPurpose(str(plan.get("kind") or "reference"))
         scope = AssetScope.SHOT if plan.get("scope") == "shot" else AssetScope.COMMON
@@ -782,6 +1031,11 @@ def create_app(
             shot_ids=tuple(str(value) for value in plan.get("shotIds", []) if value),
             replace_asset_id=replace_id,
         )
+        latest_asset = asset_store.get_asset(project_id, asset.asset_id)
+        if latest_asset.revision != asset.revision:
+            raise OrchestrationNeedsAttention(
+                "生成产物已有更新版本；保留当前素材绑定，旧产物需要人工确认"
+            )
         # A task submitted before the user selected no-reference mode may still
         # finish. Preserve its immutable asset record for audit, but do not let
         # the stale result bind a plan or invalidate approved video prompts.
@@ -816,6 +1070,7 @@ def create_app(
         # the accepted candidate. Keeping the old id in prompt metadata causes
         # later H3 manifests to upload and reference the previous image.
         if replace_id and replace_id != asset.asset_id:
+
             def replace_asset_reference(value: object) -> object:
                 if isinstance(value, list):
                     return [
@@ -843,7 +1098,11 @@ def create_app(
         invalidated_h3 = [
             item
             for item in previous_h3
-            if isinstance(item, dict) and str(item.get("shotId") or "") in affected_shot_ids
+            if isinstance(item, dict)
+            and (
+                (replace_id and replace_id in item.get("assetIds", []))
+                or (not replace_id and str(item.get("shotId") or "") in affected_shot_ids)
+            )
         ]
         if invalidated_h3:
             invalidated_ids = {str(item.get("segmentId") or "") for item in invalidated_h3}
@@ -896,25 +1155,41 @@ def create_app(
 
     def persist_task_output(task: TaskSpec, filename: str, content: bytes) -> Path:
         safe_name = Path(filename).name
+        if not safe_name or not content:
+            raise ValueError("generated output must have a filename and non-empty content")
         root = (
             Path(resolved_settings.data_root)
             / "task-outputs"
             / hashlib.sha256(task.task_id.encode()).hexdigest()[:24]
         )
         root.mkdir(parents=True, exist_ok=True)
-        path = root / safe_name
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_bytes(content)
-        temporary.replace(path)
+        digest = hashlib.sha256(content).hexdigest()
+        path = root / f"{digest[:24]}-{safe_name}"
+        if path.exists() and _file_sha256(path) == digest:
+            return path
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if _file_sha256(temporary) != digest:
+                raise ValueError("generated output failed integrity validation")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return path
 
-    async def execute_local_comfy_task(task_id: str) -> None:
+    async def execute_local_comfy_task(task_id: str, *, collect_completed: bool = False) -> None:
         store = get_task_store()
         workflow_completed = False
+        external_failed = False
         try:
             task = store.get_task(task_id)
             if task.state == TaskState.QUEUED:
                 task = store.transition_task(task_id, TaskState.RUNNING)
+            elif task.state != TaskState.RUNNING:
+                return
             if task.workload_manifest_sha256 is None:
                 raise ValueError("image task is missing its workload manifest")
             manifest = store.get_workload_manifest(task.workload_manifest_sha256).manifest
@@ -953,18 +1228,69 @@ def create_app(
             adapter = worker_adapter()
             prompt_id = task.comfyui_prompt_id
             if not prompt_id:
-                submission = await adapter.submit_prompt(manifest.prompt)
-                if submission.node_errors:
-                    raise ValueError(f"ComfyUI rejected workflow nodes: {submission.node_errors}")
-                store.record_comfyui_prompt(task_id, submission.prompt_id)
-                prompt_id = submission.prompt_id
+                if collect_completed:
+                    raise ValueError("output collection requires an existing external prompt")
+                submission_token, fresh = store.ensure_submission_intent(task_id)
+                if not fresh:
+                    prompt_id = await adapter.find_submission(submission_token)
+                    if not prompt_id:
+                        store.transition_task(
+                            task_id,
+                            TaskState.NEEDS_ATTENTION,
+                            error_code="submission_unconfirmed",
+                            error_message="找不到此前提交的任务；为避免重复生成，请重新对账或确认重新执行",
+                        )
+                        return
+                    store.record_comfyui_prompt(task_id, prompt_id)
+                else:
+                    submission = await adapter.submit_prompt(
+                        manifest.prompt,
+                        extra_data={
+                            "avg_submission_token": submission_token,
+                            "avg_task_id": task_id,
+                            "avg_attempt_id": task.attempt_id,
+                        },
+                    )
+                    if submission.node_errors:
+                        raise ValueError(
+                            f"ComfyUI rejected workflow nodes: {submission.node_errors}"
+                        )
+                    store.record_comfyui_prompt(task_id, submission.prompt_id)
+                    prompt_id = submission.prompt_id
             task = store.get_task(task_id)
-            async with asyncio.timeout(4 * 60 * 60):
+            missing_observations = 0
+            async with asyncio.timeout(
+                max(
+                    0.01,
+                    60
+                    if collect_completed
+                    else (task.deadline_at - datetime.now(UTC)).total_seconds()
+                    if task.deadline_at
+                    else 14400,
+                )
+            ):
                 while True:
                     current = store.get_task(task_id)
-                    if current.state == TaskState.CANCELLED:
+                    if current.state in {
+                        TaskState.CANCELLED,
+                        TaskState.CANCELLING,
+                        TaskState.STALE,
+                    }:
                         return
                     history = await adapter.get_history(prompt_id)
+                    if history is None:
+                        queued = await adapter.queued_prompt_ids()
+                        missing_observations = (
+                            0 if prompt_id in queued else missing_observations + 1
+                        )
+                        if missing_observations >= 3:
+                            store.transition_task(
+                                task_id,
+                                TaskState.NEEDS_ATTENTION,
+                                error_code="external_job_missing",
+                                error_message="ComfyUI 队列及历史中均未找到任务；不会自动重复生成",
+                            )
+                            return
                     if history is not None:
                         status = history.get("status")
                         status_text = str(
@@ -974,6 +1300,7 @@ def create_app(
                             isinstance(status, dict) and status.get("completed") is True
                         )
                         if status_text in {"error", "failed"}:
+                            external_failed = True
                             raise ValueError("ComfyUI image workflow failed")
                         if task.kind == TaskKind.IMAGE_GENERATION and template is not None:
                             outputs = extract_workflow_outputs(history, template)
@@ -1160,48 +1487,55 @@ def create_app(
                         if isinstance(status, dict) and status.get("completed") is True:
                             raise ValueError("ComfyUI completed without the declared image output")
                     await asyncio.sleep(0.75)
-        except Exception as exc:  # task failures are persisted for UI recovery
-            try:
-                current = store.get_task(task_id)
-                # Once ComfyUI has returned a prompt ID, a transport timeout only
-                # means this observer lost its connection. Leave the task running;
-                # the dispatcher will reattach to the same prompt and read again.
-                submitted_transport_failure = isinstance(exc, httpx.TransportError) and bool(
-                    current.comfyui_prompt_id
-                )
-                if (
-                    current.state not in {TaskState.CANCELLED, TaskState.SUCCEEDED}
-                    and not submitted_transport_failure
-                ):
-                    failed = store.transition_task(
+        except Exception as exc:
+            current = store.get_task(task_id)
+            if current.state not in {
+                TaskState.CANCELLED,
+                TaskState.CANCELLING,
+                TaskState.SUCCEEDED,
+                TaskState.STALE,
+                TaskState.NEEDS_ATTENTION,
+            }:
+                if isinstance(exc, httpx.TransportError):
+                    store.transition_task(
                         task_id,
-                        TaskState.FAILED,
-                        error_code=(
-                            "local_output_collection_failed"
-                            if workflow_completed
-                            else "local_comfy_execution_failed"
-                        ),
-                        error_message=(str(exc) or type(exc).__name__)[:2000],
+                        TaskState.RECOVERING,
+                        error_code="worker_disconnected",
+                        error_message="连接中断，保留执行标识以便重新对账",
                     )
-                    if failed.attempt < failed.max_attempts:
-                        store.put_task_checkpoint(
-                            TaskCheckpoint(
-                                checkpoint_id=f"{task_id}:auto-retry:{failed.attempt}",
-                                task_id=task_id,
-                                sequence=80 + failed.attempt,
-                                phase="automatic_retry",
-                                payload={
-                                    "attempt": failed.attempt,
-                                    "max_attempts": failed.max_attempts,
-                                    "error": (str(exc) or type(exc).__name__)[:1000],
-                                },
-                                created_at=datetime.now(UTC),
-                            )
+                    await asyncio.sleep(2)
+                elif isinstance(exc, TimeoutError):
+                    store.transition_task(
+                        task_id,
+                        TaskState.NEEDS_ATTENTION,
+                        error_code="execution_deadline",
+                        error_message="执行超时，请核对 ComfyUI 任务",
+                    )
+                else:
+                    with store._connect() as connection:
+                        intent = connection.execute(
+                            "SELECT submission_token FROM task_runtime WHERE task_id=?",
+                            (task_id,),
+                        ).fetchone()
+                    uncertain = bool(current.comfyui_prompt_id or (intent and intent[0]))
+                    if external_failed:
+                        identity = store.inspect_submission(task_id)
+                        store.confirm_task_stopped(
+                            task_id,
+                            expected_attempt_id=identity.get("attempt_id"),
+                            expected_submission_token=identity.get("submission_token"),
+                            prompt_id=current.comfyui_prompt_id,
+                            evidence="ComfyUI history explicitly reports execution failure",
                         )
-                        store.prepare_task_retry(task_id)
-                        store.transition_task(task_id, TaskState.QUEUED)
-            except (TaskNotFoundError, InvalidTaskTransitionError):
-                pass
+                    else:
+                        store.transition_task(
+                            task_id,
+                            TaskState.NEEDS_ATTENTION if uncertain else TaskState.FAILED,
+                            error_code="local_output_collection_failed"
+                            if workflow_completed
+                            else "local_comfy_execution_failed",
+                            error_message=(str(exc) or type(exc).__name__)[:2000],
+                        )
         finally:
             local_job_ids.discard(task_id)
             local_comfy_job_ids.discard(task_id)
@@ -1530,10 +1864,6 @@ def create_app(
             get_task_store().get_workload_manifest(h3_task.workload_manifest_sha256 or "").manifest
         )
         prompt_text = str(manifest.context.get("prompt_text") or "")
-        if not prompt_text:
-            task_prompt = h3_task.inputs.get("prompt")
-            if isinstance(task_prompt, dict):
-                prompt_text = str(task_prompt.get("prompt") or "")
         for node in manifest.prompt.values():
             if prompt_text:
                 break
@@ -1719,49 +2049,23 @@ def create_app(
             shot_id=str(plan.get("shotId") or "") or None,
         )
 
-    async def run_ai_review_with_retries(task: TaskSpec) -> None:
-        attempts = max(1, task.max_attempts)
-        for attempt_index in range(attempts):
-            try:
-                await run_ai_review(task)
-                return
-            except LLMClientError as exc:
-                if not is_retryable_llm_error(exc) or attempt_index + 1 >= attempts:
-                    raise
-                delay_seconds = min(8, 2**attempt_index)
-                get_task_store().put_task_checkpoint(
-                    TaskCheckpoint(
-                        checkpoint_id=f"{task.task_id}:llm-retry:{attempt_index + 1}",
-                        task_id=task.task_id,
-                        sequence=90 + attempt_index,
-                        phase="llm_retry_wait",
-                        payload={
-                            "attempt": attempt_index + 1,
-                            "max_attempts": attempts,
-                            "delay_seconds": delay_seconds,
-                            "error": str(exc)[:1000],
-                        },
-                        created_at=datetime.now(UTC),
-                    )
-                )
-                await asyncio.sleep(delay_seconds)
-
     async def execute_local_control_task(task_id: str) -> None:
         store = get_task_store()
         try:
             task = store.get_task(task_id)
             if task.state == TaskState.QUEUED:
                 task = store.transition_task(task_id, TaskState.RUNNING)
+            elif task.state != TaskState.RUNNING:
+                return
             if task.kind == TaskKind.LLM_PLANNING:
-                await run_batch_project_orchestration(task)
-                store.transition_task(task_id, TaskState.SUCCEEDED)
+                if await run_batch_project_orchestration(task):
+                    store.transition_task(task_id, TaskState.SUCCEEDED)
             elif task.kind == TaskKind.MODEL_SWITCH:
                 await worker_adapter().free_models()
                 store.transition_task(task_id, TaskState.SUCCEEDED)
             elif task.kind == TaskKind.AI_REVIEW:
                 run_state = store.get_project_run_state(task.project_id)
                 if run_state.review_policy.effective_mode.value == "human_ai":
-                    await run_ai_review_with_retries(task)
                     opened = datetime.now(UTC)
                     store.put_review_deadline(
                         ReviewDeadline(
@@ -1772,8 +2076,11 @@ def create_app(
                             + timedelta(seconds=run_state.review_policy.human_timeout_seconds),
                         )
                     )
+                    await run_ai_review(task)
                 else:
-                    await run_ai_review_with_retries(task)
+                    await run_ai_review(task)
+            elif task.kind == TaskKind.ASSET_TRANSFER:
+                raise ValueError("本地素材传输任务缺少可执行传输契约；请检查输入或改用远程 Worker")
             elif task.kind == TaskKind.MASTER_ASSEMBLY:
                 workspace = store.get_latest_project_workspace(task.project_id)
                 sources = {
@@ -1868,8 +2175,7 @@ def create_app(
                 store.transition_task(task_id, TaskState.SUCCEEDED)
             elif task.kind == TaskKind.EXPORT:
                 tasks_by_id = {
-                    item.task_id: item
-                    for item in store.list_tasks(project_id=task.project_id)
+                    item.task_id: item for item in store.list_tasks(project_id=task.project_id)
                 }
                 video_sources = tuple(
                     dependency
@@ -1927,104 +2233,163 @@ def create_app(
         except Exception as exc:
             try:
                 current = store.get_task(task_id)
-                if current.state not in {TaskState.CANCELLED, TaskState.SUCCEEDED}:
-                    store.transition_task(
-                        task_id,
-                        TaskState.FAILED,
-                        error_code="local_control_task_failed",
-                        error_message=str(exc)[:4000],
-                    )
-            except (TaskNotFoundError, InvalidTaskTransitionError):
-                pass
+                if current.state not in {
+                    TaskState.CANCELLED,
+                    TaskState.SUCCEEDED,
+                    TaskState.CANCELLING,
+                }:
+                    if isinstance(exc, OrchestrationNeedsAttention):
+                        store.transition_task(
+                            task_id,
+                            TaskState.NEEDS_ATTENTION,
+                            error_code="orchestration_needs_attention",
+                            error_message=str(exc)[:4000],
+                        )
+                    else:
+                        identity = store.inspect_submission(task_id)
+                        store.finish_attempt_failure(
+                            task_id,
+                            expected_attempt_id=identity.get("attempt_id"),
+                            expected_submission_token=identity.get("submission_token"),
+                            error_code="local_control_task_failed",
+                            error_message=(str(exc) or type(exc).__name__)[:4000],
+                            retryable=isinstance(exc, LLMClientError)
+                            and is_retryable_llm_error(exc),
+                        )
+            except (TaskNotFoundError, InvalidTaskTransitionError, ValueError):
+                logger.exception("control_attempt_failure_fenced")
         finally:
             local_job_ids.discard(task_id)
             local_comfy_job_ids.discard(task_id)
 
     async def local_task_dispatch_loop() -> None:
+        nonlocal dispatcher_owned
         while True:
             try:
-                reconcile_generation_batches(get_task_store())
-                for generation_batch in get_task_store().list_generation_batches_all():
-                    if not generation_batch.dispatch_requested or generation_batch.state in {
-                        GenerationBatchState.COMPLETED,
-                        GenerationBatchState.CANCELLED,
-                    }:
-                        continue
-                    run_state = get_task_store().get_project_run_state(generation_batch.project_id)
-                    if run_state.paused:
-                        continue
-                    selected_ids = {
-                        *generation_batch.encoding_task_ids,
-                        *generation_batch.task_ids,
-                    }
-                    if generation_batch.model_switch_task_id:
-                        selected_ids.add(generation_batch.model_switch_task_id)
-                    selected = [
-                        task
-                        for task in get_task_store().list_tasks(
-                            project_id=generation_batch.project_id
-                        )
-                        if task.task_id in selected_ids
-                    ]
-                    if any(
-                        task.state in {TaskState.QUEUED, TaskState.RUNNING} for task in selected
+                store = get_task_store()
+                if not store.acquire_dispatcher(dispatcher_owner):
+                    dispatcher_owned = False
+                    dispatcher_health["status"] = "standby"
+                    await asyncio.sleep(1)
+                    continue
+                if not dispatcher_owned:
+                    store.recover_local_attempts()
+                    dispatcher_owned = True
+                dispatcher_health.update(status="running", last_tick=datetime.now(UTC).isoformat())
+                store.promote_due_retries()
+                store.recover_expired_leases()
+                for cancelling_task in store.list_tasks():
+                    if (
+                        cancelling_task.state == TaskState.CANCELLING
+                        and cancelling_task.task_id not in cancellation_observers
                     ):
-                        continue
-                    workspace = get_task_store().get_latest_project_workspace(
-                        generation_batch.project_id
-                    )
-                    frozen = frozen_segment_ids(
-                        motion_context_segments(workspace.payload),
-                        (
-                            marker
-                            for marker in get_task_store().list_rework_markers(
-                                generation_batch.project_id
-                            )
-                            if marker.batch_id != generation_batch.batch_id
-                        ),
-                    )
-                    versions_by_task = {
-                        version.task_id: version
-                        for version in get_task_store().list_segment_generation_versions(
+                        observer = asyncio.create_task(
+                            observe_cancellation(cancelling_task.task_id)
+                        )
+                        cancellation_observers[cancelling_task.task_id] = observer
+                        local_jobs.add(observer)
+                        observer.add_done_callback(local_jobs.discard)
+                for generation_batch in store.list_generation_batches_all():
+                    try:
+                        reconcile_generation_batches(store, batch_id=generation_batch.batch_id)
+                    except (KeyError, ValueError, StoreConflictError):
+                        logger.exception(
+                            "generation_batch_reconciliation_failed",
+                            extra={
+                                "project_id": generation_batch.project_id,
+                            },
+                        )
+                for generation_batch in get_task_store().list_generation_batches_all():
+                    try:
+                        if not generation_batch.dispatch_requested or generation_batch.state in {
+                            GenerationBatchState.COMPLETED,
+                            GenerationBatchState.CANCELLED,
+                        }:
+                            continue
+                        run_state = get_task_store().get_project_run_state(
                             generation_batch.project_id
                         )
-                    }
-                    ready_encodes = [
-                        task
-                        for task in selected
-                        if task.kind == TaskKind.CONDITIONING_ENCODING
-                        and task.state == TaskState.READY
-                    ]
-                    switch = next(
-                        (
+                        if run_state.paused:
+                            continue
+                        selected_ids = {
+                            *generation_batch.encoding_task_ids,
+                            *generation_batch.task_ids,
+                        }
+                        if generation_batch.model_switch_task_id:
+                            selected_ids.add(generation_batch.model_switch_task_id)
+                        selected = [
+                            task
+                            for task in get_task_store().list_tasks(
+                                project_id=generation_batch.project_id
+                            )
+                            if task.task_id in selected_ids
+                        ]
+                        if any(
+                            task.state in {TaskState.QUEUED, TaskState.RUNNING} for task in selected
+                        ):
+                            continue
+                        workspace = get_task_store().get_latest_project_workspace(
+                            generation_batch.project_id
+                        )
+                        frozen = frozen_segment_ids(
+                            motion_context_segments(workspace.payload),
+                            (
+                                marker
+                                for marker in get_task_store().list_rework_markers(
+                                    generation_batch.project_id
+                                )
+                                if marker.batch_id != generation_batch.batch_id
+                            ),
+                        )
+                        versions_by_task = {
+                            version.task_id: version
+                            for version in get_task_store().list_segment_generation_versions(
+                                generation_batch.project_id
+                            )
+                        }
+                        ready_encodes = [
                             task
                             for task in selected
-                            if task.task_id == generation_batch.model_switch_task_id
-                        ),
-                        None,
-                    )
-                    ready_videos = sorted(
-                        (
-                            task
-                            for task in selected
-                            if task.kind == TaskKind.H3_GENERATION
+                            if task.kind == TaskKind.CONDITIONING_ENCODING
                             and task.state == TaskState.READY
-                            and versions_by_task.get(task.task_id) is not None
-                            and versions_by_task[task.task_id].segment_id not in frozen
-                        ),
-                        key=lambda task: (-task.priority, task.task_id),
-                    )
-                    candidate = (
-                        min(ready_encodes, key=lambda task: task.task_id)
-                        if ready_encodes
-                        else switch
-                        if switch is not None and switch.state == TaskState.READY
-                        else ready_videos[0]
-                        if ready_videos
-                        else None
-                    )
-                    if candidate is not None:
-                        get_task_store().transition_task(candidate.task_id, TaskState.QUEUED)
+                        ]
+                        switch = next(
+                            (
+                                task
+                                for task in selected
+                                if task.task_id == generation_batch.model_switch_task_id
+                            ),
+                            None,
+                        )
+                        ready_videos = sorted(
+                            (
+                                task
+                                for task in selected
+                                if task.kind == TaskKind.H3_GENERATION
+                                and task.state == TaskState.READY
+                                and versions_by_task.get(task.task_id) is not None
+                                and versions_by_task[task.task_id].segment_id not in frozen
+                            ),
+                            key=lambda task: (-task.priority, task.task_id),
+                        )
+                        candidate = (
+                            min(ready_encodes, key=lambda task: task.task_id)
+                            if ready_encodes
+                            else switch
+                            if switch is not None and switch.state == TaskState.READY
+                            else ready_videos[0]
+                            if ready_videos
+                            else None
+                        )
+                        if candidate is not None:
+                            get_task_store().transition_task(candidate.task_id, TaskState.QUEUED)
+                    except Exception as exc:
+                        dispatcher_health.update(status="degraded", error=type(exc).__name__)
+                        logger.exception(
+                            "project_dispatch_failed",
+                            extra={"project_id": generation_batch.project_id},
+                        )
+                        continue
                 takeover_states = get_task_store().apply_expired_review_deadlines()
                 takeover_projects = {state.project_id for state in takeover_states}
                 for project_id in takeover_projects:
@@ -2055,65 +2420,83 @@ def create_app(
                     if batch.state != BatchState.RUNNING:
                         continue
                     for item in batch.items:
-                        selected = set(item.task_ids)
-                        for batch_task in get_task_store().list_tasks(project_id=item.project_id):
-                            if selected and batch_task.task_id not in selected:
-                                continue
-                            if batch_task.state == TaskState.READY:
+                        if item.paused:
+                            continue
+                        try:
+                            selected = set(item.task_ids)
+                            member_tasks = tuple(
+                                batch_task
+                                for batch_task in get_task_store().list_tasks(
+                                    project_id=item.project_id
+                                )
+                                if batch_task.task_id in selected
+                            )
+                            for batch_task in batch_dispatch_frontier(member_tasks):
                                 get_task_store().transition_task(
                                     batch_task.task_id, TaskState.QUEUED
                                 )
-                for task in get_task_store().list_tasks():
-                    if task.kind == TaskKind.AI_REVIEW and task.state == TaskState.READY:
-                        get_task_store().transition_task(task.task_id, TaskState.QUEUED)
-                        task = get_task_store().get_task(task.task_id)
-                    if (
-                        task.kind
-                        in {
+                        except Exception as exc:
+                            dispatcher_health.update(status="degraded", error=type(exc).__name__)
+                            logger.exception(
+                                "project_dispatch_failed", extra={"project_id": item.project_id}
+                            )
+                            continue
+                for task in dispatch_order(
+                    store.list_tasks(),
+                    resident_key=residency["key"],
+                    consecutive=int(residency["count"]),
+                    window_started=residency["since"],
+                ):
+                    try:
+                        if task.execution_target != ExecutionTarget.LOCAL:
+                            continue
+                        try:
+                            paused = store.get_project_run_state(task.project_id).paused
+                        except KeyError:
+                            paused = False
+                        if paused and task.state != TaskState.RECOVERING:
+                            continue
+                        if task.kind == TaskKind.AI_REVIEW and task.state == TaskState.READY:
+                            task = store.transition_task(task.task_id, TaskState.QUEUED)
+                        if (
+                            task.state not in {TaskState.QUEUED, TaskState.RECOVERING}
+                            or task.task_id in local_job_ids
+                        ):
+                            continue
+                        comfy = task.kind in {
                             TaskKind.IMAGE_GENERATION,
                             TaskKind.CONDITIONING_ENCODING,
                             TaskKind.H3_GENERATION,
                             TaskKind.SEEDVR2,
                             TaskKind.RIFE,
-                            TaskKind.WHISPER,
-                        }
-                        and task.execution_target == ExecutionTarget.LOCAL
-                        and (
-                            task.kind != TaskKind.WHISPER
-                            or task.workload_manifest_sha256 is not None
+                        } or (
+                            task.kind == TaskKind.WHISPER
+                            and task.workload_manifest_sha256 is not None
                         )
-                        and task.state in {TaskState.QUEUED, TaskState.RUNNING}
-                        and task.task_id not in local_job_ids
-                        and not local_comfy_job_ids
-                    ):
+                        gpu = comfy or task.kind == TaskKind.MODEL_SWITCH
+                        if gpu and local_comfy_job_ids and task.state != TaskState.RECOVERING:
+                            continue
+                        claimed = store.claim_local_task(task.task_id, dispatcher_owner)
+                        if claimed is None:
+                            continue
                         local_job_ids.add(task.task_id)
-                        local_comfy_job_ids.add(task.task_id)
-                        job = asyncio.create_task(execute_local_comfy_task(task.task_id))
-                        local_jobs.add(job)
-                        job.add_done_callback(local_jobs.discard)
-                    elif (
-                        task.kind
-                        in {
-                            TaskKind.LLM_PLANNING,
-                            TaskKind.MODEL_SWITCH,
-                            TaskKind.AI_REVIEW,
-                            TaskKind.MASTER_ASSEMBLY,
-                            TaskKind.WHISPER,
-                            TaskKind.EXPORT,
-                        }
-                        and task.execution_target == ExecutionTarget.LOCAL
-                        and (task.kind != TaskKind.WHISPER or task.workload_manifest_sha256 is None)
-                        and task.state == TaskState.QUEUED
-                        and task.task_id not in local_job_ids
-                        and (task.kind != TaskKind.MODEL_SWITCH or not local_comfy_job_ids)
-                    ):
-                        local_job_ids.add(task.task_id)
-                        if task.kind == TaskKind.MODEL_SWITCH:
+                        if gpu:
                             local_comfy_job_ids.add(task.task_id)
-                        job = asyncio.create_task(execute_local_control_task(task.task_id))
-                        local_jobs.add(job)
-                        job.add_done_callback(local_jobs.discard)
+                        job = asyncio.create_task(
+                            run_owned_local_task(
+                                claimed, comfy=comfy,
+                                observing=task.state == TaskState.RECOVERING,
+                            )
+                        )
+                        track_local_execution_job(task.task_id, job)
+                    except Exception as exc:
+                        dispatcher_health.update(status="degraded", error=type(exc).__name__)
+                        logger.exception(
+                            "project_dispatch_failed", extra={"project_id": task.project_id}
+                        )
+                        continue
             except Exception as exc:
+                dispatcher_health.update(status="degraded", error=type(exc).__name__)
                 # Keep the dispatcher alive, but make scheduler faults observable and
                 # attach enough state to diagnose a stuck ready/queued task.
                 logger.exception(
@@ -2123,24 +2506,165 @@ def create_app(
                         "active_local_jobs": len(local_job_ids),
                     },
                 )
-            await asyncio.sleep(1.0)
+            try:
+                await asyncio.wait_for(dispatcher_wake.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
+            finally:
+                dispatcher_wake.clear()
 
     async def cancel_task_execution(task_id: str) -> TaskSpec:
-        task = get_task_store().get_task(task_id)
-        if task.state == TaskState.CANCELLED:
+        store = get_task_store()
+        task = store.request_task_cancellation(task_id)
+        if task.state in {TaskState.CANCELLED, TaskState.SUCCEEDED, TaskState.STALE}:
             return task
-        if (
-            task.state == TaskState.RUNNING
-            and task.execution_target == ExecutionTarget.LOCAL
-            and task.comfyui_prompt_id
-        ):
-            await worker_adapter().cancel_prompt(task.comfyui_prompt_id)
-        return get_task_store().transition_task(
-            task_id,
+        identity = store.inspect_submission(task_id)
+        cas = {
+            "expected_attempt_id": identity.get("attempt_id"),
+            "expected_submission_token": identity.get("submission_token"),
+        }
+        if task.execution_target == ExecutionTarget.REMOTE:
+            store.append_task_checkpoint(
+                task_id,
+                "remote_cancel_pending",
+                {
+                    "reason": "等待远程 Worker 确认停止；尚未释放执行资源",
+                },
+            )
+            return store.get_task(task_id)
+        job = local_execution_jobs.get(task_id)
+        if job and not job.done():
+            job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
+        prompt_id = task.comfyui_prompt_id
+        try:
+            adapter = worker_adapter()
+            if not prompt_id and identity.get("submission_token"):
+                prompt_id = await adapter.find_submission(identity["submission_token"])
+                if not prompt_id:
+                    store.append_task_checkpoint(
+                        task_id,
+                        "cancellation_pending",
+                        {
+                            "reason": "提交结果未知，等待对账确认；不会释放资源或重新提交",
+                        },
+                    )
+                    return store.get_task(task_id)
+            if prompt_id:
+                await adapter.cancel_prompt(prompt_id)
+                if prompt_id in await adapter.queued_prompt_ids():
+                    return store.get_task(task_id)
+                evidence = "Known prompt absent from confirmed ComfyUI queue after cancellation"
+            else:
+                evidence = "Local coroutine stopped; no external submission intent exists"
+            return store.confirm_task_stopped(
+                task_id,
+                prompt_id=prompt_id,
+                evidence=evidence,
+                **cas,
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            store.append_task_checkpoint(
+                task_id,
+                "cancellation_pending",
+                {
+                    "reason": type(exc).__name__,
+                    "message": str(exc)[:500],
+                },
+            )
+            return store.get_task(task_id)
+
+    async def reconcile_task_execution(task_id: str) -> TaskSpec:
+        """Observe external facts with CAS; never authorize a new submission."""
+        store = get_task_store()
+        task = store.get_task(task_id)
+        if task.state in {TaskState.CANCELLED, TaskState.SUCCEEDED, TaskState.STALE}:
+            return task
+        if task.state == TaskState.CANCELLING:
+            return await cancel_task_execution(task_id)
+        if task.execution_target == ExecutionTarget.REMOTE:
+            store.append_task_checkpoint(
+                task_id,
+                "remote_reconciliation_pending",
+                {
+                    "reason": "等待持有该尝试标识的远程 Worker 回报；不向本地 ComfyUI 派发",
+                },
+            )
+            return task
+        # An existing live observer already owns collection. Do not fence it on
+        # a manual refresh while its heartbeat and lease remain authoritative.
+        job = local_execution_jobs.get(task_id)
+        if job and not job.done() and task.state == TaskState.RUNNING:
+            return task
+        identity = store.inspect_submission(task_id)
+        prompt_id = task.comfyui_prompt_id
+        try:
+            adapter = worker_adapter()
+            if not prompt_id and identity.get("submission_token"):
+                prompt_id = await adapter.find_submission(identity["submission_token"])
+            if not prompt_id:
+                return task
+            history = await adapter.get_history(prompt_id)
+            queued = await adapter.queued_prompt_ids()
+            status = history.get("status", {}) if history else {}
+            if not isinstance(status, dict):
+                raise ValueError("ComfyUI history status is malformed")
+            if prompt_id in queued:
+                outcome, evidence = "running", "Prompt exists in ComfyUI queue"
+            elif status.get("completed") is True:
+                outcome, evidence = "completed", "ComfyUI history confirms completed output"
+            elif status.get("status_str") == "error":
+                outcome, evidence = "stopped", "ComfyUI history confirms execution failure"
+            else:
+                outcome, evidence = "unknown", "Queue/history cannot establish execution outcome"
+            return store.mark_reconciliation_outcome(
+                task_id,
+                outcome,
+                expected_attempt_id=identity.get("attempt_id"),
+                expected_submission_token=identity.get("submission_token"),
+                prompt_id=prompt_id,
+                evidence=evidence,
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            store.append_task_checkpoint(
+                task_id,
+                "reconciliation_unavailable",
+                {
+                    "reason": type(exc).__name__,
+                    "message": str(exc)[:500],
+                },
+            )
+            return store.get_task(task_id)
+
+    async def cancel_project_task_executions(project_id: str) -> tuple[TaskSpec, ...]:
+        terminal = {
+            TaskState.SUCCEEDED,
+            TaskState.FAILED,
             TaskState.CANCELLED,
-            error_code="cancelled_by_user",
-            error_message="task cancellation was requested by the user",
+            TaskState.STALE,
+        }
+        tasks = get_task_store().list_tasks(project_id=project_id)
+        actionable = sorted(tasks, key=lambda item: item.state != TaskState.RUNNING)
+        cancelled: list[TaskSpec] = []
+        for task in actionable:
+            if task.state not in terminal:
+                cancelled.append(await cancel_task_execution(task.task_id))
+        return tuple(cancelled)
+
+    async def cancel_batch_member_executions(batch: BatchRun, project_id: str) -> None:
+        store = get_task_store()
+        terminal = {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.STALE}
+        # Stop producers first, then re-read membership to include any child that
+        # was registered before its producer's cancellation committed.
+        for task in batch_project_tasks(store, batch, project_id):
+            if task.kind == TaskKind.LLM_PLANNING and task.state not in terminal:
+                await cancel_task_execution(task.task_id)
+        refreshed = next(
+            item for item in store.list_batch_runs() if item.batch_id == batch.batch_id
         )
+        for task in batch_project_tasks(store, refreshed, project_id):
+            if task.state not in terminal:
+                await cancel_task_execution(task.task_id)
 
     def set_project_dispatch_paused(project_id: str, paused: bool) -> ProjectRunState:
         state = get_task_store().get_project_run_state(project_id)
@@ -2219,6 +2743,8 @@ def create_app(
             "llm_timeout_seconds": runtime_settings.llm_timeout_seconds,
             "llm_first_token_timeout_seconds": runtime_settings.llm_first_token_timeout_seconds,
             "llm_stream_idle_timeout_seconds": runtime_settings.llm_stream_idle_timeout_seconds,
+            "llm_operation_timeout_seconds": runtime_settings.llm_operation_timeout_seconds,
+            "llm_concurrency": runtime_settings.llm_concurrency,
             "llm_video_capable": runtime_settings.llm_video_capable,
             "network_proxy": runtime_settings.network_proxy,
             "h3_diffusion_model": runtime_settings.h3_diffusion_model,
@@ -2346,6 +2872,8 @@ def create_app(
                 "llm_timeout_seconds": request.llm_timeout_seconds,
                 "llm_first_token_timeout_seconds": request.llm_first_token_timeout_seconds,
                 "llm_stream_idle_timeout_seconds": request.llm_stream_idle_timeout_seconds,
+                "llm_operation_timeout_seconds": request.llm_operation_timeout_seconds,
+                "llm_concurrency": request.llm_concurrency,
                 "llm_video_capable": request.llm_video_capable,
                 "network_proxy": request.network_proxy or None,
                 "h3_diffusion_model": request.h3_diffusion_model,
@@ -2368,6 +2896,9 @@ def create_app(
         try:
             runtime_settings = Settings(_env_file=None, **values)
             save_runtime_settings(runtime_settings)
+            if task_store is not None:
+                task_store.llm_slots = runtime_settings.llm_concurrency
+                task_store.llm_timeout_seconds = runtime_settings.llm_operation_timeout_seconds
         except (CredentialStoreError, OSError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return await get_runtime_settings()
@@ -2716,7 +3247,6 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         decisions = get_task_store().list_decisions(project_id)
-        tasks = get_task_store().list_tasks(project_id=project_id)
         asset_store = ProjectAssetStore(
             Path(resolved_settings.data_root) / "control-plane.db",
             Path(resolved_settings.data_root) / "project-assets",
@@ -2724,20 +3254,15 @@ def create_app(
         project_asset_context, asset_image_urls = _project_asset_llm_context(
             asset_store, project_id
         )
+        visual_operation = request.operation.endswith(("assets", "storyboard", "prompts"))
+        if not visual_operation:
+            asset_image_urls = ()
         context = {
-            "project_run_state": run_state.model_dump(mode="json"),
-            "decisions": [item.model_dump(mode="json") for item in decisions],
-            "memory": [_project_memory_llm_context(item) for item in active_memories],
-            "tasks": [
-                {
-                    "task_id": task.task_id,
-                    "kind": task.kind.value,
-                    "state": task.state.value,
-                    "error_code": task.error_code,
-                }
-                for task in tasks
+            "decisions": [
+                {"key": item.key, "value": item.value, "locked": item.locked} for item in decisions
             ],
-            "project_assets": project_asset_context,
+            "memory": [_project_memory_llm_context(item) for item in active_memories[-12:]],
+            "project_assets": project_asset_context if visual_operation else [],
         }
         if request.operation in {"initialize_assets", "refine_assets"}:
             shots = workspace.payload.get("shots")
@@ -2784,6 +3309,7 @@ def create_app(
             allowed_paths=request.allowed_paths,
             locked_paths=request.locked_paths,
             highest_instruction=str(workspace.payload.get("highestInstruction") or ""),
+            reference_asset_ids=tuple(item["asset_id"] for item in project_asset_context),
         )
         input_payload = operation.model_dump(mode="json")
         input_bytes = _canonical_json(input_payload)
@@ -2831,7 +3357,7 @@ def create_app(
             ) from exc
 
         max_repairs = (
-            0 if run_state.time_budget and run_state.time_budget.retry_budget_exhausted else 3
+            0 if run_state.time_budget and run_state.time_budget.retry_budget_exhausted else 1
         )
         try:
             async with open_client(remote_config(runtime_settings)) as client:
@@ -2952,180 +3478,17 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="LLM operation not found") from exc
 
-    async def run_batch_project_orchestration(task: TaskSpec) -> None:
-        """Advance an outline-approved project to a compiled, queued DAG."""
-        store = get_task_store()
-        project_id = task.project_id
-
-        def checkpoint(sequence: int, phase: str, **payload: object) -> None:
-            store.put_task_checkpoint(
-                TaskCheckpoint(
-                    checkpoint_id=f"{task.task_id}:{sequence}:{phase}",
-                    task_id=task.task_id,
-                    sequence=sequence,
-                    phase=phase,
-                    payload=payload,
-                    created_at=datetime.now(UTC),
-                )
-            )
-
-        state = store.get_project_run_state(project_id)
-        if not state.outline_approved:
-            raise ValueError("批量自动编排要求项目大纲已批准")
-        store.put_project_run_state(
-            state.model_copy(
-                update={
-                    "review_policy": ReviewPolicy(
-                        configured_mode=ReviewMode.AI_ONLY,
-                        effective_mode=ReviewMode.AI_ONLY,
-                        human_timeout_seconds=state.review_policy.human_timeout_seconds,
-                    ),
-                    "execution_mode": ExecutionMode.BATCH,
-                    "updated_at": datetime.now(UTC),
-                }
-            )
-        )
-        checkpoint(1, "batch_orchestration_started", review_mode="ai_only")
-
-        workspace = store.get_latest_project_workspace(project_id)
-        if not workspace.payload.get("shots"):
-            await operate_project_with_agent(
-                project_id,
-                ProjectAgentOperationRequest(
-                    operation_id=str(uuid.uuid4()),
-                    operation="initialize_storyboard",
-                    instruction=(
-                        "根据当前项目内容自动生成完整电影分镜。需要连续生成的镜头在"
-                        "motionSegments 中逐段填写 durationSeconds 和 summary；分段合计须等于"
-                        "镜头时长，每段至少4秒，首段最多15秒，续段最多12秒。不要机械拆成"
-                        "15+15；30秒可用10+10+10，并把接缝放在密集信息结束后、运动与机位"
-                        "较稳定处，summary 写清交给下一段继承的结束状态。"
-                    ),
-                    display_instruction="批量模式自动生成电影分镜",
-                    allowed_paths=("/shots",),
-                    commit=True,
-                ),
-            )
-        checkpoint(2, "storyboard_ready")
-
-        workspace = store.get_latest_project_workspace(project_id)
-        if (
-            not workspace.payload.get("assetPlans")
-            and workspace.payload.get("referenceAssetMode") != "none"
-        ):
-            await operate_project_with_agent(
-                project_id,
-                ProjectAgentOperationRequest(
-                    operation_id=str(uuid.uuid4()),
-                    operation="initialize_assets",
-                    instruction=(
-                        "根据已批准创意、大纲、分镜和现有项目图片规划仍缺少的素材。"
-                        "不得重复已有素材；每项图片总像素约1280×1280并独立决定构图。"
-                    ),
-                    display_instruction="批量模式自动规划缺失素材",
-                    allowed_paths=("/assetPlans", "/referenceAssetMode"),
-                    commit=True,
-                ),
-            )
-        checkpoint(3, "asset_plan_ready")
-
+    async def run_batch_project_orchestration(task: TaskSpec) -> bool:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://control-plane"
         ) as internal:
-            workspace = store.get_latest_project_workspace(project_id)
-            plans = workspace.payload.get("assetPlans", [])
-            pending_plans = (
-                [
-                    item
-                    for item in plans
-                    if isinstance(item, dict)
-                    and item.get("id")
-                    and not item.get("fulfilledByAssetId")
-                ]
-                if isinstance(plans, list)
-                else []
+            return await run_batch_project_orchestration_service(
+                task,
+                store=get_task_store(),
+                internal=internal,
+                operate_project_with_agent=operate_project_with_agent,
+                batch_settings=_batch_settings_for_task(get_task_store(), task),
             )
-            for index, plan in enumerate(pending_plans, start=1):
-                plan_id = str(plan["id"])
-                prompt_response = await internal.post(
-                    f"/api/v1/projects/{project_id}/prompts/images/{plan_id}/generate",
-                    json={"instruction": None, "workflow_template_id": None},
-                )
-                if prompt_response.is_error:
-                    raise ValueError(
-                        f"素材 {plan.get('name', plan_id)} 提示词生成失败："
-                        f"{prompt_response.text[:1000]}"
-                    )
-                run_response = await internal.post(
-                    f"/api/v1/projects/{project_id}/image-prompts/{plan_id}/run",
-                    json={},
-                )
-                if run_response.is_error:
-                    raise ValueError(
-                        f"素材 {plan.get('name', plan_id)} 生成任务创建失败："
-                        f"{run_response.text[:1000]}"
-                    )
-                image_task_id = str(run_response.json()["task_id"])
-                checkpoint(10 + index, "asset_generation_started", plan_id=plan_id)
-                while True:
-                    image_task = store.get_task(image_task_id)
-                    if image_task.state == TaskState.SUCCEEDED:
-                        break
-                    if image_task.state in {
-                        TaskState.FAILED,
-                        TaskState.CANCELLED,
-                        TaskState.STALE,
-                    }:
-                        raise ValueError(
-                            f"素材 {plan.get('name', plan_id)} 生成失败："
-                            f"{image_task.error_message or image_task.state.value}"
-                        )
-                    await asyncio.sleep(2)
-
-            prompt_response = await internal.post(
-                f"/api/v1/projects/{project_id}/stages/prompts/generate", json={}
-            )
-            if prompt_response.is_error:
-                raise ValueError(f"H3 提示词生成失败：{prompt_response.text[:2000]}")
-            checkpoint(50, "h3_prompts_ready")
-            compile_response = await internal.post(
-                f"/api/v1/projects/{project_id}/tasks/compile", json={}
-            )
-            if compile_response.is_error:
-                raise ValueError(f"任务 DAG 编译失败：{compile_response.text[:2000]}")
-
-        compiled_tasks = tuple(
-            item
-            for item in store.list_tasks(project_id=project_id)
-            if item.task_id != task.task_id
-            and item.state
-            not in {
-                TaskState.SUCCEEDED,
-                TaskState.FAILED,
-                TaskState.CANCELLED,
-                TaskState.STALE,
-            }
-        )
-        for batch in store.list_batch_runs():
-            if batch.state != BatchState.RUNNING:
-                continue
-            member = next(
-                (
-                    item
-                    for item in batch.items
-                    if item.project_id == project_id and task.task_id in item.task_ids
-                ),
-                None,
-            )
-            if member is not None:
-                compiled_ids = resolve_batch_task_ids(compiled_tasks, member.start_boundary)
-                store.expand_running_batch_project_tasks(
-                    batch_id=batch.batch_id,
-                    project_id=project_id,
-                    orchestration_task_id=task.task_id,
-                    task_ids=compiled_ids,
-                )
-        checkpoint(60, "dag_compiled", task_count=len(compiled_tasks))
 
     @app.get("/api/v1/harnesses")
     async def list_harnesses() -> tuple[HarnessBundle, ...]:
@@ -3523,11 +3886,17 @@ def create_app(
         asset_plan_id: str,
         *,
         create_candidate: bool,
+        expected_workspace_sha256: str | None = None,
     ) -> TaskSpec:
         try:
             workspace = get_task_store().get_latest_project_workspace(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project workspace not found") from exc
+        if (
+            expected_workspace_sha256 is not None
+            and expected_workspace_sha256 != workspace.payload_sha256
+        ):
+            raise HTTPException(status_code=409, detail="图片输入已改变，请重新读取当前素材需求")
         prompts = workspace.payload.get("prompts", {}).get("imagePrompts", [])
         prompt = (
             next(
@@ -3617,6 +3986,17 @@ def create_app(
                     "width": str(image_width),
                     "height": str(image_height),
                     "asset_candidate": "true" if create_candidate else "false",
+                    "asset_plan_input_fingerprint": _asset_plan_input_fingerprint(image_plan),
+                    "binding_asset_id": str(image_plan.get("fulfilledByAssetId") or ""),
+                    "binding_asset_revision": (
+                        str(
+                            project_asset_store()
+                            .get_asset(project_id, str(image_plan["fulfilledByAssetId"]))
+                            .revision
+                        )
+                        if image_plan.get("fulfilledByAssetId")
+                        else ""
+                    ),
                 },
             )
             record = get_task_store().put_workload_manifest(manifest)
@@ -3631,6 +4011,7 @@ def create_app(
                         "height": image_height,
                         "seed": generation_seed,
                         "asset_candidate": create_candidate,
+                        "workload_manifest_sha256": record.sha256,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -3649,10 +4030,9 @@ def create_app(
                     input_fingerprint=fingerprint,
                     workload_manifest_sha256=record.sha256,
                     affinity_key=f"image:{template.template_id}",
-                )
+                ),
+                expected_workspace_sha256=workspace.payload_sha256,
             )
-            if task.state in {TaskState.FAILED, TaskState.STALE, TaskState.PAUSED}:
-                task = get_task_store().transition_task(task.task_id, TaskState.READY)
             if task.state == TaskState.READY:
                 task = get_task_store().transition_task(task.task_id, TaskState.QUEUED)
             return task
@@ -3663,8 +4043,17 @@ def create_app(
         "/api/v1/projects/{project_id}/image-prompts/{asset_plan_id}/run",
         status_code=202,
     )
-    async def run_project_image_prompt(project_id: str, asset_plan_id: str) -> TaskSpec:
-        return await submit_project_image_prompt(project_id, asset_plan_id, create_candidate=False)
+    async def run_project_image_prompt(
+        project_id: str,
+        asset_plan_id: str,
+        request: ImageTaskRunRequest | None = None,
+    ) -> TaskSpec:
+        return await submit_project_image_prompt(
+            project_id,
+            asset_plan_id,
+            create_candidate=False,
+            expected_workspace_sha256=request.expected_workspace_sha256 if request else None,
+        )
 
     @app.post(
         "/api/v1/projects/{project_id}/asset-plans/{asset_plan_id}/regenerate",
@@ -3758,7 +4147,9 @@ def create_app(
 
     @app.post("/api/v1/projects/{project_id}/tasks/compile", status_code=201)
     async def compile_project_tasks(
-        project_id: str, restart_h3: bool = Query(default=False)
+        project_id: str,
+        restart_h3: bool = Query(default=False),
+        request: dict[str, object] | None = None,
     ) -> dict[str, object]:
         nonlocal runtime_settings
         try:
@@ -3821,6 +4212,73 @@ def create_app(
             ]
             if approved:
                 image_harnesses[bundle.workflow_template_id] = approved[-1].revision
+        compile_payload = request if isinstance(request, dict) else {}
+        batch_settings = compile_payload.get("batch_settings")
+        if isinstance(batch_settings, dict):
+            post = workspace.payload.get("postProcessing")
+            merged_post = dict(post) if isinstance(post, dict) else {}
+
+            def approved_workflow_revision(workflow_id: object, kind: str) -> int | None:
+                if not isinstance(workflow_id, str) or not workflow_id:
+                    return None
+                revisions = [
+                    item.revision
+                    for item in get_task_store().list_workflow_revisions(workflow_id)
+                    if item.kind == kind and item.approval == WorkflowApproval.APPROVED
+                ]
+                return max(revisions) if revisions else None
+
+            if batch_settings.get("seedvrEnabled") is True:
+                seedvr = (
+                    dict(merged_post.get("seedvr"))
+                    if isinstance(merged_post.get("seedvr"), dict)
+                    else {}
+                )
+                seedvr.update(
+                    {
+                        "enabled": True,
+                        "workflowTemplateId": (
+                            batch_settings.get("seedvrWorkflowId")
+                            or seedvr.get("workflowTemplateId")
+                        ),
+                        "upscaleFactor": (
+                            batch_settings.get("seedvrUpscaleFactor")
+                            if batch_settings.get("seedvrUpscaleFactor") is not None
+                            else seedvr.get("upscaleFactor")
+                        ),
+                    }
+                )
+                seedvr["workflowRevision"] = approved_workflow_revision(
+                    seedvr.get("workflowTemplateId"), "restoration"
+                ) or seedvr.get("workflowRevision")
+                merged_post["seedvr"] = seedvr
+            if batch_settings.get("rifeEnabled") is True:
+                rife = (
+                    dict(merged_post.get("rife"))
+                    if isinstance(merged_post.get("rife"), dict)
+                    else {}
+                )
+                rife.update(
+                    {
+                        "enabled": True,
+                        "workflowTemplateId": (
+                            batch_settings.get("rifeWorkflowId") or rife.get("workflowTemplateId")
+                        ),
+                        "targetFps": (batch_settings.get("rifeTargetFps") or rife.get("targetFps")),
+                    }
+                )
+                rife["workflowRevision"] = approved_workflow_revision(
+                    rife.get("workflowTemplateId"), "interpolation"
+                ) or rife.get("workflowRevision")
+                merged_post["rife"] = rife
+            workspace = workspace.model_copy(
+                update={
+                    "payload": {
+                        **workspace.payload,
+                        "postProcessing": merged_post,
+                    }
+                }
+            )
         plan = compile_project_task_plan(
             project_id=project_id,
             workspace_revision=workspace.revision,
@@ -4585,6 +5043,141 @@ def create_app(
     async def list_tasks(project_id: str | None = Query(default=None)) -> tuple[TaskSpec, ...]:
         return get_task_store().list_tasks(project_id=project_id)
 
+    @app.get("/api/v1/scheduler/health")
+    async def scheduler_health() -> dict[str, object]:
+        counts: dict[str, int] = {}
+        for task in get_task_store().list_tasks():
+            counts[task.state.value] = counts.get(task.state.value, 0) + 1
+        return {
+            **dispatcher_health,
+            "owns_dispatcher": dispatcher_owned,
+            "persisted": get_task_store().dispatcher_health(),
+            "task_counts": counts,
+            "active_local_tasks": sorted(local_job_ids),
+            "llm_concurrency": runtime_settings.llm_concurrency,
+        }
+
+    @app.get("/api/v1/tasks/{task_id}/events")
+    async def task_events(
+        task_id: str, limit: int = Query(default=100, ge=1, le=1000)
+    ) -> tuple[dict, ...]:
+        try:
+            return get_task_store().list_execution_events(task_id, limit=limit)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+
+    @app.post("/api/v1/tasks/{task_id}/reconcile")
+    async def reconcile_task(task_id: str) -> TaskSpec:
+        try:
+            return await reconcile_task_execution(task_id)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        except (InvalidTaskTransitionError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/task-commands")
+    async def task_commands(request: TaskCommandRequest) -> dict:
+        store = get_task_store()
+        if len(set(request.task_ids)) != len(request.task_ids):
+            raise HTTPException(status_code=422, detail="duplicate task identifiers")
+        try:
+            tasks = tuple(store.get_task(task_id) for task_id in request.task_ids)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        if request.scope == "batch":
+            batch = next(
+                (b for b in store.list_batch_runs() if b.batch_id == request.scope_id), None
+            )
+            if batch is None:
+                raise HTTPException(status_code=404, detail="batch not found")
+            members = {
+                (item.project_id, task_id) for item in batch.items for task_id in item.task_ids
+            }
+            in_scope = all((task.project_id, task.task_id) in members for task in tasks)
+        else:
+            in_scope = all(task.project_id == request.scope_id for task in tasks)
+        if not in_scope:
+            raise HTTPException(status_code=422, detail="command contains tasks outside its scope")
+        if request.action == "confirm_retry" and not request.confirm_duplicate_execution:
+            raise HTTPException(
+                status_code=422, detail="explicit duplicate-execution confirmation required"
+            )
+        try:
+            created, result = begin_control_command(
+                store, request.model_dump(mode="json"), owner_id=dispatcher_owner
+            )
+        except StoreConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not created:
+            return result
+        for snapshot in tasks:
+            try:
+                task = store.get_task(snapshot.task_id)
+                if request.action == "cancel":
+                    if task.state not in {
+                        TaskState.SUCCEEDED,
+                        TaskState.CANCELLED,
+                        TaskState.STALE,
+                    }:
+                        task = await cancel_task_execution(task.task_id)
+                elif request.action == "reconcile":
+                    task = await reconcile_task_execution(task.task_id)
+                elif request.action == "pause":
+                    if task.state != TaskState.PAUSED:
+                        task = store.transition_task(task.task_id, TaskState.PAUSED)
+                elif request.action == "resume":
+                    if task.state == TaskState.PAUSED:
+                        task = store.transition_task(task.task_id, TaskState.READY)
+                    if task.state == TaskState.READY:
+                        task = store.transition_task(task.task_id, TaskState.QUEUED)
+                elif request.action == "restart":
+                    task = store.restart_failed_orchestration(task.task_id)
+                elif request.action == "retry":
+                    if task.state != TaskState.FAILED:
+                        raise InvalidTaskTransitionError("retry only applies to failed tasks")
+                    task = _retry_task_and_batch(store, task.task_id)
+                else:
+                    if task.state != TaskState.NEEDS_ATTENTION:
+                        raise InvalidTaskTransitionError(
+                            "confirmation only applies to ambiguous tasks"
+                        )
+                    identity = store.inspect_submission(task.task_id)
+                    task = store.confirm_ambiguous_retry(
+                        task.task_id,
+                        expected_attempt_id=identity.get("attempt_id"),
+                        expected_submission_token=identity.get("submission_token"),
+                    )
+                    if task.state == TaskState.READY:
+                        task = store.transition_task(task.task_id, TaskState.QUEUED)
+                item = {"task_id": task.task_id, "ok": True, "state": task.state.value}
+            except (
+                InvalidTaskTransitionError,
+                TaskNotFoundError,
+                StoreConflictError,
+                ValueError,
+            ) as exc:
+                item = {"task_id": snapshot.task_id, "ok": False, "error": str(exc)}
+            result["results"].append(item)
+            save_control_command(store, result, owner_id=dispatcher_owner)
+        return save_control_command(store, result, owner_id=dispatcher_owner, completed=True)
+
+    @app.post("/api/v1/tasks/{task_id}/confirm-retry")
+    async def confirm_task_retry(task_id: str, request: ConfirmTaskRetryRequest) -> dict:
+        try:
+            task = get_task_store().get_task(task_id)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        return await task_commands(
+            TaskCommandRequest(
+                scope="project",
+                scope_id=task.project_id,
+                action="confirm_retry",
+                task_ids=(task_id,),
+                idempotency_key=request.idempotency_key,
+                confirm_duplicate_execution=request.confirm_duplicate_execution,
+            )
+        )
+
     @app.get("/api/v1/tasks/{task_id}")
     async def get_task(task_id: str) -> TaskSpec:
         try:
@@ -4600,23 +5193,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="task not found") from exc
         except InvalidTaskTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except (httpx.HTTPError, ValueError) as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"ComfyUI cancellation failed; task state was not changed: {exc}",
-            ) from exc
 
     @app.post("/api/v1/tasks/{task_id}/run")
     async def run_task(task_id: str) -> TaskSpec:
         try:
             task = get_task_store().get_task(task_id)
             if task.state in {TaskState.FAILED, TaskState.STALE}:
-                task = get_task_store().prepare_task_retry(task_id)
+                task = _retry_task_and_batch(get_task_store(), task_id)
             elif task.state == TaskState.PAUSED:
                 task = get_task_store().transition_task(task_id, TaskState.READY)
             if task.state == TaskState.READY:
                 return get_task_store().transition_task(task_id, TaskState.QUEUED)
-            if task.state == TaskState.QUEUED:
+            if task.state in {TaskState.QUEUED, TaskState.RECOVERING}:
                 return task
             raise InvalidTaskTransitionError(f"task {task_id} is not at an executable boundary")
         except TaskNotFoundError as exc:
@@ -4644,17 +5232,18 @@ def create_app(
 
     @app.post("/api/v1/tasks/{task_id}/redo")
     async def redo_task(task_id: str) -> TaskSpec:
+        # Legacy action remains a bounded failure retry. Regeneration creates a
+        # new explicit generation revision through the generation page.
         try:
             task = get_task_store().get_task(task_id)
-            if task.state == TaskState.SUCCEEDED:
-                get_task_store().mark_stale(task_id, propagate=False)
-            task = get_task_store().get_task(task_id)
-            if task.state in {TaskState.STALE, TaskState.FAILED, TaskState.PAUSED}:
-                task = get_task_store().prepare_task_retry(task_id)
-            return get_task_store().transition_task(task.task_id, TaskState.QUEUED)
+            if task.state != TaskState.FAILED:
+                raise InvalidTaskTransitionError(
+                    "redo only retries failed tasks; use regeneration for a new execution"
+                )
+            return _retry_task_and_batch(get_task_store(), task_id)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="task not found") from exc
-        except InvalidTaskTransitionError as exc:
+        except (InvalidTaskTransitionError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/tasks/{task_id}/checkpoints", status_code=201)
@@ -5026,9 +5615,55 @@ def create_app(
         except StoreConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    def batch_with_counts(batch: BatchRun) -> BatchRun:
+        ids = {task_id for item in batch.items for task_id in item.task_ids}
+        tasks = tuple(task for task in get_task_store().list_tasks() if task.task_id in ids)
+        counts = {state.value: 0 for state in TaskState}
+        for task in tasks:
+            counts[task.state.value] += 1
+        counts["missing"] = len(ids) - len(tasks)
+        counts["total"] = len(ids)
+        terminal = {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.STALE}
+        counts["pending"] = sum(task.state not in terminal for task in tasks) + counts["missing"]
+        ended = bool(ids) and counts["pending"] == 0
+        return batch.model_copy(
+            update={
+                "task_counts": counts,
+                "all_tasks_ended": ended,
+                "all_tasks_succeeded": ended and counts["succeeded"] == counts["total"],
+            }
+        )
+
     @app.get("/api/v1/batches")
     async def list_batches() -> tuple[BatchRun, ...]:
-        return get_task_store().list_batch_runs()
+        return tuple(batch_with_counts(batch) for batch in get_task_store().list_batch_runs())
+
+    @app.post("/api/v1/batches/{batch_id}/projects/{project_id}/pause")
+    @app.post("/api/v1/batches/{batch_id}/projects/{project_id}/resume")
+    async def control_batch_member(batch_id: str, project_id: str, request: Request) -> BatchRun:
+        store = get_task_store()
+        batch = next((b for b in store.list_batch_runs() if b.batch_id == batch_id), None)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        if not any(item.project_id == project_id for item in batch.items):
+            raise HTTPException(status_code=422, detail="project is not a member of this batch")
+        if batch.state != BatchState.RUNNING:
+            raise HTTPException(
+                status_code=409, detail="resume the batch before controlling members"
+            )
+        paused = request.url.path.endswith("/pause")
+        updated = batch.model_copy(
+            update={
+                "items": tuple(
+                    item.model_copy(update={"paused": paused})
+                    if item.project_id == project_id
+                    else item
+                    for item in batch.items
+                ),
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        return batch_with_counts(store.put_batch_run(updated))
 
     @app.post("/api/v1/batches/{batch_id}/projects/{project_id}/cancel")
     async def cancel_batch_project(batch_id: str, project_id: str) -> BatchRun:
@@ -5038,32 +5673,31 @@ def create_app(
         )
         if stored is None:
             raise HTTPException(status_code=404, detail="batch not found")
+        if not any(item.project_id == project_id for item in stored.items):
+            raise HTTPException(status_code=422, detail="project is not a member of this batch")
         if stored.state != BatchState.RUNNING:
             raise HTTPException(
                 status_code=409, detail="only a running batch member can be cancelled"
             )
         try:
-            tasks = batch_project_tasks(get_task_store(), stored, project_id)
-            with suppress(KeyError):
-                set_project_dispatch_paused(project_id, True)
-            try:
-                ordered = sorted(tasks, key=lambda task: task.state != TaskState.RUNNING)
-                for task in ordered:
-                    if task.state in {
-                        TaskState.SUCCEEDED,
-                        TaskState.FAILED,
-                        TaskState.CANCELLED,
-                        TaskState.STALE,
-                    }:
-                        continue
-                    await cancel_task_execution(task.task_id)
-            finally:
-                with suppress(KeyError):
-                    get_task_store().request_project_mode(project_id, ExecutionMode.GUIDED)
-                    set_project_dispatch_paused(project_id, False)
+            paused = stored.model_copy(
+                update={
+                    "items": tuple(
+                        item.model_copy(update={"paused": True})
+                        if item.project_id == project_id
+                        else item
+                        for item in stored.items
+                    ),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            get_task_store().put_batch_run(paused)
+            await cancel_batch_member_executions(paused, project_id)
             reconcile_batch_runs(get_task_store())
-            return next(
-                item for item in get_task_store().list_batch_runs() if item.batch_id == batch_id
+            return batch_with_counts(
+                next(
+                    item for item in get_task_store().list_batch_runs() if item.batch_id == batch_id
+                )
             )
         except (StoreConflictError, InvalidTaskTransitionError, TaskNotFoundError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -5094,6 +5728,17 @@ def create_app(
         updated = stored.model_copy(update={"state": target, "updated_at": datetime.now(UTC)})
         try:
             if target == BatchState.RUNNING:
+                if action == "start":
+                    for item in stored.items:
+                        for task in batch_project_tasks(get_task_store(), stored, item.project_id):
+                            if (
+                                task.state == TaskState.FAILED
+                                and "retry" not in task.available_actions
+                            ):
+                                raise StoreConflictError(
+                                    f"任务 {task.task_id} 不能直接重试：请在任务页核对执行结果、"
+                                    "剩余次数和截止时间；需要重新生成时使用生成入口"
+                                )
                 for item in stored.items:
                     selected_tasks = batch_project_tasks(get_task_store(), stored, item.project_id)
                     if any(task.kind == TaskKind.LLM_PLANNING for task in selected_tasks):
@@ -5103,62 +5748,50 @@ def create_app(
                                 f"project {item.project_id} outline is not approved"
                             )
                         continue
-                    preflight = project_preflight(item.project_id)
+                    preflight = project_preflight(item.project_id, tasks=selected_tasks)
                     if not preflight["ready"]:
                         raise StoreConflictError(
                             f"project {item.project_id} preflight failed: "
                             + "; ".join(str(value) for value in preflight["blockers"])
                         )
+            if target == BatchState.COMPLETED and not batch_with_counts(stored).all_tasks_ended:
+                raise StoreConflictError("batch still has unfinished tasks")
+            if target == BatchState.CANCELLED:
+                # Pause admission first while retaining dynamic membership from
+                # producers whose cancellation is still being observed.
+                paused = stored.model_copy(
+                    update={
+                        "state": BatchState.PAUSED,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                get_task_store().put_batch_run(paused)
+                for item in paused.items:
+                    await cancel_batch_member_executions(paused, item.project_id)
+                latest = next(
+                    batch
+                    for batch in get_task_store().list_batch_runs()
+                    if batch.batch_id == batch_id
+                )
+                updated = latest.model_copy(
+                    update={
+                        "state": target,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+            result = get_task_store().put_batch_run(updated)
             if target == BatchState.RUNNING:
-                for item in stored.items:
-                    try:
+                for item in result.items:
+                    with suppress(KeyError):
                         get_task_store().request_project_mode(item.project_id, ExecutionMode.BATCH)
-                        set_project_dispatch_paused(item.project_id, False)
-                    except KeyError:
+                    if item.paused:
                         continue
-                    selected = set(item.task_ids)
-                    for task in get_task_store().list_tasks(project_id=item.project_id):
-                        if selected and task.task_id not in selected:
-                            continue
-                        if task.state == TaskState.FAILED:
-                            task = get_task_store().prepare_task_retry(task.task_id)
-                        if task.state == TaskState.PAUSED:
-                            task = get_task_store().transition_task(task.task_id, TaskState.READY)
+                    for task in batch_project_tasks(get_task_store(), result, item.project_id):
+                        if action == "start" and task.state == TaskState.FAILED:
+                            task = _retry_task_and_batch(get_task_store(), task.task_id)
                         if task.state == TaskState.READY:
                             get_task_store().transition_task(task.task_id, TaskState.QUEUED)
-            elif target == BatchState.PAUSED:
-                for item in stored.items:
-                    try:
-                        set_project_dispatch_paused(item.project_id, True)
-                        get_task_store().request_project_mode(item.project_id, ExecutionMode.GUIDED)
-                    except KeyError:
-                        continue
-                    selected = set(item.task_ids)
-                    for task in get_task_store().list_tasks(project_id=item.project_id):
-                        if selected and task.task_id not in selected:
-                            continue
-                        if task.state == TaskState.QUEUED:
-                            get_task_store().transition_task(task.task_id, TaskState.PAUSED)
-            elif target == BatchState.CANCELLED:
-                for item in stored.items:
-                    try:
-                        set_project_dispatch_paused(item.project_id, True)
-                    except KeyError:
-                        continue
-                    selected = set(item.task_ids)
-                    for task in get_task_store().list_tasks(project_id=item.project_id):
-                        if selected and task.task_id not in selected:
-                            continue
-                        if task.state not in {
-                            TaskState.SUCCEEDED,
-                            TaskState.FAILED,
-                            TaskState.CANCELLED,
-                        }:
-                            await cancel_task_execution(task.task_id)
-                    get_task_store().request_project_mode(item.project_id, ExecutionMode.GUIDED)
-                    set_project_dispatch_paused(item.project_id, False)
-            result = get_task_store().put_batch_run(updated)
-            return result
+            return batch_with_counts(result)
         except (StoreConflictError, InvalidTaskTransitionError, TaskNotFoundError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (httpx.HTTPError, ValueError) as exc:
@@ -5220,7 +5853,8 @@ def create_app(
             return None
         active = get_task_store().active_lease_for_worker(worker_id)
         if active is not None:
-            return active
+            # A second/restarted client must not execute an existing lease again.
+            return None
         return get_task_store().claim_next(
             worker_id,
             lease_duration=timedelta(seconds=resolved_settings.remote_lease_seconds),
@@ -5231,6 +5865,7 @@ def create_app(
     async def renew_remote_lease(
         worker_id: str,
         task_id: str,
+        request: WorkerLeaseRenewRequest,
         authorization: str | None = Header(default=None),
     ) -> TaskSpec:
         require_worker_token(authorization)
@@ -5238,6 +5873,7 @@ def create_app(
             return get_task_store().renew_lease(
                 task_id,
                 worker_id,
+                attempt_id=request.attempt_id,
                 lease_duration=timedelta(seconds=resolved_settings.remote_lease_seconds),
             )
         except TaskNotFoundError as exc:
@@ -5312,8 +5948,9 @@ def create_app(
                 if heartbeat.worker_id != worker_id:
                     await websocket.send_json({"type": "error", "code": "worker_id_mismatch"})
                     continue
-                task = get_task_store().active_lease_for_worker(worker_id)
-                if task is None:
+                active = get_task_store().active_lease_for_worker(worker_id)
+                task = None
+                if active is None:
                     task = get_task_store().claim_next(
                         worker_id,
                         lease_duration=timedelta(seconds=resolved_settings.remote_lease_seconds),
@@ -5402,6 +6039,8 @@ def create_app(
         for job in tuple(local_jobs):
             job.cancel()
         await asyncio.gather(*local_jobs, return_exceptions=True)
+        if dispatcher_owned:
+            get_task_store().release_dispatcher(dispatcher_owner)
 
     return app
 
@@ -5577,9 +6216,7 @@ def _motion_context_output_path(
     output_root = (Path(comfyui_root) / "output").resolve()
     relative = Path(prefix)
     path = (
-        output_root
-        / relative.parent
-        / f"{relative.name}_{clip_index:05d}.safetensors"
+        output_root / relative.parent / f"{relative.name}_{clip_index:05d}.safetensors"
     ).resolve()
     if output_root not in path.parents:
         raise ValueError("Motion Context 输出路径越出 ComfyUI output")

@@ -294,6 +294,10 @@ input[type="file"] { display: none; }
 .batch-member small { color: #d6958e; overflow-wrap: anywhere; font-size: 9px; }
 .batch-member em { color: #686f69; font-style: normal; font-size: 8px; }
 .batch-member .secondary-button { min-height: 28px; padding: 4px 8px; font-size: 10px; }
+.batch-phase, .batch-member-phase { color: #c3d6c8 !important; font-size: 11px !important; overflow-wrap: anywhere; }
+.batch-stage-counts { display: flex; flex-wrap: wrap; gap: 6px 12px; min-width: 0; }
+.batch-stage-counts > span { color: #a4ada6 !important; font-size: 10px !important; white-space: nowrap; }
+.batch-stage-counts strong { color: #d5ddd6; font-size: inherit; font-weight: 600; }
 .harness-editor { margin-bottom: 28px; border: 1px solid #343835; border-radius: 7px; background: #181b19; overflow: hidden; }
 .harness-heading { min-height: 60px; padding: 10px 14px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #303431; }
 .harness-heading > div { min-width: 0; margin-right: auto; display: grid; gap: 4px; }
@@ -833,3 +837,27 @@ input[type="file"] { display: none; }
 .asset-shot-map-empty {
   font-size: 11px;
 }
+
+/* Task recovery uses the existing restrained control palette. */
+.state-recovering { color: #9ac7ca; border-color: #35565a; }
+.state-retry_wait, .state-needs_attention, .state-cancelling { color: #e2bb74; border-color: #594a2c; }
+.state-paused, .state-blocked, .state-stale { color: #b7bcb8; border-color: #444b46; }
+.task-filters, .task-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 14px 0; }
+.task-filters label { display: grid; gap: 5px; color: #a5ada7; font-size: 12px; }
+.task-filters select { min-width: 130px; max-width: 300px; padding: 7px; color: #d7ded8; background: #181b19; border: 1px solid #343835; border-radius: 4px; }
+.task-toolbar { align-items: center; }
+.task-scheduler-status { color: #939d96; font-size: 11px; }
+.task-management-table { overflow-x: auto; }
+.task-management-table .task-row, .task-management-table .task-header { grid-template-columns: minmax(220px, 1.4fr) 100px 96px 48px minmax(150px, 1fr); }
+.task-row small { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+.task-row strong { overflow-wrap: anywhere; }
+.task-control-buttons { display: flex; flex-wrap: wrap; gap: 5px; }
+.task-control-buttons .secondary-button { min-height: 28px; padding: 4px 7px; font-size: 11px; }
+.task-diagnostics { grid-column: 1 / -1; min-width: 0; color: #b9c1bb; font-size: 11px; }
+.task-diagnostics summary { cursor: pointer; overflow-wrap: anywhere; }
+.task-diagnostics pre { padding: 10px; background: #101211; border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
+.task-diagnostic-actions { display: flex; gap: 8px; margin-top: 8px; }
+.task-history-controls { margin-top: 20px; color: #a5ada7; font-size: 12px; }
+.task-history-controls summary { cursor: pointer; }
+.batch-outcomes { display: grid; gap: 4px; color: #a5ada7; font-size: 11px; }
+.batch-member .task-control-buttons { max-width: 140px; flex-shrink: 0; }

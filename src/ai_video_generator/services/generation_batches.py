@@ -197,9 +197,7 @@ def ensure_initial_generation_batch(
             predecessor_version_id=(
                 versions[prior_id].version_id if prior_id in versions else None
             ),
-            parent_version_id=(
-                active[segment_id].version_id if segment_id in active else None
-            ),
+            parent_version_id=(active[segment_id].version_id if segment_id in active else None),
             prompt_revision_id=str(segment.get("id") or "") or None,
             seed=int(segment.get("seed") or 0),
             created_at=now,
@@ -355,9 +353,7 @@ def cancel_rework_marker(store: SQLiteTaskStore, marker: ReworkMarker) -> Rework
     )
     if active_batch is not None:
         store.put_generation_batch(
-            active_batch.model_copy(
-                update={"dispatch_requested": True, "updated_at": now}
-            )
+            active_batch.model_copy(update={"dispatch_requested": True, "updated_at": now})
         )
     return cancelled
 
@@ -583,8 +579,10 @@ def confirm_rework_markers(
     return batch
 
 
-def reconcile_generation_batches(store: SQLiteTaskStore) -> None:
+def reconcile_generation_batches(store: SQLiteTaskStore, *, batch_id: str | None = None) -> None:
     for batch in store.list_generation_batches_all():
+        if batch_id is not None and batch.batch_id != batch_id:
+            continue
         now = datetime.now(UTC)
         referenced_task_ids = {
             *batch.encoding_task_ids,

@@ -4,7 +4,11 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from ai_video_generator.api import create_app
+from ai_video_generator.api import (
+    _batch_settings_for_task,
+    _reactivate_completed_batch_for_task,
+    create_app,
+)
 from ai_video_generator.config import Settings
 from ai_video_generator.domain import (
     BatchRun,
@@ -62,6 +66,35 @@ def _batch(boundary: str, *, task_ids: tuple[str, ...] = ()) -> BatchRun:
     )
 
 
+def test_exhausted_local_orchestration_restarts_as_new_batch_member(tmp_path) -> None:
+    store = SQLiteTaskStore(tmp_path / "restart.db")
+    original = _task("plan", TaskKind.LLM_PLANNING, state=TaskState.FAILED)
+    store.add_task(original)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE tasks SET attempt=3,error_code='local_control_task_failed',"
+            "error_message='missing workflow' WHERE task_id='plan'"
+        )
+    batch = _batch("next_ready", task_ids=("plan",)).model_copy(
+        update={"state": BatchState.COMPLETED}
+    )
+    store.put_batch_run(batch)
+    assert "restart" in store.get_task("plan").available_actions
+
+    replacement = store.restart_failed_orchestration("plan")
+    assert replacement.task_id != "plan"
+    assert (replacement.state, replacement.attempt, replacement.max_attempts) == (
+        TaskState.QUEUED, 0, 3
+    )
+    assert (store.get_task("plan").state, store.get_task("plan").attempt) == (
+        TaskState.FAILED, 3
+    )
+    updated = store.list_batch_runs()[0]
+    assert updated.state == BatchState.RUNNING
+    assert updated.items[0].task_ids == (replacement.task_id,)
+    assert "restart" not in store.get_task("plan").available_actions
+
+
 def test_review_boundary_resolves_required_ancestors_and_all_successors(tmp_path) -> None:
     store = SQLiteTaskStore(tmp_path / "batch.db")
     store.add_task(_task("image", TaskKind.IMAGE_GENERATION, state=TaskState.SUCCEEDED))
@@ -73,9 +106,7 @@ def test_review_boundary_resolves_required_ancestors_and_all_successors(tmp_path
             depends_on=("image",),
         )
     )
-    store.add_task(
-        _task("review", TaskKind.AI_REVIEW, state=TaskState.BLOCKED, depends_on=("h3",))
-    )
+    store.add_task(_task("review", TaskKind.AI_REVIEW, state=TaskState.BLOCKED, depends_on=("h3",)))
     store.add_task(
         _task("export", TaskKind.EXPORT, state=TaskState.BLOCKED, depends_on=("review",))
     )
@@ -89,9 +120,7 @@ def test_review_boundary_resolves_required_ancestors_and_all_successors(tmp_path
 def test_client_task_ids_cannot_create_an_orphaned_batch_successor(tmp_path) -> None:
     store = SQLiteTaskStore(tmp_path / "batch.db")
     store.add_task(_task("h3", TaskKind.H3_GENERATION, state=TaskState.READY))
-    store.add_task(
-        _task("review", TaskKind.AI_REVIEW, state=TaskState.BLOCKED, depends_on=("h3",))
-    )
+    store.add_task(_task("review", TaskKind.AI_REVIEW, state=TaskState.BLOCKED, depends_on=("h3",)))
     store.add_task(
         _task("export", TaskKind.EXPORT, state=TaskState.BLOCKED, depends_on=("review",))
     )
@@ -151,7 +180,7 @@ def test_next_ready_resumes_failed_task_without_creating_new_planning(tmp_path) 
     assert not any(task.kind == TaskKind.LLM_PLANNING for task in store.list_tasks())
 
 
-def test_failed_project_is_settled_without_blocking_other_batch_items(tmp_path) -> None:
+def test_failed_dependency_stays_blocked_without_stalling_other_batch_items(tmp_path) -> None:
     store = SQLiteTaskStore(tmp_path / "batch.db")
     store.add_task(_task("failed", TaskKind.H3_GENERATION, state=TaskState.FAILED))
     store.add_task(
@@ -188,7 +217,8 @@ def test_failed_project_is_settled_without_blocking_other_batch_items(tmp_path) 
 
     reconciled = reconcile_batch_runs(store, now=now)
 
-    assert store.get_task("blocked").state == TaskState.CANCELLED
+    assert store.get_task("blocked").state == TaskState.BLOCKED
+    assert "failed" in store.get_task("blocked").blocked_reason
     assert store.get_task("other-ready").state == TaskState.READY
     assert reconciled[0].state == BatchState.RUNNING
 
@@ -197,19 +227,15 @@ def test_failed_project_is_settled_without_blocking_other_batch_items(tmp_path) 
     store.transition_task("other-ready", TaskState.SUCCEEDED)
     reconciled = reconcile_batch_runs(store, now=now)
 
-    assert reconciled[0].state == BatchState.COMPLETED
+    assert reconciled[0].state == BatchState.RUNNING
 
 
 @pytest.mark.asyncio
 async def test_create_batch_api_returns_server_resolved_task_closure(tmp_path) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))
     h3 = _task("h3", TaskKind.H3_GENERATION, state=TaskState.READY)
-    review = _task(
-        "review", TaskKind.AI_REVIEW, state=TaskState.BLOCKED, depends_on=("h3",)
-    )
-    export = _task(
-        "export", TaskKind.EXPORT, state=TaskState.BLOCKED, depends_on=("review",)
-    )
+    review = _task("review", TaskKind.AI_REVIEW, state=TaskState.BLOCKED, depends_on=("h3",))
+    export = _task("export", TaskKind.EXPORT, state=TaskState.BLOCKED, depends_on=("review",))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -230,11 +256,15 @@ async def test_batch_api_accepts_default_and_project_settings_with_existing_queu
     queued = _task("queued", TaskKind.H3_GENERATION, state=TaskState.QUEUED)
     batch = _batch("next_ready").model_copy(
         update={
-            "settings": {"imageWorkflowId": "image-default", "rifeEnabled": True},
+            "settings": {
+                "imageWorkflowId": "image-default",
+                "seedvrUpscaleFactor": 1.5,
+                "rifeEnabled": True,
+            },
             "items": (
-                _batch("next_ready").items[0].model_copy(
-                    update={"settings": {"rifeWorkflowId": "rife-project"}}
-                ),
+                _batch("next_ready")
+                .items[0]
+                .model_copy(update={"settings": {"rifeWorkflowId": "rife-project"}}),
             ),
         }
     )
@@ -248,7 +278,48 @@ async def test_batch_api_accepts_default_and_project_settings_with_existing_queu
 
     assert response.status_code == 201, response.text
     assert response.json()["settings"]["rifeEnabled"] is True
+    assert response.json()["settings"]["seedvrUpscaleFactor"] == 1.5
     assert response.json()["items"][0]["settings"]["rifeWorkflowId"] == "rife-project"
+
+
+def test_completed_batch_retains_settings_for_failed_automation_retry(tmp_path) -> None:
+    store = SQLiteTaskStore(tmp_path / "batch-retry.db")
+    automation = _task("automation", TaskKind.LLM_PLANNING, state=TaskState.FAILED)
+    store.add_task(automation)
+    now = datetime.now(UTC)
+    store.put_batch_run(
+        BatchRun(
+            batch_id="completed-batch",
+            name="Completed batch",
+            state=BatchState.COMPLETED,
+            settings={
+                "seedvrEnabled": True,
+                "seedvrWorkflowId": "user:restoration",
+            },
+            items=(
+                BatchRunItem(
+                    project_id=automation.project_id,
+                    task_ids=(automation.task_id,),
+                    settings={
+                        "rifeEnabled": True,
+                        "rifeWorkflowId": "user:interpolation",
+                    },
+                ),
+            ),
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    assert _batch_settings_for_task(store, automation) == {
+        "seedvrEnabled": True,
+        "seedvrWorkflowId": "user:restoration",
+        "rifeEnabled": True,
+        "rifeWorkflowId": "user:interpolation",
+    }
+    reactivated = _reactivate_completed_batch_for_task(store, automation)
+    assert reactivated is not None
+    assert reactivated.state == BatchState.RUNNING
 
 
 @pytest.mark.asyncio
@@ -319,9 +390,7 @@ async def test_batch_admission_uses_latest_committed_workspace_progress(tmp_path
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        created = await client.post(
-            "/api/v1/projects", json=project.model_dump(mode="json")
-        )
+        created = await client.post("/api/v1/projects", json=project.model_dump(mode="json"))
         assert created.status_code == 201
         committed_project = project.model_copy(update={"revision": 2})
         committed = await client.post(
@@ -343,9 +412,7 @@ async def test_batch_admission_uses_latest_committed_workspace_progress(tmp_path
         assert committed.status_code == 201
 
         state = await client.get(f"/api/v1/projects/{project.project_id}/run-state")
-        admitted = await client.post(
-            "/api/v1/batches", json=batch.model_dump(mode="json")
-        )
+        admitted = await client.post("/api/v1/batches", json=batch.model_dump(mode="json"))
 
     assert state.status_code == 200
     assert state.json()["outline_approved"] is True
@@ -383,21 +450,15 @@ async def test_outline_only_project_defers_boundary_filter_until_after_compilati
         batch = BatchRun(
             batch_id="deferred-review",
             name="Deferred review",
-            items=(
-                BatchRunItem(project_id="outline-review", start_boundary="review"),
-            ),
+            items=(BatchRunItem(project_id="outline-review", start_boundary="review"),),
             created_at=now,
             updated_at=now,
         )
-        response = await client.post(
-            "/api/v1/batches", json=batch.model_dump(mode="json")
-        )
+        response = await client.post("/api/v1/batches", json=batch.model_dump(mode="json"))
 
     assert response.status_code == 201
     assert response.json()["items"][0]["start_boundary"] == "review"
-    assert response.json()["items"][0]["task_ids"][0].startswith(
-        "batch-plan:outline-review:"
-    )
+    assert response.json()["items"][0]["task_ids"][0].startswith("batch-plan:outline-review:")
 
 
 @pytest.mark.asyncio
@@ -405,15 +466,21 @@ async def test_cancel_batch_project_interrupts_its_job_and_keeps_other_project_r
     tmp_path,
 ) -> None:
     requests: list[tuple[str, str]] = []
+    interrupted = False
 
     def comfy_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal interrupted
         requests.append((request.method, request.url.path))
         if request.method == "GET" and request.url.path == "/queue":
             return httpx.Response(
                 200,
-                json={"queue_running": [[1, "prompt-1", {}, {}, []]], "queue_pending": []},
+                json={
+                    "queue_running": [] if interrupted else [[1, "prompt-1", {}, {}, []]],
+                    "queue_pending": [],
+                },
             )
         if request.method == "POST" and request.url.path == "/interrupt":
+            interrupted = True
             return httpx.Response(200, json={})
         return httpx.Response(404)
 
@@ -466,14 +533,28 @@ async def test_cancel_batch_project_interrupts_its_job_and_keeps_other_project_r
         response = await client.post("/api/v1/batches", json=batch.model_dump(mode="json"))
         assert response.status_code == 201
 
+        dynamically_created = _task(
+            "project-1-dynamic",
+            TaskKind.IMAGE_GENERATION,
+            state=TaskState.QUEUED,
+        )
+        response = await client.post(
+            "/api/v1/tasks", json=dynamically_created.model_dump(mode="json")
+        )
+        assert response.status_code == 201
+
         cancelled = await client.post(
             "/api/v1/batches/batch-two-projects/projects/project-1/cancel"
         )
         first = await client.get("/api/v1/tasks/project-1-running")
+        dynamic = await client.get("/api/v1/tasks/project-1-dynamic")
         second = await client.get("/api/v1/tasks/project-2-queued")
 
     assert cancelled.status_code == 200
     assert cancelled.json()["state"] == "running"
     assert first.json()["state"] == "cancelled"
+    # This task was created outside the orchestrator context and never joined
+    # this batch. A batch-scoped command must not cancel unrelated project work.
+    assert dynamic.json()["state"] == "queued"
     assert second.json()["state"] == "queued"
     assert ("POST", "/interrupt") in requests

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from ai_video_generator.llm.budget import MAX_OUTPUT_CHARACTERS
 from ai_video_generator.llm.client import llm_delta_callback
 
 
@@ -103,7 +104,8 @@ async def cancel_llm_operation(operation_id: str, project_id: str) -> dict[str, 
 
 async def _run_operation(record: _Operation, operation: Callable[[], Awaitable[object]]) -> None:
     def publish(delta: str) -> None:
-        record.text += delta
+        # UI replay is a bounded tail; output validation happens before commit.
+        record.text = (record.text + delta)[-MAX_OUTPUT_CHARACTERS:]
         record.updated_at = datetime.now(UTC)
         record.version += 1
         _notify(record)
@@ -140,12 +142,16 @@ def _notify(record: _Operation) -> None:
 
 def _stream_response(record: _Operation) -> StreamingResponse:
     async def events():
-        cursor = 0
+        previous = ""
         yield _event("operation", record.snapshot())
         while True:
-            if len(record.text) > cursor:
-                delta = record.text[cursor:]
-                cursor = len(record.text)
+            if record.text != previous:
+                delta = (
+                    record.text[len(previous) :]
+                    if record.text.startswith(previous)
+                    else record.text
+                )
+                previous = record.text
                 yield _event("delta", delta)
             if record.state == "succeeded":
                 yield _event("result", record.result)

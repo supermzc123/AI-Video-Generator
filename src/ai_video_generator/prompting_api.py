@@ -51,6 +51,8 @@ from ai_video_generator.llm import (
     exception_messages,
     remote_config,
 )
+from ai_video_generator.llm.budget import claim_business_repair, llm_operation
+from ai_video_generator.llm.context import content_fingerprint, prompt_generation_lock
 from ai_video_generator.llm.h3_prompt import deterministic_director_decision
 from ai_video_generator.llm.harness_files import load_harness
 from ai_video_generator.persistence import SQLiteTaskStore, StoreConflictError
@@ -110,9 +112,7 @@ def _commit_prompt_result(project_id: str, commit: Callable[[], Any]) -> Any:
         return commit()
 
 
-def _merge_h3_prompt_entries(
-    existing: list[Any], incoming: list[Any]
-) -> list[Any]:
+def _merge_h3_prompt_entries(existing: list[Any], incoming: list[Any]) -> list[Any]:
     """Merge segment drafts without allowing an empty result to erase text."""
     incoming_by_id = {
         str(item.get("segmentId")): item
@@ -133,7 +133,11 @@ def _merge_h3_prompt_entries(
             continue
         current_text = str(current.get("prompt") or "").strip()
         candidate_text = str(candidate.get("prompt") or "").strip()
-        merged.append(current if current_text and not candidate_text else candidate)
+        merged.append(
+            current
+            if current.get("locked") is True or (current_text and not candidate_text)
+            else candidate
+        )
     merged.extend(item for key, item in incoming_by_id.items() if key not in existing_ids)
     return merged
 
@@ -156,18 +160,30 @@ def _h3_generation_summary(entries: list[Any]) -> dict[str, Any]:
 
 def create_prompting_router(settings: Settings) -> APIRouter:
     router = APIRouter(tags=["project-prompts"])
-    task_store = SQLiteTaskStore(Path(settings.data_root) / "control-plane.db")
-    asset_store = ProjectAssetStore(
-        Path(settings.data_root) / "control-plane.db",
-        Path(settings.data_root) / "project-assets",
-    )
+    task_store: SQLiteTaskStore | None = None
+    asset_store: ProjectAssetStore | None = None
+
+    def get_task_store() -> SQLiteTaskStore:
+        nonlocal task_store
+        if task_store is None:
+            task_store = SQLiteTaskStore(Path(settings.data_root) / "control-plane.db")
+        return task_store
+
+    def get_asset_store() -> ProjectAssetStore:
+        nonlocal asset_store
+        if asset_store is None:
+            asset_store = ProjectAssetStore(
+                Path(settings.data_root) / "control-plane.db",
+                Path(settings.data_root) / "project-assets",
+            )
+        return asset_store
 
     @router.post("/api/v1/projects/{project_id}/stages/prompts/generate")
     async def generate_prompt_stage(project_id: str) -> ProjectWorkspaceRevision:
         return await _generate_and_commit(
             settings,
-            task_store,
-            asset_store,
+            get_task_store(),
+            get_asset_store(),
             project_id,
             only_segment_id=None,
         )
@@ -176,8 +192,8 @@ def create_prompting_router(settings: Settings) -> APIRouter:
     async def regenerate_h3_prompt(project_id: str, segment_id: str) -> ProjectWorkspaceRevision:
         return await _generate_and_commit(
             settings,
-            task_store,
-            asset_store,
+            get_task_store(),
+            get_asset_store(),
             project_id,
             only_segment_id=segment_id,
         )
@@ -191,8 +207,8 @@ def create_prompting_router(settings: Settings) -> APIRouter:
         return stream_llm_operation(
             lambda: _generate_and_commit(
                 settings,
-                task_store,
-                asset_store,
+                get_task_store(),
+                get_asset_store(),
                 project_id,
                 only_segment_id=segment_id,
             ),
@@ -208,13 +224,13 @@ def create_prompting_router(settings: Settings) -> APIRouter:
     )
     async def translate_h3_prompt(project_id: str, prompt_revision_id: str) -> H3PromptTranslation:
         try:
-            revision = task_store.get_h3_prompt_revision(prompt_revision_id)
+            revision = get_task_store().get_h3_prompt_revision(prompt_revision_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="H3 prompt revision not found") from exc
         if revision.project_id != project_id:
             raise HTTPException(status_code=404, detail="H3 prompt revision not found")
         source_sha256 = hashlib.sha256(revision.execution_prompt.encode("utf-8")).hexdigest()
-        cached = task_store.get_h3_prompt_translation(prompt_revision_id, source_sha256)
+        cached = get_task_store().get_h3_prompt_translation(prompt_revision_id, source_sha256)
         if cached is not None:
             return H3PromptTranslation(
                 prompt_revision_id=prompt_revision_id,
@@ -222,7 +238,7 @@ def create_prompting_router(settings: Settings) -> APIRouter:
                 translation=cached,
             )
         runtime = load_runtime_settings(settings)
-        workspace = task_store.get_latest_project_workspace(project_id)
+        workspace = get_task_store().get_latest_project_workspace(project_id)
         messages = (
             ChatMessage(
                 role="system",
@@ -251,7 +267,9 @@ def create_prompting_router(settings: Settings) -> APIRouter:
             raise HTTPException(
                 status_code=502, detail=f"H3 prompt translation failed: {exc}"
             ) from exc
-        cached = task_store.put_h3_prompt_translation(prompt_revision_id, source_sha256, translated)
+        cached = get_task_store().put_h3_prompt_translation(
+            prompt_revision_id, source_sha256, translated
+        )
         return H3PromptTranslation(
             prompt_revision_id=prompt_revision_id,
             source_sha256=source_sha256,
@@ -266,8 +284,8 @@ def create_prompting_router(settings: Settings) -> APIRouter:
     ) -> ProjectWorkspaceRevision:
         return await _generate_image_prompt_and_commit(
             settings,
-            task_store,
-            asset_store,
+            get_task_store(),
+            get_asset_store(),
             project_id,
             asset_plan_id,
             instruction=request.instruction,
@@ -284,8 +302,8 @@ def create_prompting_router(settings: Settings) -> APIRouter:
         return stream_llm_operation(
             lambda: _generate_image_prompt_and_commit(
                 settings,
-                task_store,
-                asset_store,
+                get_task_store(),
+                get_asset_store(),
                 project_id,
                 asset_plan_id,
                 instruction=request.instruction,
@@ -301,6 +319,29 @@ def create_prompting_router(settings: Settings) -> APIRouter:
 
 
 async def _generate_image_prompt_and_commit(
+    settings: Settings,
+    store: SQLiteTaskStore,
+    asset_store: ProjectAssetStore,
+    project_id: str,
+    asset_plan_id: str,
+    instruction: str | None = None,
+    workflow_template_id: str | None = None,
+) -> ProjectWorkspaceRevision:
+    async with prompt_generation_lock(
+        (str(settings.data_root), project_id, "image", asset_plan_id)
+    ):
+        return await _generate_image_prompt_and_commit_unlocked(
+            settings,
+            store,
+            asset_store,
+            project_id,
+            asset_plan_id,
+            instruction,
+            workflow_template_id,
+        )
+
+
+async def _generate_image_prompt_and_commit_unlocked(
     settings: Settings,
     store: SQLiteTaskStore,
     asset_store: ProjectAssetStore,
@@ -349,7 +390,7 @@ async def _generate_image_prompt_and_commit(
     ]
     harness_revision = revisions[-1] if revisions else None
 
-    assets = [
+    all_assets = [
         asset for asset in asset_store.list_assets(project_id) if asset.state.value == "available"
     ]
     bound_asset_ids: set[str] = set()
@@ -364,17 +405,6 @@ async def _generate_image_prompt_and_commit(
             and plan_item.get("fulfilledByAssetId")
         ):
             bound_asset_ids.add(str(plan_item["fulfilledByAssetId"]))
-    asset_context = [
-        {
-            "asset_id": asset.asset_id,
-            "name": asset.name,
-            "kind": asset.kind.value,
-            "scope": asset.scope.value,
-            "shot_id": asset.shot_id,
-            "shot_ids": list(asset.shot_ids),
-        }
-        for asset in assets
-    ]
     existing_prompts = workspace.payload.get("prompts", {}).get("imagePrompts", [])
     existing_prompt = (
         next(
@@ -388,35 +418,61 @@ async def _generate_image_prompt_and_commit(
         if isinstance(existing_prompts, list)
         else None
     )
+    if existing_prompt and existing_prompt.get("locked") is True:
+        return workspace
+    referenced_ids = bound_asset_ids | set((existing_prompt or {}).get("referenceAssetIds") or [])
+    unknown_references = referenced_ids - {asset.asset_id for asset in all_assets}
+    if unknown_references:
+        raise HTTPException(
+            status_code=409,
+            detail=f"图片提示词引用的素材不可用：{', '.join(sorted(unknown_references))}",
+        )
+    assets = [
+        asset
+        for asset in all_assets
+        if asset.asset_id in referenced_ids and asset.media_kind.value == "image"
+    ]
+    related_shots = _image_context_shots(workspace.payload, plan)
+    asset_context = [
+        {
+            "asset_id": asset.asset_id,
+            "name": asset.name,
+            "kind": asset.kind.value,
+            "scope": asset.scope.value,
+            "shot_id": asset.shot_id,
+            "shot_ids": list(asset.shot_ids),
+        }
+        for asset in assets
+    ]
+    source_fingerprint = _image_input_fingerprint(
+        workspace.payload, plan, workflow_id, harness_revision_number, assets
+    )
+    if (
+        not instruction
+        and existing_prompt
+        and existing_prompt.get("inputFingerprint") == source_fingerprint
+        and str(existing_prompt.get("prompt") or "").strip()
+    ):
+        return workspace
     context = {
         "project": {
             "name": workspace.payload.get("name"),
             "idea": workspace.payload.get("idea"),
-            "shots": workspace.payload.get("shots"),
+            "shots": related_shots,
         },
         "asset_plan": plan,
-        "existing_image_prompt": existing_prompt,
+        "existing_image_prompt": existing_prompt if instruction else None,
         "available_reference_assets": asset_context,
         "workflow_template_id": workflow_id,
         "user_revision_instruction": instruction,
-        "image_resolution_policy": {
-            "independent_from_video_resolution": True,
-            "target_total_pixels": 1280 * 1280,
-            "dimension_multiple": 8,
-            "minimum_dimension": 64,
-            "maximum_dimension": 4096,
-            "manual_resolution_is_locked": plan.get("resolutionSource") == "manual",
-            "instruction": (
-                "按素材构图选择横图、竖图或方图；总像素控制在1280×1280左右。"
-                "若 resolutionSource 为 manual，必须原样返回 asset_plan 中的 width 和 height。"
-            ),
-        },
+        "output_contract": (
+            "Only write the image prompt. Resolution, IDs, reference bindings and versions "
+            "are supplied by the application."
+        ),
     }
     system = "\n\n".join(
         (
-            harness_revision.markdown
-            if harness_revision
-            else load_harness("image-default.md"),
+            harness_revision.markdown if harness_revision else load_harness("image-default.md"),
             load_harness("image-writer.md"),
         )
     )
@@ -472,9 +528,10 @@ async def _generate_image_prompt_and_commit(
         "negativePrompt": str((old or {}).get("negativePrompt") or "N/A"),
         "workflowTemplateId": workflow_id,
         "harnessRevision": harness_revision_number,
-        "referenceAssetIds": list(bound_asset_ids or (old or {}).get("referenceAssetIds") or []),
+        "referenceAssetIds": sorted(referenced_ids),
         "locked": bool((old or {}).get("locked", False)),
         "revision": int((old or {}).get("revision") or 0) + 1,
+        "inputFingerprint": source_fingerprint,
     }
     manual_resolution = plan.get("resolutionSource") == "manual"
     selected_width = int(plan.get("width") or 1024)
@@ -491,7 +548,9 @@ async def _generate_image_prompt_and_commit(
             "state": "ready",
             "width": selected_width,
             "height": selected_height,
-            "resolutionSource": "manual" if manual_resolution else "ai",
+            "resolutionSource": "manual"
+            if manual_resolution
+            else str(plan.get("resolutionSource") or "default"),
         }
         if isinstance(item, dict) and item.get("id") == asset_plan_id
         else item
@@ -505,16 +564,52 @@ async def _generate_image_prompt_and_commit(
         latest_project = store.get_latest_project_revision(project_id)
         latest_workspace = store.get_latest_project_workspace(project_id)
         latest_payload = json.loads(json.dumps(latest_workspace.payload))
+        latest_plan = next(
+            (
+                item
+                for item in latest_payload.get("assetPlans", [])
+                if isinstance(item, dict) and item.get("id") == asset_plan_id
+            ),
+            None,
+        )
+        latest_assets = [
+            asset
+            for asset in asset_store.list_assets(project_id)
+            if asset.state.value == "available"
+            and asset.asset_id in referenced_ids
+            and asset.media_kind.value == "image"
+        ]
+        if (
+            latest_plan is None
+            or _image_input_fingerprint(
+                latest_payload, latest_plan, workflow_id, harness_revision_number, latest_assets
+            )
+            != source_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409, detail="图片规划已在生成期间修改；保留当前输入，请重新生成"
+            )
         latest_prompts = latest_payload.setdefault("prompts", {})
         latest_images = (
             latest_prompts.get("imagePrompts")
             if isinstance(latest_prompts.get("imagePrompts"), list)
             else []
         )
-        new_images = payload["prompts"]["imagePrompts"]
-        by_plan = {
-            str(item.get("assetPlanId")): item for item in new_images if isinstance(item, dict)
-        }
+        latest_current = next(
+            (
+                item
+                for item in latest_images
+                if isinstance(item, dict) and item.get("assetPlanId") == asset_plan_id
+            ),
+            None,
+        )
+        if latest_current != existing_prompt:
+            if latest_current and latest_current.get("inputFingerprint") == source_fingerprint:
+                return latest_workspace
+            raise HTTPException(
+                status_code=409, detail="图片提示词已在生成期间修改；未覆盖当前内容"
+            )
+        by_plan = {asset_plan_id: entry}
         merged_images = [
             by_plan.get(str(item.get("assetPlanId")), item) if isinstance(item, dict) else item
             for item in latest_images
@@ -572,6 +667,95 @@ async def _complete_image_prompt(
     return (await client.complete_text(messages)).strip()  # type: ignore[attr-defined]
 
 
+def _image_context_shots(payload: dict[str, Any], plan: dict[str, Any]) -> list[dict[str, Any]]:
+    shot_ids = set(plan.get("shotIds") or [])
+    if plan.get("shotId"):
+        shot_ids.add(plan["shotId"])
+    return [
+        item
+        for item in payload.get("shots", [])
+        if isinstance(item, dict) and item.get("id") in shot_ids
+    ]
+
+
+def _image_input_fingerprint(payload, plan, workflow_id, harness_revision, assets) -> str:
+    return content_fingerprint(
+        {
+            "project": {key: payload.get(key) for key in ("name", "idea", "highestInstruction")},
+            "plan": {key: value for key, value in plan.items() if key != "state"},
+            "shots": _image_context_shots(payload, plan),
+            "workflow": workflow_id,
+            "harness": harness_revision,
+            "assets": [asset.model_dump(mode="json") for asset in assets],
+        }
+    )
+
+
+def _h3_input_fingerprint(payload, segment, assets, manifest_sha256, prior_end_state) -> str:
+    return content_fingerprint(
+        {
+            "project": {key: payload.get(key) for key in ("name", "idea", "highestInstruction")},
+            "segment": segment,
+            "assets": [asset.model_dump(mode="json") for asset in assets],
+            "manifest": manifest_sha256,
+            "prior_end_state": prior_end_state,
+        }
+    )
+
+
+def _can_reuse_h3_prompt(entry: Any, fingerprint: str) -> bool:
+    return (
+        isinstance(entry, dict)
+        and entry.get("inputFingerprint") == fingerprint
+        and bool(str(entry.get("prompt") or "").strip())
+        and isinstance(entry.get("review"), dict)
+        and entry["review"].get("ready") is True
+    )
+
+
+def _validate_plain_h3_prompt(request: H3PromptRequest, text: str) -> tuple[str, ...]:
+    errors: list[str] = []
+    if len(text.strip()) < 20:
+        errors.append("execution prompt is empty or too short")
+    if len(text) > request.runtime_limits.max_prompt_characters:
+        errors.append("execution prompt exceeds runtime character limit")
+    expected = {asset.label for asset in request.assets}
+    expected.update(
+        asset.companion_audio_label for asset in request.assets if asset.companion_audio_label
+    )
+    actual = set(re.findall(r"<(?:Picture|Video|Audio) [1-9][0-9]*>", text))
+    if actual - expected:
+        errors.append("unknown reference labels: " + ", ".join(sorted(actual - expected)))
+    if expected - actual:
+        errors.append("missing reference labels: " + ", ".join(sorted(expected - actual)))
+    if text.lstrip().startswith(("```", "{", '["')):
+        errors.append("return executable prompt text without JSON or a code fence")
+    return tuple(errors)
+
+
+async def _generate_validated_plain_h3(remote, request, messages) -> str:
+    async with llm_operation(timeout_seconds=remote.operation_timeout_seconds):
+        text = (await complete_text(remote, messages)).strip()
+        errors = _validate_plain_h3_prompt(request, text)
+        if errors and claim_business_repair():
+            repair_messages = (
+                *messages,
+                ChatMessage(role="assistant", content=text),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Correct these errors and return the full executable prompt: "
+                        + "; ".join(errors)
+                    ),
+                ),
+            )
+            text = (await complete_text(remote, repair_messages)).strip()
+            errors = _validate_plain_h3_prompt(request, text)
+        if errors:
+            raise ValueError("; ".join(errors))
+        return text
+
+
 def _bound_asset_ids_for_shot(payload: dict[str, Any], shot_id: str) -> set[str]:
     return {
         str(plan["fulfilledByAssetId"])
@@ -601,6 +785,20 @@ async def _generate_and_commit(
     *,
     only_segment_id: str | None,
 ) -> ProjectWorkspaceRevision:
+    async with prompt_generation_lock((str(settings.data_root), project_id, "h3")):
+        return await _generate_and_commit_unlocked(
+            settings, store, asset_store, project_id, only_segment_id=only_segment_id
+        )
+
+
+async def _generate_and_commit_unlocked(
+    settings: Settings,
+    store: SQLiteTaskStore,
+    asset_store: ProjectAssetStore,
+    project_id: str,
+    *,
+    only_segment_id: str | None,
+) -> ProjectWorkspaceRevision:
     runtime = load_runtime_settings(settings)
     if not runtime.llm_base_url or not runtime.llm_model:
         raise HTTPException(status_code=503, detail="LLM provider is not configured")
@@ -621,8 +819,15 @@ async def _generate_and_commit(
         json.dumps(
             {
                 "project_id": project_id,
-                "workspace_revision": workspace.revision,
+                "inputs": {
+                    key: workspace.payload.get(key)
+                    for key in ("name", "idea", "highestInstruction", "shots", "assetPlans")
+                },
+                "assets": [
+                    item.model_dump(mode="json") for item in asset_store.list_assets(project_id)
+                ],
                 "segment": operation_scope,
+                "explicit_regeneration": str(uuid.uuid4()) if only_segment_id else None,
                 "harness_revision": harness_revision.revision,
                 "harness_manifest_sha256": harness_revision.content_sha256,
             },
@@ -634,7 +839,7 @@ async def _generate_and_commit(
         existing = store.get_stage_generation_checkpoint(project_id, "prompts", fingerprint)
         if existing.state == StageGenerationState.SUCCEEDED:
             return store.get_latest_project_workspace(project_id)
-        if existing.state == StageGenerationState.FAILED:
+        if existing.state in {StageGenerationState.FAILED, StageGenerationState.PARTIAL}:
             # A completed failed attempt is immutable. A manual retry receives a
             # distinct idempotency key while a crashed STARTED attempt is resumed.
             fingerprint = hashlib.sha256(f"{fingerprint}:retry:{uuid.uuid4()}".encode()).hexdigest()
@@ -655,6 +860,9 @@ async def _generate_and_commit(
     payload = json.loads(json.dumps(workspace.payload))
     prompts = payload.setdefault("prompts", {})
     prior_h3 = prompts.get("h3Prompts") if isinstance(prompts.get("h3Prompts"), list) else []
+    prior_by_segment = {
+        str(item.get("segmentId")): item for item in prior_h3 if isinstance(item, dict)
+    }
     locked_by_segment = {
         str(item.get("segmentId")): item
         for item in prior_h3
@@ -662,6 +870,7 @@ async def _generate_and_commit(
     }
     assets = asset_store.list_assets(project_id)
     generated: dict[str, dict[str, Any]] = {}
+    generated_input_fingerprints: dict[str, str] = {}
     continuity_end_states = {
         str(item.get("segmentId")): str(item["endState"])
         for item in prior_h3
@@ -679,14 +888,14 @@ async def _generate_and_commit(
             segment_id = str(segment["segmentId"])
             if only_segment_id and segment_id != only_segment_id:
                 continue
+            if segment_id in locked_by_segment:
+                generated[segment_id] = locked_by_segment[segment_id]
+                continue
             prior_end_state = _continuation_end_state(
                 segment,
                 continuity_end_states,
                 require_for_single_regeneration=only_segment_id is not None,
             )
-            if segment_id in locked_by_segment:
-                generated[segment_id] = locked_by_segment[segment_id]
-                continue
             # Explicit shot bindings are the only source of truth for reference use.
             bound_asset_ids = _bound_asset_ids_for_shot(payload, str(segment["shotId"]))
             relevant_candidates = [
@@ -765,19 +974,43 @@ async def _generate_and_commit(
                 constraints=_segment_constraints(segment),
                 prior_continuity_state=prior_end_state,
             )
+            segment_fingerprint = _h3_input_fingerprint(
+                payload, segment, relevant, harness_revision.content_sha256, prior_end_state
+            )
+            existing_prompt = prior_by_segment.get(segment_id)
+            if only_segment_id is None and _can_reuse_h3_prompt(
+                existing_prompt, segment_fingerprint
+            ):
+                generated[segment_id] = existing_prompt
+                continue
+            generated_input_fingerprints[segment_id] = segment_fingerprint
+            recovered = next(
+                (
+                    revision
+                    for revision in store.list_h3_prompt_revisions(
+                        project_id, segment_id=segment_id
+                    )
+                    if any(
+                        stage.get("inputFingerprint") == segment_fingerprint
+                        for stage in revision.stage_trace
+                    )
+                ),
+                None,
+            )
+            if only_segment_id is None and recovered is not None:
+                generated[segment_id] = _workspace_h3_prompt(segment, recovered, 0)
+                generated[segment_id]["inputFingerprint"] = segment_fingerprint
+                continuity_end_states[segment_id] = recovered.terminal_state
+                continue
             try:
                 director = deterministic_director_decision(request)
-                prompt_text = (
-                    await complete_text(
-                        remote,
-                        _plain_h3_messages(
-                            request,
-                            library,
-                            director.mode.value,
-                            tuple(media_urls_list),
-                        ),
-                    )
-                ).strip()
+                prompt_text = await _generate_validated_plain_h3(
+                    remote,
+                    request,
+                    _plain_h3_messages(
+                        request, library, director.mode.value, tuple(media_urls_list)
+                    ),
+                )
                 persisted = _persist_plain_h3_prompt(
                     store,
                     project_id,
@@ -787,9 +1020,11 @@ async def _generate_and_commit(
                     request,
                     director.mode,
                     prompt_text,
+                    input_fingerprint=segment_fingerprint,
                 )
                 generated[segment_id] = _workspace_h3_prompt(segment, persisted, 0)
-                continuity_end_states[segment_id] = prompt_text
+                generated[segment_id]["inputFingerprint"] = segment_fingerprint
+                continuity_end_states[segment_id] = persisted.terminal_state
             except (LLMClientError, ValueError) as exc:
                 generated[segment_id] = _failed_workspace_prompt(
                     segment, harness_revision.revision, exception_messages(exc)
@@ -829,12 +1064,58 @@ async def _generate_and_commit(
         latest_project = store.get_latest_project_revision(project_id)
         latest_workspace = store.get_latest_project_workspace(project_id)
         latest_payload = json.loads(json.dumps(latest_workspace.payload))
+        latest_segments = {
+            str(item["segmentId"]): item for item in _workspace_segments(latest_payload)
+        }
+        latest_assets = asset_store.list_assets(project_id)
+        for segment_id, source_fingerprint in generated_input_fingerprints.items():
+            latest_segment = latest_segments.get(segment_id)
+            if latest_segment is None:
+                raise HTTPException(status_code=409, detail="生成期间分镜已删除；未覆盖当前提示词")
+            latest_bound = _bound_asset_ids_for_shot(latest_payload, str(latest_segment["shotId"]))
+            latest_relevant = [
+                asset
+                for asset in latest_assets
+                if asset.state.value == "available"
+                and _asset_is_bound_to_shot(asset, str(latest_segment["shotId"]), latest_bound)
+            ]
+            prior_end = continuity_end_states.get(str(latest_segment.get("continuationOf")))
+            if (
+                _h3_input_fingerprint(
+                    latest_payload,
+                    latest_segment,
+                    latest_relevant,
+                    harness_revision.content_sha256,
+                    prior_end,
+                )
+                != source_fingerprint
+            ):
+                raise HTTPException(
+                    status_code=409, detail="生成期间分镜或素材已修改；未覆盖当前提示词"
+                )
         latest_prompts = latest_payload.setdefault("prompts", {})
         latest_h3 = (
             latest_prompts.get("h3Prompts")
             if isinstance(latest_prompts.get("h3Prompts"), list)
             else []
         )
+        latest_by_segment = {
+            str(item.get("segmentId")): item for item in latest_h3 if isinstance(item, dict)
+        }
+        for segment_id in generated_input_fingerprints:
+            latest_entry = latest_by_segment.get(segment_id)
+            if latest_entry != prior_by_segment.get(segment_id):
+                if (
+                    latest_entry
+                    and latest_entry.get("inputFingerprint")
+                    == generated_input_fingerprints[segment_id]
+                ):
+                    generated[segment_id] = latest_entry
+                else:
+                    raise HTTPException(
+                        status_code=409, detail="生成期间提示词已修改或锁定；未覆盖当前内容"
+                    )
+        prompts["h3Prompts"] = list(generated.values())
         merged_h3 = _merge_h3_prompt_entries(latest_h3, prompts["h3Prompts"])
         latest_prompts["h3Prompts"] = merged_h3
         latest_images = (
@@ -847,12 +1128,7 @@ async def _generate_and_commit(
             for item in prompts["imagePrompts"]
             if isinstance(item, dict)
         }
-        merged_images = [
-            generated_images.get(str(item.get("assetPlanId")), item)
-            if isinstance(item, dict)
-            else item
-            for item in latest_images
-        ]
+        merged_images = [item for item in latest_images]
         existing_plan_ids = {
             str(item.get("assetPlanId")) for item in merged_images if isinstance(item, dict)
         }
@@ -891,7 +1167,7 @@ async def _generate_and_commit(
         checkpoint.model_copy(
             update={
                 "state": checkpoint_state,
-                "after_workspace_revision": next_revision,
+                "after_workspace_revision": committed.revision,
                 "error_code": "segment_generation_failed" if failed_segments else None,
                 "error_message": (
                     f"{len(failed_segments)} H3 segment(s) failed" if failed_segments else None
@@ -957,7 +1233,9 @@ def _relevant_project_memory(
         relevant = store.list_memory_events(project_id, query=query, limit=12)
     recent = store.list_memory_events(project_id, limit=4)
     by_id = {
-        event.event_id: event for event in (*relevant, *recent) if event.role != "h3_llm_telemetry"
+        event.event_id: event
+        for event in (*relevant, *recent)
+        if event.kind == MemoryEventKind.MESSAGE and event.role != "h3_llm_telemetry"
     }
     ordered = sorted(by_id.values(), key=lambda event: event.created_at)
     return "\n".join(event.content for event in ordered)[-8_000:]
@@ -1298,9 +1576,12 @@ def _persist_plain_h3_prompt(
     request: H3PromptRequest,
     mode,
     prompt_text: str,
+    *,
+    input_fingerprint: str | None = None,
 ) -> H3PromptRevision:
-    if not prompt_text:
-        raise LLMClientError("OpenAI-compatible response message content was empty")
+    errors = _validate_plain_h3_prompt(request, prompt_text)
+    if errors:
+        raise ValueError("; ".join(errors))
     prompt_id = "h3-" + hashlib.sha256(f"{project_id}:{segment_id}".encode()).hexdigest()[:32]
     history = store.list_h3_prompt_revisions(
         project_id, segment_id=segment_id, include_history=True
@@ -1347,7 +1628,14 @@ def _persist_plain_h3_prompt(
                 for item in request.assets
             ),
             assumptions=(),
-            stage_trace=({"stage": "direct_writer", "status": "succeeded", "attempt": 0},),
+            stage_trace=(
+                {
+                    "stage": "direct_writer",
+                    "status": "succeeded",
+                    "attempt": 0,
+                    "inputFingerprint": input_fingerprint,
+                },
+            ),
             terminal_state=_prompt_terminal_context(prompt_text),
             review=review,
             state=PromptRevisionState.DRAFT,

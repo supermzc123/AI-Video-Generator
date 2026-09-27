@@ -18,6 +18,7 @@ import httpx
 
 from ai_video_generator.domain import (
     TaskSpec,
+    TaskState,
     TaskWorkloadManifest,
     WorkerCapabilities,
     WorkloadManifestRecord,
@@ -38,6 +39,10 @@ class RemoteWorkerError(RuntimeError):
 
 
 class RemoteLeaseLostError(RemoteWorkerError):
+    pass
+
+
+class RemoteCancellationRequested(RemoteWorkerError):
     pass
 
 
@@ -72,13 +77,23 @@ class WorkerExecutionOutcome:
     artifacts: tuple[ProducedArtifact, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
+    retryable: bool = False
+    stop_evidence: str | None = None
+    submission_token: str | None = None
+    external_prompt_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.status == WorkerResultStatus.FAILED and not self.error_code:
+        if self.status == WorkerResultStatus.CANCELLED and not (self.stop_evidence or "").strip():
+            raise ValueError("cancelled outcomes require confirmed stop evidence")
+        if self.retryable and self.status != WorkerResultStatus.FAILED:
+            raise ValueError("only confirmed failed execution may authorize automatic retry")
+        error_status = self.status in {
+            WorkerResultStatus.FAILED,
+            WorkerResultStatus.NEEDS_ATTENTION,
+        }
+        if error_status and not self.error_code:
             raise ValueError("failed execution outcomes require an error code")
-        if self.status != WorkerResultStatus.FAILED and (
-            self.error_code is not None or self.error_message is not None
-        ):
+        if not error_status and (self.error_code is not None or self.error_message is not None):
             raise ValueError("only failed execution outcomes may include error details")
 
 
@@ -136,14 +151,19 @@ class RemoteWorkerClient:
         response = await self._request(
             "POST",
             f"/api/v1/workers/{heartbeat.worker_id}/leases/claim",
+            retry_transport=False,
             json={"heartbeat": heartbeat.model_dump(mode="json")},
         )
         payload = response.json()
         return None if payload is None else TaskSpec.model_validate(payload)
 
-    async def renew(self, worker_id: str, task_id: str) -> TaskSpec:
+    async def renew(self, worker_id: str, task_id: str, attempt_id: str | None = None) -> TaskSpec:
+        if not attempt_id:
+            raise RemoteLeaseLostError("lease renewal requires the current attempt identity")
         response = await self._request(
-            "POST", f"/api/v1/workers/{worker_id}/leases/{task_id}/renew"
+            "POST",
+            f"/api/v1/workers/{worker_id}/leases/{task_id}/renew",
+            json={"attempt_id": attempt_id},
         )
         if response.status_code == 409:
             raise RemoteLeaseLostError(response.text)
@@ -214,14 +234,17 @@ class RemoteWorkerClient:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _request(
+        self, method: str, url: str, *, retry_transport: bool = True, **kwargs: Any
+    ) -> httpx.Response:
         policy = self.retry_policy
+        attempts = policy.attempts if retry_transport else 1
         delay = policy.initial_delay_seconds
-        for attempt in range(policy.attempts):
+        for attempt in range(attempts):
             try:
                 response = await self._client.request(method, url, **kwargs)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt + 1 == policy.attempts:
+                if attempt + 1 == attempts:
                     raise RemoteWorkerError(
                         f"control plane request failed: {method} {url}"
                     ) from exc
@@ -233,7 +256,7 @@ class RemoteWorkerClient:
                             f"HTTP {response.status_code} {response.text}"
                         )
                     return response
-                if attempt + 1 == policy.attempts:
+                if attempt + 1 == attempts:
                     raise RemoteWorkerError(
                         f"control plane unavailable: {method} {url} returned {response.status_code}"
                     )
@@ -330,59 +353,111 @@ class RemoteWorkerRuntime:
         self.executor = executor
         self.workload_executor = workload_executor
         self.lease_renew_interval_seconds = lease_renew_interval_seconds
+        self._unrecoverable_attempts: set[tuple[str, str | None]] = set()
 
     async def run_once(self) -> TaskSpec | None:
         await self.client.register(self.capabilities)
-        heartbeat = WorkerHeartbeat(
-            worker_id=self.capabilities.worker_id,
-            sent_at=datetime.now(UTC),
-            available_gpu_slots=1,
-        )
-        task = await self.client.claim(heartbeat)
+        journal = getattr(self.workload_executor, "journal", None)
+        task = None
+        if journal is not None:
+            for previous in journal.pending_tasks():
+                key = (previous.task_id, previous.attempt_id)
+                if key in self._unrecoverable_attempts:
+                    continue
+                try:
+                    task = await self.client.renew(
+                        self.capabilities.worker_id, previous.task_id, previous.attempt_id
+                    )
+                except RemoteLeaseLostError:
+                    self._unrecoverable_attempts.add(key)
+                    journal.update(
+                        previous, phase="fenced", detail="control-plane lease no longer owned"
+                    )
+                    continue
+                if task.attempt_id != previous.attempt_id:
+                    raise RemoteLeaseLostError("renewal returned a different attempt")
+                break
+        if task is None:
+            heartbeat = WorkerHeartbeat(
+                worker_id=self.capabilities.worker_id,
+                sent_at=datetime.now(UTC),
+                available_gpu_slots=1,
+            )
+            task = await self.client.claim(heartbeat)
         if task is None:
             return None
 
         stop_renewal = asyncio.Event()
         renewal = asyncio.create_task(self._renew_lease(task, stop_renewal))
         execution = asyncio.create_task(self._execute(task))
+        cancellation_requested = task.state == TaskState.CANCELLING
         try:
-            done, _ = await asyncio.wait({execution, renewal}, return_when=asyncio.FIRST_COMPLETED)
-            if renewal in done:
+            # Let the executor enter its cleanup boundary before cancellation.
+            if cancellation_requested:
+                await asyncio.sleep(0)
                 execution.cancel()
-                await asyncio.gather(execution, return_exceptions=True)
-                error = renewal.exception()
-                if error is None:
-                    raise RemoteWorkerError("lease renewal stopped before task completion")
-                if isinstance(error, RemoteWorkerError):
-                    raise error
-                raise RemoteWorkerError(
-                    f"lease renewal failed: {type(error).__name__}: {error}"
-                ) from error
+            else:
+                done, _ = await asyncio.wait(
+                    {execution, renewal}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if renewal in done:
+                    error = renewal.exception()
+                    execution.cancel()
+                    if isinstance(error, RemoteCancellationRequested):
+                        cancellation_requested = True
+                    else:
+                        await asyncio.gather(execution, return_exceptions=True)
+                        if isinstance(error, RemoteWorkerError):
+                            raise error
+                        raise RemoteWorkerError(f"lease ownership was lost: {error}")
             try:
                 outcome = await execution
             except asyncio.CancelledError:
-                raise
+                if not cancellation_requested:
+                    raise
+                outcome = WorkerExecutionOutcome(
+                    status=WorkerResultStatus.NEEDS_ATTENTION,
+                    error_code="cancellation_unconfirmed",
+                    error_message="executor ended without confirmed external stop",
+                )
             except Exception as exc:
                 outcome = WorkerExecutionOutcome(
-                    status=WorkerResultStatus.FAILED,
+                    status=WorkerResultStatus.NEEDS_ATTENTION,
                     error_code="worker_executor_error",
                     error_message=str(exc)[:2000],
                 )
+            if cancellation_requested and outcome.status not in {
+                WorkerResultStatus.CANCELLED,
+                WorkerResultStatus.NEEDS_ATTENTION,
+            }:
+                outcome = WorkerExecutionOutcome(
+                    status=WorkerResultStatus.NEEDS_ATTENTION,
+                    error_code="cancellation_completion_race",
+                    error_message="execution completed while cancellation required reconciliation",
+                    submission_token=outcome.submission_token,
+                    external_prompt_id=outcome.external_prompt_id,
+                )
             artifact_hashes = []
             for artifact in outcome.artifacts:
-                if renewal.done():
+                if renewal.done() and not cancellation_requested:
                     await renewal
                 transfer = await self.client.upload_artifact(artifact.path, artifact.media_type)
                 artifact_hashes.append(transfer.sha256)
-            if renewal.done():
+            if renewal.done() and not cancellation_requested:
                 await renewal
             report = _build_result_report(task, outcome, tuple(artifact_hashes))
             await self.client.report_result(report)
+            if journal is not None:
+                # Rejected manifests never entered the submission journal.
+                with suppress(ValueError):
+                    journal.update(task, phase="reported", detail=outcome.status.value)
             return task
         finally:
             stop_renewal.set()
+            if not execution.done():
+                execution.cancel()
             renewal.cancel()
-            await asyncio.gather(renewal, return_exceptions=True)
+            await asyncio.gather(execution, renewal, return_exceptions=True)
 
     async def run(
         self,
@@ -392,15 +467,30 @@ class RemoteWorkerRuntime:
         error_backoff_seconds: float = 5.0,
     ) -> None:
         while not stop_event.is_set():
+            operation = asyncio.create_task(self.run_once())
+            stopping = asyncio.create_task(stop_event.wait())
             try:
-                task = await self.run_once()
-            except RemoteWorkerError:
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(stop_event.wait(), timeout=error_backoff_seconds)
-                continue
-            if task is None:
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(stop_event.wait(), timeout=idle_poll_seconds)
+                done, _ = await asyncio.wait(
+                    {operation, stopping}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if stopping in done:
+                    operation.cancel()
+                    await asyncio.gather(operation, return_exceptions=True)
+                    return
+                try:
+                    task = await operation
+                except (RemoteWorkerError, httpx.HTTPError):
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(stop_event.wait(), timeout=error_backoff_seconds)
+                    continue
+                if task is None:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(stop_event.wait(), timeout=idle_poll_seconds)
+            finally:
+                stopping.cancel()
+                if not operation.done():
+                    operation.cancel()
+                await asyncio.gather(operation, stopping, return_exceptions=True)
 
     async def _renew_lease(self, task: TaskSpec, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -408,8 +498,16 @@ class RemoteWorkerRuntime:
                 await asyncio.wait_for(stop.wait(), timeout=self.lease_renew_interval_seconds)
             except TimeoutError:
                 try:
-                    await self.client.renew(self.capabilities.worker_id, task.task_id)
-                except RemoteLeaseLostError:
+                    renewed = await self.client.renew(
+                        self.capabilities.worker_id, task.task_id, task.attempt_id
+                    )
+                    if renewed.attempt_id != task.attempt_id:
+                        raise RemoteLeaseLostError("renewal returned a different attempt")
+                    if renewed.state == TaskState.CANCELLING:
+                        raise RemoteCancellationRequested("control plane requested cancellation")
+                    if renewed.state != TaskState.RUNNING:
+                        raise RemoteLeaseLostError("control plane no longer authorizes execution")
+                except (RemoteLeaseLostError, RemoteCancellationRequested):
                     raise
                 except (RemoteWorkerError, httpx.TimeoutException, httpx.NetworkError) as exc:
                     raise RemoteWorkerError(
@@ -451,10 +549,15 @@ def _build_result_report(
         "task_id": task.task_id,
         "worker_id": task.worker_id,
         "attempt": task.attempt,
+        "attempt_id": task.attempt_id,
         "status": outcome.status.value,
         "artifact_sha256_values": artifact_hashes,
         "error_code": outcome.error_code,
         "error_message": outcome.error_message,
+        "retryable": outcome.retryable,
+        "stop_evidence": outcome.stop_evidence,
+        "submission_token": outcome.submission_token,
+        "external_prompt_id": outcome.external_prompt_id,
     }
     report_id = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

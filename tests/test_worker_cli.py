@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,6 +56,8 @@ def _task(manifest: TaskWorkloadManifest) -> TaskSpec:
         workload_manifest_sha256=manifest.sha256,
         execution_target=ExecutionTarget.REMOTE,
         worker_id="ubuntu-1",
+        attempt_id="test-attempt",
+        deadline_at=datetime.now(UTC) + timedelta(minutes=5),
     )
 
 
@@ -90,8 +93,10 @@ async def test_workload_executor_materializes_inputs_and_collects_all_outputs(
             downloads.append((digest, destination))
 
     class Adapter:
-        async def submit_prompt(self, prompt: object) -> object:
+        async def submit_prompt(self, prompt: object, **kwargs) -> object:
             assert prompt == manifest.prompt
+            assert kwargs["extra_data"]["avg_attempt_id"] == "test-attempt"
+            assert kwargs["extra_data"]["avg_submission_token"]
             return SimpleNamespace(prompt_id="prompt-1", node_errors={})
 
         async def get_history(self, prompt_id: str) -> dict[str, object]:
@@ -122,10 +127,8 @@ async def test_workload_executor_materializes_inputs_and_collects_all_outputs(
 
     assert downloads == [("3" * 64, comfyui_root / "input" / "inputs" / "a.png")]
     assert outcome.status is WorkerResultStatus.SUCCEEDED
-    assert [artifact.path.name for artifact in outcome.artifacts] == [
-        "2-clip.mp4",
-        "3-clip.mp4",
-    ]
+    assert all(artifact.path.name.endswith("-clip.mp4") for artifact in outcome.artifacts)
+    assert len({artifact.path for artifact in outcome.artifacts}) == 2
     assert [artifact.path.read_bytes() for artifact in outcome.artifacts] == [
         b"2:clip.mp4",
         b"3:clip.mp4",

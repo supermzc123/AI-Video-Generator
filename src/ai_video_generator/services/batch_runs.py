@@ -43,6 +43,25 @@ _NO_LONGER_ACTIONABLE_STATES = frozenset(
     {TaskState.SUCCEEDED, TaskState.CANCELLED, TaskState.STALE}
 )
 
+# Phase preference applies only to runnable work; dependency edges remain authoritative.
+_DISPATCH_PHASES: tuple[frozenset[TaskKind], ...] = (
+    frozenset({TaskKind.LLM_PLANNING}),
+    frozenset({TaskKind.IMAGE_GENERATION}),
+    frozenset({TaskKind.CONDITIONING_ENCODING}),
+    frozenset({TaskKind.MODEL_SWITCH}),
+    frozenset({TaskKind.H3_GENERATION}),
+    frozenset({TaskKind.AI_REVIEW}),
+    frozenset(
+        {
+            TaskKind.SEEDVR2,
+            TaskKind.RIFE,
+            TaskKind.WHISPER,
+            TaskKind.MASTER_ASSEMBLY,
+            TaskKind.EXPORT,
+        }
+    ),
+)
+
 
 def resolve_batch_run(store: SQLiteTaskStore, batch: BatchRun) -> BatchRun:
     """Resolve project boundaries to an immutable, dependency-complete task set.
@@ -95,23 +114,17 @@ def resolve_batch_run(store: SQLiteTaskStore, batch: BatchRun) -> BatchRun:
                     f"{item.project_id}:{workspace.revision}"
                 ).encode()
             ).hexdigest()
-            dependencies = tuple(
-                task.task_id
-                for task in tasks
-                if task.state not in _TERMINAL_STATES
-            )
             planning = store.add_task(
                 TaskSpec(
                     task_id=f"batch-plan:{item.project_id}:{fingerprint[:16]}",
                     project_id=item.project_id,
                     kind=TaskKind.LLM_PLANNING,
-                    state=TaskState.BLOCKED if dependencies else TaskState.READY,
+                    state=TaskState.READY,
                     idempotency_key=hashlib.sha256(
                         f"batch-plan:{fingerprint}".encode()
                     ).hexdigest(),
                     input_fingerprint=fingerprint,
                     affinity_key="llm:project-orchestration",
-                    depends_on=dependencies,
                     priority=item.priority,
                     max_attempts=3,
                 )
@@ -150,6 +163,17 @@ def batch_project_tasks(
     return tuple(by_id[task_id] for task_id in item.task_ids)
 
 
+def batch_dispatch_frontier(tasks: tuple[TaskSpec, ...]) -> tuple[TaskSpec, ...]:
+    """Expose every ready branch; phase preference must not defeat aging."""
+    ready = tuple(task for task in tasks if task.state == TaskState.READY)
+    known = frozenset().union(*_DISPATCH_PHASES)
+    other = tuple(task for task in ready if task.kind not in known)
+    return (
+        *other,
+        *(task for phase in _DISPATCH_PHASES for task in ready if task.kind in phase),
+    )
+
+
 def resolve_batch_task_ids(tasks: tuple[TaskSpec, ...], boundary: str) -> tuple[str, ...]:
     """Resolve a compiled project DAG using the same boundary contract as admission."""
     selected = _resolve_item_tasks(tasks, boundary)
@@ -159,43 +183,21 @@ def resolve_batch_task_ids(tasks: tuple[TaskSpec, ...], boundary: str) -> tuple[
 def reconcile_batch_runs(
     store: SQLiteTaskStore, *, now: datetime | None = None
 ) -> tuple[BatchRun, ...]:
-    """Settle dependency failures and complete batches whose members are terminal."""
+    """Keep failed dependencies recoverable; never cancel descendants implicitly."""
     changed_at = now or datetime.now(UTC)
-    results: list[BatchRun] = []
+    results = []
     for batch in store.list_batch_runs():
         if batch.state != BatchState.RUNNING:
             continue
-        selected_ids = {task_id for item in batch.items for task_id in item.task_ids}
-        tasks = {
-            task.task_id: task
-            for item in batch.items
-            for task in store.list_tasks(project_id=item.project_id)
-            if task.task_id in selected_ids
-        }
-        changed = True
-        while changed:
-            changed = False
-            for task in tuple(tasks.values()):
-                if task.state != TaskState.BLOCKED:
-                    continue
-                dependencies = [tasks.get(task_id) for task_id in task.depends_on]
-                if any(
-                    dependency is not None and dependency.state in _UNSUCCESSFUL_STATES
-                    for dependency in dependencies
-                ):
-                    updated = store.transition_task(
-                        task.task_id,
-                        TaskState.CANCELLED,
-                        error_code="dependency_failed",
-                        error_message="cancelled because a required batch task did not succeed",
-                        now=changed_at,
-                    )
-                    tasks[task.task_id] = updated
-                    changed = True
-        if tasks and all(task.state in _TERMINAL_STATES for task in tasks.values()):
-            batch = batch.model_copy(
-                update={"state": BatchState.COMPLETED, "updated_at": changed_at}
-            )
+        selected = {task_id for item in batch.items for task_id in item.task_ids}
+        tasks = {task.task_id: task for item in batch.items
+                 for task in store.list_tasks(project_id=item.project_id)
+                 if task.task_id in selected}
+        # Missing members and blocked branches require attention, not false success.
+        if selected and selected == set(tasks) and all(
+            task.state in _TERMINAL_STATES for task in tasks.values()
+        ):
+            batch = batch.model_copy(update={"state":BatchState.COMPLETED,"updated_at":changed_at})
             store.put_batch_run(batch)
         results.append(batch)
     return tuple(results)
@@ -220,7 +222,9 @@ def _resolve_item_tasks(tasks: tuple[TaskSpec, ...], boundary: str) -> set[str]:
         seeds = {task.task_id for task in tasks if task.kind in kinds}
         selected = _walk(seeds, children)
         selected = {
-            task_id for task_id in selected if by_id[task_id].state not in _TERMINAL_STATES
+            task_id
+            for task_id in selected
+            if by_id[task_id].state not in _NO_LONGER_ACTIONABLE_STATES
         }
 
     # Every unfinished ancestor is part of the batch. This is what prevents a

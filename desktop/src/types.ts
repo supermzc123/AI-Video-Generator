@@ -312,6 +312,10 @@ export type TaskState =
   | "queued"
   | "paused"
   | "running"
+  | "recovering"
+  | "retry_wait"
+  | "cancelling"
+  | "needs_attention"
   | "needs_review"
   | "succeeded"
   | "failed"
@@ -337,6 +341,15 @@ export type TaskSpec = {
   comfyui_prompt_id: string | null;
   error_code: string | null;
   error_message: string | null;
+  attempt_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_activity_at?: string | null;
+  next_retry_at?: string | null;
+  deadline_at?: string | null;
+  current_phase?: string | null;
+  blocked_reason?: string | null;
+  available_actions?: string[];
 };
 
 export type ProjectRunState = {
@@ -374,10 +387,38 @@ export type BatchRun = {
     start_boundary: string;
     priority: number;
     settings?: BatchSettings;
+    paused?: boolean;
   }>;
   created_at: string;
   updated_at: string;
   settings?: BatchSettings;
+  task_counts?: Record<string, number>;
+  all_tasks_ended?: boolean;
+  all_tasks_succeeded?: boolean;
+};
+
+export type TaskCommandAction = "pause" | "resume" | "cancel" | "retry" | "reconcile" | "confirm_retry" | "restart";
+export type TaskCommandScope = { scope: "project" | "batch"; scope_id: string };
+export type TaskCommandRequest = TaskCommandScope & {
+  action: TaskCommandAction;
+  task_ids: string[];
+  idempotency_key: string;
+  confirm_duplicate_execution: boolean;
+};
+export type TaskCommandReceipt = TaskCommandScope & {
+  idempotency_key: string;
+  action: TaskCommandAction;
+  status: "pending" | "completed" | "needs_attention";
+  message?: string;
+  results: Array<{ task_id: string; ok: boolean; state?: TaskState; error?: string }>;
+};
+export type TaskEvent = { event_id: number; task_id: string; kind: string; created_at: number; payload: Record<string, unknown> };
+export type SchedulerHealth = {
+  owns_dispatcher: boolean;
+  last_tick_at?: string | null;
+  last_error?: string | null;
+  task_counts: Record<string, number>;
+  persisted?: Record<string, unknown>;
 };
 
 export type BatchSettings = {

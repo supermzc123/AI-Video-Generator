@@ -27,6 +27,10 @@ class TaskState(StrEnum):
     QUEUED = "queued"
     PAUSED = "paused"
     RUNNING = "running"
+    RECOVERING = "recovering"
+    RETRY_WAIT = "retry_wait"
+    CANCELLING = "cancelling"
+    NEEDS_ATTENTION = "needs_attention"
     NEEDS_REVIEW = "needs_review"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -59,13 +63,26 @@ class TaskSpec(FrozenModel):
     comfyui_prompt_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    attempt_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    next_retry_at: datetime | None = None
+    deadline_at: datetime | None = None
+    current_phase: str | None = None
+    blocked_reason: str | None = None
+    available_actions: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_execution(self) -> "TaskSpec":
         if self.execution_target == ExecutionTarget.REMOTE and not self.worker_id:
             raise ValueError("remote tasks require worker_id")
-        if self.lease_expires_at is not None and self.state != TaskState.RUNNING:
-            raise ValueError("only running tasks may have an active lease")
+        if self.lease_expires_at is not None and self.state not in {
+            TaskState.RUNNING,
+            TaskState.RECOVERING,
+            TaskState.CANCELLING,
+        }:
+            raise ValueError("only active execution attempts may have a lease")
         if self.attempt > self.max_attempts:
             raise ValueError("task attempts exceed max_attempts")
         return self

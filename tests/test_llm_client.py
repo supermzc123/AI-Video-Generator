@@ -105,6 +105,7 @@ async def test_openai_compatible_client_posts_deterministic_json_request() -> No
         "model": "test-model",
         "messages": [{"role": "user", "content": "map"}],
         "temperature": 0,
+        "max_tokens": 8192,
         "response_format": {"type": "json_object"},
     }
 

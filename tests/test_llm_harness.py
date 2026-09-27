@@ -205,14 +205,14 @@ async def test_harness_repairs_invalid_mapping_then_returns_valid_draft() -> Non
 
 
 @pytest.mark.asyncio
-async def test_harness_allows_at_most_three_repair_attempts() -> None:
+async def test_harness_allows_at_most_one_repair_attempt() -> None:
     client = FakeClient(["invalid"] * 4)
     harness = LLMHarness(client)
 
     with pytest.raises(HarnessValidationError, match="remained invalid"):
         await harness.map_workflow(mapping_request())
 
-    assert len(client.calls) == 4
+    assert len(client.calls) == 2
 
 
 def patch_request() -> StructuredOperationRequest:
@@ -310,7 +310,8 @@ def test_structured_prompt_contains_exact_workspace_contracts() -> None:
     assert "asset_plan_item" in payload["contract"]["workspace_value_contracts"]
     assert "image_prompt_item" in payload["contract"]["workspace_value_contracts"]
     asset_contract = payload["contract"]["workspace_value_contracts"]["asset_plan_item"]
-    assert {"width", "height", "resolutionSource"}.issubset(asset_contract["required"])
+    assert {"width", "height"}.issubset(asset_contract["required"])
+    assert "resolutionSource" in asset_contract["serverManagedFields"]
     motion = payload["contract"]["motion_context_contract"]
     asset_policy = payload["contract"]["asset_planning_policy"]
     assert motion["segment_duration_sum"] == "must equal shot.durationSeconds"

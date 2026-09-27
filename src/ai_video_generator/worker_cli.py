@@ -5,13 +5,15 @@ import asyncio
 import os
 import signal
 import socket
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from platformdirs import user_data_path
 
-from ai_video_generator.domain import TaskSpec, TaskWorkloadManifest, WorkerCapabilities
+from ai_video_generator.domain import TaskSpec, TaskState, TaskWorkloadManifest, WorkerCapabilities
 from ai_video_generator.services.remote import WorkerResultStatus
+from ai_video_generator.services.remote_execution import RemoteExecutionJournal, validated_queue_ids
 from ai_video_generator.workers.comfyui import ComfyUIAdapter
 from ai_video_generator.workers.remote_worker import (
     ProducedArtifact,
@@ -58,72 +60,206 @@ def _history_output(history: dict[str, Any], node_id: str) -> dict[str, str] | N
 
 
 def _workload_executor(
-    *, client: RemoteWorkerClient, adapter: ComfyUIAdapter, comfyui_root: Path,
+    *,
+    client: RemoteWorkerClient,
+    adapter: ComfyUIAdapter,
+    comfyui_root: Path,
     work_root: Path,
+    poll_seconds: float = 0.75,
 ):
-    async def execute(
-        task: TaskSpec, manifest: TaskWorkloadManifest
-    ) -> WorkerExecutionOutcome:
-        input_root = (comfyui_root / "input").resolve()
-        for blob in manifest.input_blobs:
-            target = (input_root / Path(blob.mount_path)).resolve()
-            if input_root not in target.parents:
-                raise ValueError("workload input escapes ComfyUI input directory")
-            await client.download_artifact(blob.sha256, target)
-        submission = await adapter.submit_prompt(manifest.prompt)
-        if submission.node_errors:
-            raise RuntimeError(f"ComfyUI rejected workload: {submission.node_errors}")
-        deadline = asyncio.get_running_loop().time() + 4 * 60 * 60
+    journal = RemoteExecutionJournal(work_root)
+
+    async def execute(task: TaskSpec, manifest: TaskWorkloadManifest) -> WorkerExecutionOutcome:
+        record = journal.prepare(task, manifest)
+        prompt_id = record["prompt_id"]
+        token = record["submission_token"]
+
+        def outcome(status, *, code=None, message=None, evidence=None, artifacts=()):
+            return WorkerExecutionOutcome(
+                status=status,
+                artifacts=artifacts,
+                error_code=code,
+                error_message=message,
+                stop_evidence=evidence,
+                submission_token=token,
+                external_prompt_id=prompt_id,
+            )
+
+        async def stop_owned_prompt():
+            nonlocal prompt_id
+            current = journal.get(task)
+            if current["phase"] == "prepared":
+                return "submission was never started"
+            if prompt_id is None:
+                prompt_id = await adapter.find_submission(token)
+                if prompt_id is None:
+                    return None
+                journal.update(task, phase="cancelling", prompt_id=prompt_id)
+            await adapter.cancel_prompt(prompt_id)
+            # The POST only requests interruption. A later validated queue observation
+            # is the required evidence before the Worker reports cancellation.
+            for _ in range(3):
+                if prompt_id not in await validated_queue_ids(adapter):
+                    return f"ComfyUI queue confirms prompt {prompt_id} is absent after stop request"
+                await asyncio.sleep(poll_seconds)
+            return None
+
         try:
-            while asyncio.get_running_loop().time() < deadline:
-                history = await adapter.get_history(submission.prompt_id)
-                if history is None:
-                    await asyncio.sleep(0.75)
-                    continue
-                status = history.get("status")
+            if task.state == TaskState.CANCELLING:
+                raise asyncio.CancelledError
+            if record["phase"] == "completed":
+                outputs = journal.verified_outputs(task)
+                return outcome(
+                    WorkerResultStatus.SUCCEEDED,
+                    artifacts=tuple(
+                        ProducedArtifact(Path(item["path"]), item["media_type"]) for item in outputs
+                    ),
+                )
+            if record["phase"] == "prepared":
+                if datetime.now(UTC) >= task.deadline_at:
+                    journal.update(
+                        task, phase="stopped", detail="deadline expired before submission"
+                    )
+                    return outcome(
+                        WorkerResultStatus.FAILED,
+                        code="deadline_exceeded",
+                        message="original execution deadline expired before submission",
+                        evidence="submission was never started",
+                    )
+                input_root = (comfyui_root / "input").resolve()
+                for blob in manifest.input_blobs:
+                    target = (input_root / Path(blob.mount_path)).resolve()
+                    if input_root not in target.parents:
+                        raise ValueError("workload input escapes ComfyUI input directory")
+                    await client.download_artifact(blob.sha256, target)
+                if datetime.now(UTC) >= task.deadline_at:
+                    journal.update(task, phase="stopped", detail="deadline expired during inputs")
+                    return outcome(
+                        WorkerResultStatus.FAILED,
+                        code="deadline_exceeded",
+                        message="original deadline expired while preparing inputs",
+                        evidence="submission was never started",
+                    )
+                if journal.claim_submission(task):
+                    try:
+                        submission = await adapter.submit_prompt(
+                            manifest.prompt,
+                            client_id=f"avg-worker-{task.attempt_id}",
+                            extra_data={
+                                "avg_task_id": task.task_id,
+                                "avg_attempt_id": task.attempt_id,
+                                "avg_submission_token": token,
+                            },
+                        )
+                        prompt_id = submission.prompt_id
+                        journal.update(task, phase="submitted", prompt_id=prompt_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # An exception can follow server acceptance. Intent remains
+                        # durable and no path may submit the same attempt again.
+                        prompt_id = await adapter.find_submission(token)
+                        if prompt_id:
+                            journal.update(task, phase="submitted", prompt_id=prompt_id)
+            if prompt_id is None:
+                prompt_id = await adapter.find_submission(token)
+                if prompt_id:
+                    journal.update(task, phase="submitted", prompt_id=prompt_id)
+            if prompt_id is None:
+                journal.update(
+                    task, phase="unknown", detail="submission result cannot be reconciled"
+                )
+                return outcome(
+                    WorkerResultStatus.NEEDS_ATTENTION,
+                    code="submission_unknown",
+                    message="submission outcome is unknown; automatic replay is forbidden",
+                )
+            while True:
+                history = await adapter.get_history(prompt_id)
+                status = history.get("status") if history else None
                 status_text = str(
                     status.get("status_str") if isinstance(status, dict) else status or ""
                 ).lower()
                 if status_text in {"error", "failed"}:
-                    raise RuntimeError("ComfyUI workload failed")
-                artifacts: list[ProducedArtifact] = []
-                missing_outputs: list[str] = []
-                for output in manifest.outputs:
-                    media = _history_output(history, output.node_id)
-                    if media is None:
-                        missing_outputs.append(output.node_id)
-                        continue
-                    content = await adapter.get_output_image(
-                        media["filename"],
-                        subfolder=media["subfolder"],
-                        storage_type=media["type"],
+                    journal.update(task, phase="stopped", detail="ComfyUI history confirms failure")
+                    return outcome(
+                        WorkerResultStatus.FAILED,
+                        code="comfy_execution_failed",
+                        message="ComfyUI workload failed",
+                        evidence="ComfyUI history confirms execution failure",
                     )
-                    directory = work_root / task.task_id.replace(":", "_")
-                    directory.mkdir(parents=True, exist_ok=True)
-                    filename = f"{output.node_id}-{Path(media['filename']).name}"
-                    target = directory / filename
-                    temporary = target.with_suffix(target.suffix + ".tmp")
-                    temporary.write_bytes(content)
-                    temporary.replace(target)
-                    artifacts.append(
-                        ProducedArtifact(path=target, media_type=output.media_type)
+                complete = isinstance(status, dict) and status.get("completed") is True
+                if complete:
+                    outputs = []
+                    for output in manifest.outputs:
+                        media = _history_output(history, output.node_id)
+                        if media is None:
+                            raise ValueError(
+                                f"completed workload is missing output {output.node_id}"
+                            )
+                        content = await adapter.get_output_image(
+                            media["filename"],
+                            subfolder=media["subfolder"],
+                            storage_type=media["type"],
+                        )
+                        outputs.append(
+                            journal.publish(
+                                task, output.node_id, media["filename"], content, output.media_type
+                            )
+                        )
+                    journal.update(task, phase="completed", outputs=outputs)
+                    return outcome(
+                        WorkerResultStatus.SUCCEEDED,
+                        artifacts=tuple(
+                            ProducedArtifact(Path(item["path"]), item["media_type"])
+                            for item in outputs
+                        ),
                     )
-                if not missing_outputs:
-                    return WorkerExecutionOutcome(
-                        status=WorkerResultStatus.SUCCEEDED, artifacts=tuple(artifacts)
+                if datetime.now(UTC) >= task.deadline_at:
+                    evidence = await stop_owned_prompt()
+                    journal.update(
+                        task,
+                        phase="stopped" if evidence else "unknown",
+                        detail=evidence or "deadline stop was not confirmed",
                     )
-                if isinstance(status, dict) and status.get("completed") is True:
-                    missing = ", ".join(missing_outputs)
-                    raise RuntimeError(
-                        f"ComfyUI completed without declared output nodes: {missing}"
+                    return outcome(
+                        WorkerResultStatus.FAILED
+                        if evidence
+                        else WorkerResultStatus.NEEDS_ATTENTION,
+                        code="deadline_exceeded" if evidence else "deadline_stop_unconfirmed",
+                        message="original absolute execution deadline expired",
+                        evidence=evidence,
                     )
-                await asyncio.sleep(0.75)
-            await adapter.cancel_prompt(submission.prompt_id)
-            raise TimeoutError("ComfyUI workload exceeded four hours")
+                await asyncio.sleep(poll_seconds)
         except asyncio.CancelledError:
-            await adapter.cancel_prompt(submission.prompt_id)
-            raise
+            try:
+                async with asyncio.timeout(45):
+                    evidence = await stop_owned_prompt()
+            except Exception as exc:
+                evidence = None
+                journal.update(task, phase="unknown", detail=f"stop check failed: {exc}"[:2000])
+            else:
+                journal.update(
+                    task,
+                    phase="stopped" if evidence else "unknown",
+                    detail=evidence or "stop was not confirmed",
+                )
+            if evidence:
+                return outcome(WorkerResultStatus.CANCELLED, evidence=evidence)
+            return outcome(
+                WorkerResultStatus.NEEDS_ATTENTION,
+                code="cancellation_unconfirmed",
+                message="Worker could not confirm external execution stopped",
+            )
+        except Exception as exc:
+            journal.update(task, phase="unknown", detail=str(exc)[:2000])
+            return outcome(
+                WorkerResultStatus.NEEDS_ATTENTION,
+                code="remote_execution_unknown",
+                message=str(exc)[:2000],
+            )
 
+    execute.journal = journal
     return execute
 
 

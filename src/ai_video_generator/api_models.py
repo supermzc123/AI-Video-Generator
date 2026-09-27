@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -73,6 +73,12 @@ class WorkerLeaseRequest(BaseModel):
     heartbeat: WorkerHeartbeat
 
 
+class WorkerLeaseRenewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: str = Field(min_length=1)
+
+
 class WorkerResultRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -124,6 +130,8 @@ class RuntimeSettingsUpdateRequest(BaseModel):
     llm_timeout_seconds: float = Field(gt=0, le=300)
     llm_first_token_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     llm_stream_idle_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    llm_operation_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    llm_concurrency: int = Field(default=2, ge=1, le=16)
     llm_video_capable: bool = False
     network_proxy: str | None = None
     h3_diffusion_model: str = Field(
@@ -223,6 +231,24 @@ class ReworkMarkerRequest(BaseModel):
     version_id: str = Field(min_length=1)
     action: ReworkAction
     feedback: str | None = Field(default=None, max_length=4000)
+
+
+class ConfirmTaskRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_duplicate_execution: bool = False
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class TaskCommandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["project", "batch"]
+    scope_id: str = Field(min_length=1, max_length=200)
+    action: Literal["pause", "resume", "cancel", "retry", "reconcile", "confirm_retry", "restart"]
+    task_ids: tuple[str, ...] = Field(min_length=1, max_length=500)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    confirm_duplicate_execution: bool = False
     replacement_seed: int | None = Field(default=None, ge=0)
     source: str = Field(default="human", pattern="^(human|ai)$")
 
@@ -233,3 +259,9 @@ class ReworkMarkerUpdateRequest(BaseModel):
     action: ReworkAction | None = None
     feedback: str | None = Field(default=None, min_length=1, max_length=4000)
     replacement_seed: int | None = Field(default=None, ge=0)
+
+
+class ImageTaskRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_workspace_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")

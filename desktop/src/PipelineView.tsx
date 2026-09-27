@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 import { ChangeEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  cancelTask,
+  taskCommands,
   cancelProjectLlmOperation,
   acceptAssetCandidate,
   assetCandidatePreviewUrl,
@@ -77,11 +77,16 @@ import type {
   ShotDraft,
   TaskKind,
   TaskSpec,
+  TaskCommandAction,
   ReviewDecision,
   ReworkMarker,
   SegmentGenerationVersion,
   H3PromptRevision,
 } from "./types";
+
+import { TaskActionButtons, TaskDiagnostics, TaskStatus } from "./TaskStatus";
+import { activeExecutionStates, taskExplanation, taskKindLabels, taskStateLabels } from "./task-status";
+import { describeCommandReceipt } from "./task-commands";
 
 function extractH3Description(stream: string): string | null {
   return stream || null;
@@ -145,34 +150,6 @@ const stageMeta: Record<PipelineStageId, { index: string; label: string; short: 
   prompts: { index: "06", label: "提示词设计", short: "提示词" },
   generation: { index: "07", label: "视频生成", short: "生成" },
   delivery: { index: "08", label: "后处理与交付", short: "交付" },
-};
-
-const taskKindLabels: Record<TaskKind, string> = {
-  llm_planning: "LLM 规划",
-  image_generation: "图片生成",
-  conditioning_encoding: "条件编码",
-  h3_generation: "H3 生成",
-  ai_review: "审核",
-  model_switch: "准备视频生成模型",
-  seedvr2: "SeedVR2",
-  rife: "RIFE",
-  whisper: "Whisper",
-  master_assembly: "母版拼接",
-  export: "FFmpeg 导出",
-  asset_transfer: "素材传输",
-};
-
-const taskStateLabels: Record<TaskSpec["state"], string> = {
-  blocked: "等待前置任务",
-  ready: "等待派发",
-  queued: "已派发",
-  paused: "已暂停",
-  running: "执行中",
-  needs_review: "等待人工审核",
-  succeeded: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-  stale: "已失效",
 };
 
 const deliveryTaskKinds = new Set<TaskKind>(["seedvr2", "rife", "whisper", "master_assembly", "export"]);
@@ -295,7 +272,7 @@ function GenerationSegmentCard({ segment, project, tasks, reviewTasks, artifacts
   const prompt = project.prompts.h3Prompts.find((item) => item.segmentId === segment.segment_id);
   const showAi = !["manual", "none"].includes(project.reviewPolicy.effectiveMode);
   return <article className="review-card">
-    <header><div><span>连接段 {segment.segment_index + 1}</span><div><strong>{segment.segment_id} · {version ? `第 ${version.generation_number} 次生成` : "尚未生成"}</strong><small>{segment.frozen ? "已冻结" : task ? taskStateLabels[task.state] : "等待计划"}</small></div></div><span className={`state state-${segment.frozen ? "paused" : task?.state ?? "blocked"}`}>{segment.frozen ? "已冻结" : task ? taskStateLabels[task.state] : "等待计划"}</span></header>
+    <header><div><span>连接段 {segment.segment_index + 1}</span><div><strong>{segment.segment_id} · {version ? `第 ${version.generation_number} 次生成` : "尚未生成"}</strong><small>{segment.frozen ? "已冻结" : task ? taskStateLabels[task.state] : "等待计划"}</small></div></div><TaskStatus state={segment.frozen ? "paused" : task?.state ?? "blocked"} label={segment.frozen ? "已冻结" : task ? undefined : "等待计划"} /></header>
     <div className="review-media">{video ? <video controls preload="metadata" src={artifactMediaUrl(video)}>当前系统播放器不支持此视频格式。</video> : <div className="media-placeholder"><Film size={24} /><span>{task?.state === "succeeded" ? "视频产物未登记或已作废" : segment.freeze_reason ?? "等待片段生成完成"}</span></div>}</div>
     {prompt && <details className="review-prompt"><summary>查看生成提示词</summary><pre>{prompt.prompt}</pre></details>}
     {decision && showAi && <section className="review-decision"><div className="decision-summary"><strong>{decision.disposition === "accepted" ? "AI 建议通过" : "AI 建议返工"}</strong><span>置信度 {Math.round(decision.confidence * 100)}%</span></div>{decision.issues.map((issue, index) => <div className={`review-issue ${issue.severity}`} key={`${issue.category}:${index}`}><header><strong>{issue.message}</strong><span>{issue.start_seconds === null ? "未标注时间" : `${issue.start_seconds.toFixed(1)}s`}</span></header>{issue.suggested_action && <p>建议：{issue.suggested_action}</p>}</div>)}</section>}
@@ -470,6 +447,9 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const [pendingUploadKind, setPendingUploadKind] = useState<AssetDraft["kind"]>("scene");
   const [agentGenerationBusy, setAgentGenerationBusy] = useState(false);
   const [executionStatus, setExecutionStatus] = useState<ProjectExecutionStatus | null>(null);
+  const [executionOffline, setExecutionOffline] = useState(false);
+  const [executionRefreshedAt, setExecutionRefreshedAt] = useState<Date | null>(null);
+  const [imageTaskStates, setImageTaskStates] = useState<Record<string, TaskSpec>>({});
   const [guidedRunTarget, setGuidedRunTarget] = useState<"review" | "delivery" | null>(null);
   const [activeImageTasks, setActiveImageTasks] = useState<Record<string, string>>({});
   const [candidateTaskPlans, setCandidateTaskPlans] = useState<Record<string, boolean>>({});
@@ -541,13 +521,19 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
   const refreshExecutionStatus = async () => {
     try {
       const status = await getProjectExecutionStatus(project.projectId);
+      if (latestProject.current.projectId !== project.projectId) return null;
       setExecutionStatus(status);
+      setExecutionOffline(false); setExecutionRefreshedAt(new Date());
       return status;
     } catch {
-      setExecutionStatus(null);
+      setExecutionOffline(true);
       return null;
     }
   };
+
+  useEffect(() => {
+    setExecutionStatus(null); setExecutionRefreshedAt(null); setImageTaskStates({});
+  }, [project.projectId]);
 
   useEffect(() => {
     void refreshExecutionStatus();
@@ -714,6 +700,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         try {
           const task = await getTask(taskId);
           if (cancelled) return;
+          setImageTaskStates((current) => ({ ...current, [planId]: task }));
           if (task.state === "succeeded") {
             // The task and candidate rows are committed independently. Read the
             // authoritative candidate list before deciding whether to replace
@@ -755,7 +742,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
               delete next[planId];
               return next;
             });
-            setActionError(task.error_message || "图片生成任务失败");
+            setActionError(task.error_message || (task.state === "cancelled" ? "图片生成任务已取消" : "图片生成任务失败"));
           }
         } catch (cause) {
           if (!cancelled) setActionError(cause instanceof Error ? cause.message : "读取图片任务状态失败");
@@ -1633,6 +1620,8 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
         const relevant = target === "review"
           ? status.tasks.filter((task) => reviewBoundaryKinds.has(task.kind))
           : status.tasks.filter((task) => deliveryTaskKinds.has(task.kind));
+        const attention = relevant.find((task) => ["needs_attention", "cancelling", "paused", "cancelled"].includes(task.state));
+        if (attention) { setActionMessage(taskExplanation(attention, status.tasks)); break; }
         const failed = relevant.find((task) => task.state === "failed"
           && task.error_code !== "ai_review_rework_queued"
           && !(target === "delivery" && task.kind === "ai_review"));
@@ -1654,7 +1643,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             await runTask(task.task_id);
           }
           setActionMessage(`已派发 ${ready.length} 项；等待执行完成并自动继续...`);
-        } else if (relevant.some((task) => ["queued", "running"].includes(task.state))) {
+        } else if (relevant.some((task) => activeExecutionStates.has(task.state))) {
           const waitingForHuman = relevant.filter((task) => task.state === "needs_review").length;
           setActionMessage(waitingForHuman
             ? `${waitingForHuman} 个片段等待人工确认；其他片段仍在审核`
@@ -1682,20 +1671,14 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
 
   const stopGuidedRun = () => guidedRunAbort.current?.abort();
 
-  const operatePipelineTask = async (task: TaskSpec, operation: "retry" | "cancel") => {
-    setActionBusy(true);
-    setActionError(null);
-    setActionMessage(operation === "retry" ? `正在重新提交：${taskKindLabels[task.kind]}...` : null);
+  const operatePipelineTask = async (task: TaskSpec, operation: TaskCommandAction, confirmed: boolean) => {
+    setActionBusy(true); setActionError(null); setActionMessage(null);
     try {
-      if (operation === "cancel") await cancelTask(task.task_id);
-      else await runTask(task.task_id);
+      const receipt = await taskCommands.run({ scope: "project", scope_id: project.projectId }, operation, [task], confirmed);
+      setActionMessage(describeCommandReceipt(receipt));
       await refreshExecutionStatus();
-      setActionMessage(operation === "cancel" ? "已取消当前任务" : "已重新提交失败任务");
-    } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : "任务操作失败");
-    } finally {
-      setActionBusy(false);
-    }
+    } catch (cause) { setActionError(cause instanceof Error ? cause.message : "任务操作未完成"); }
+    finally { setActionBusy(false); }
   };
 
   const openReworkDialog = (version: SegmentGenerationVersion) => {
@@ -1784,6 +1767,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
       })()}><Pause size={15} />{project.paused ? "继续派发" : "暂停"}</button> : null}
       {executionStatus?.task_count ? <button className="primary-button" disabled={actionBusy} onClick={() => void switchMode()}>{project.executionMode === "guided" ? "转入批量工作台" : "退出批量模式"}</button> : null}
     </div>
+    {executionOffline && <div className="error-banner inline-banner" role="status">连接中断，保留最后任务状态（{executionRefreshedAt?.toLocaleString() ?? "尚未同步"}）；正在自动重连。</div>}
     {actionError && <div className="global-error-banner pipeline-error-banner" role="alert"><CircleAlert size={19} /><strong>操作未完成</strong><span>{actionError}</span><button className="icon-button" title="关闭错误" onClick={() => setActionError(null)}><X size={16} /></button></div>}
     <div className="pipeline-rail" aria-label="制作阶段">
       {pipelineOrder.map((stage, index) => {
@@ -1988,8 +1972,9 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
               return <div key={plan.id} className="asset-plan-row">
                 <button className="asset-plan-preview" disabled={!fulfilled} title={fulfilled ? `放大预览 ${fulfilled.name}` : "尚未生成"} onClick={() => fulfilled && setLightboxAssetId(fulfilled.id)}>{fulfilled ? <img src={fulfilled.previewUrl || projectAssetPreviewUrl(project.projectId, fulfilled.id)} alt={fulfilled.name} /> : <ImagePlus size={19} />}</button>
                 <div className="asset-plan-info"><strong>{fulfilled?.name ?? plan.name}</strong><p>{plan.description}</p><small>{plan.kind} · {plan.scope === "public" ? "公共素材" : `引用分镜：${plan.shotIds.length ? plan.shotIds.map((id) => project.shots.find((shot) => shot.id === id)?.title ?? id).join("、") : plan.shotId ? (project.shots.find((shot) => shot.id === plan.shotId)?.title ?? plan.shotId) : "未指定"}`}</small>{assetResolutionControls(plan)}</div>
-                <span className={`state ${fulfilled ? "state-ready" : ""}`}>{generating ? "GENERATING" : fulfilled ? "SATISFIED" : hasPrompt ? "PROMPT READY" : plan.state.toUpperCase()}</span>
+                {generating && imageTaskStates[plan.id] ? <TaskStatus state={imageTaskStates[plan.id].state} /> : <span className={`state ${fulfilled ? "state-succeeded" : ""}`}>{generating ? "图片任务已提交" : fulfilled ? "素材已就绪" : hasPrompt ? "提示词已准备" : "等待素材规划"}</span>}
                 <div className="asset-plan-actions">
+                  {generating && <button className="secondary-button" onClick={onOpenTasks}><ArrowRight size={14} />查看任务与恢复控制</button>}
                   {!fulfilled && !generating && <label className="asset-plan-workflow"><span>图片工作流</span><select value={selectedWorkflow} onChange={(event) => setSelectedWorkflowByPlan((current) => ({ ...current, [plan.id]: event.target.value }))}><option value="">请选择</option>{imageWorkflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name} · R{workflow.revision}</option>)}</select></label>}
                   {!fulfilled && !generating && <label className="secondary-button" role="button" aria-label={`上传图片填充素材需求 ${plan.name}`} tabIndex={0} onKeyDown={activateFileLabel}><Upload size={14} />上传填充<input type="file" accept="image/*" onChange={(event) => queueAssetUploads(event, plan.id)} /></label>}
                   {!generating && <button className={!fulfilled ? "primary-button" : "secondary-button"} disabled={actionBusy || !selectedWorkflow} onClick={() => openImagePromptDialog(plan)}><SlidersHorizontal size={14} />编辑提示词</button>}
@@ -2139,7 +2124,7 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             <div><span>电影分镜</span><strong>{project.shots.length}</strong></div><ArrowRight size={18} /><div><span>H3 执行片段</span><strong>{segmentCount}</strong></div><ArrowRight size={18} /><div><span>连续衔接</span><strong>{continuationCount}</strong></div>
           </div>
           <div className="generation-actions">
-            <button className="primary-button" disabled={actionBusy || !workerOnline} onClick={() => void startGeneration()}><Play size={16} />{executionStatus?.compiled ? "开始 / 继续派发" : "创建计划并开始生成"}</button>
+            <button className="primary-button" disabled={actionBusy || executionOffline || !workerOnline} onClick={() => void startGeneration()}><Play size={16} />{executionStatus?.compiled ? "开始 / 继续派发" : "创建计划并开始生成"}</button>
             <button className="secondary-button" disabled={actionBusy || !workerOnline} onClick={() => void restartGeneration()} title="重新读取全局 MiniMax H3 设置，保留素材和提示词并重建视频任务"><RotateCcw size={15} />重新开始</button>
             <button className="secondary-button" disabled={actionBusy} onClick={() => void compileDag()}><ListPlus size={16} />仅创建任务计划</button>
             <button className="secondary-button" onClick={onOpenTasks}><ArrowRight size={15} />查看任务进度</button>
@@ -2181,17 +2166,14 @@ export function PipelineView({ project, workflows, workerOnline, onChange, onOpe
             <div className="postprocess-icon"><PackageCheck size={19} /></div><div><strong>语音转写与字幕</strong><span>使用用户上传的 ComfyUI 语音识别工作流生成 SRT</span></div><label className="switch"><input type="checkbox" checked={project.postProcessing.whisper.enabled} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, enabled: event.target.checked } } }))} /><span /></label>
             {project.postProcessing.whisper.enabled && <div className="postprocess-detail"><label>用户工作流 <select value={project.postProcessing.whisper.workflowTemplateId ?? ""} onChange={(event) => { const selected = transcriptionWorkflows.find((item) => item.id === event.target.value); update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, workflowTemplateId: selected?.id ?? null, workflowRevision: selected?.revision ?? null, profileId: selected?.id ?? null, profileRevision: selected?.revision ?? null } } })); }}><option value="">请选择已登记的语音识别工作流</option>{transcriptionWorkflows.map((item) => <option key={item.id} value={item.id}>{item.name} · R{item.revision}</option>)}</select></label><label>识别语言 <select value={project.postProcessing.whisper.language} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, language: event.target.value as "zh" | "en" | "auto" } } }))}><option value="zh">中文</option><option value="en">英文</option><option value="auto">自动</option></select></label><label className="check-label"><input type="checkbox" checked={project.postProcessing.whisper.burnIn} onChange={(event) => update("delivery", (current) => ({ ...current, postProcessing: { ...current.postProcessing, whisper: { ...current.postProcessing.whisper, burnIn: event.target.checked } } }))} />烧录字幕</label>{!transcriptionWorkflows.length && <span className="resource-note"><CircleAlert size={15} />请先上传并登记“语音识别 / 字幕”工作流</span>}</div>}
           </div>
-          <div className="generation-actions"><button className="primary-button" disabled={actionBusy || !executionStatus?.review_complete || (Boolean(guidedRunTarget) && guidedRunTarget !== "delivery")} onClick={() => guidedRunTarget === "delivery" ? stopGuidedRun() : void runGuidedTo("delivery")}>{guidedRunTarget === "delivery" ? <Square size={14} /> : <PackageCheck size={16} />}{guidedRunTarget === "delivery" ? "停止自动派发" : executionStatus?.delivery_complete ? "重新检查交付状态" : "开始后处理并导出"}</button><button className="secondary-button" onClick={onOpenTasks}><ArrowRight size={15} />查看只读任务进度</button></div>
+          <div className="generation-actions"><button className="primary-button" disabled={actionBusy || !executionStatus?.review_complete || (Boolean(guidedRunTarget) && guidedRunTarget !== "delivery")} onClick={() => guidedRunTarget === "delivery" ? stopGuidedRun() : void runGuidedTo("delivery")}>{guidedRunTarget === "delivery" ? <Square size={14} /> : <PackageCheck size={16} />}{guidedRunTarget === "delivery" ? "停止自动派发" : executionStatus?.delivery_complete ? "重新检查交付状态" : "开始后处理并导出"}</button><button className="secondary-button" onClick={onOpenTasks}><ArrowRight size={15} />查看任务与恢复控制</button></div>
           <div className="task-table pipeline-task-table">
             <div className="task-header"><span>交付执行链</span><span>类型</span><span>状态</span><span>尝试</span><span>操作</span></div>
             {deliveryTasks.map((task) => <div className="task-row" key={task.task_id}>
-              <div><strong>{taskKindLabels[task.kind]}</strong><small>{task.state === "blocked" ? `等待 ${task.depends_on.length} 个前置任务` : task.affinity_key ?? "本地执行"}</small></div>
-              <span>{taskKindLabels[task.kind]}</span><span className={`state state-${task.state}`}>{taskStateLabels[task.state]}</span><span>{task.attempt}/{task.max_attempts}</span>
-              <div className="task-actions">
-                {["failed", "stale", "paused"].includes(task.state) && <button className="secondary-button" disabled={actionBusy || Boolean(guidedRunTarget)} onClick={() => void operatePipelineTask(task, "retry")}><RotateCcw size={14} />重试</button>}
-                {["queued", "running"].includes(task.state) && <button className="secondary-button" disabled={actionBusy} onClick={() => void operatePipelineTask(task, "cancel")}><Square size={13} />取消</button>}
-              </div>
-              {task.error_message && <div className="task-detail">{task.error_message}</div>}
+              <div><strong>{taskKindLabels[task.kind]}</strong><small>{taskExplanation(task, currentPlanTasks)}</small></div>
+              <span>{taskKindLabels[task.kind]}</span><TaskStatus state={task.state} /><span>{task.attempt}/{task.max_attempts}</span>
+              <TaskActionButtons task={task} disabled={actionBusy || executionOffline || Boolean(guidedRunTarget)} onAction={(operation, confirmed) => void operatePipelineTask(task, operation, confirmed)} />
+              <TaskDiagnostics task={task} />
             </div>)}
             {!deliveryTasks.length && <div className="table-empty">审核完成后，交付任务会在这里解锁并直接执行。</div>}
           </div>

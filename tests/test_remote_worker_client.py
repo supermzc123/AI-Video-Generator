@@ -72,13 +72,13 @@ async def test_remote_client_claim_is_retry_safe_and_result_is_idempotent(
         retry_policy=RetryPolicy(attempts=1),
     ) as client:
         await client.register(capabilities())
-        heartbeat = _heartbeat()
-        first = await client.claim(heartbeat)
-        second = await client.claim(heartbeat)
 
-        assert first is not None
-        assert second == first
-        assert first.attempt == 1
+        async def execute_once(leased: TaskSpec) -> WorkerExecutionOutcome:
+            assert leased.attempt == 1
+            assert leased.attempt_id
+            # A second client/poll cannot replay an active execution.
+            assert await client.claim(_heartbeat()) is None
+            return await execute(leased)
 
         async def execute(_: TaskSpec) -> WorkerExecutionOutcome:
             return WorkerExecutionOutcome(
@@ -89,11 +89,12 @@ async def test_remote_client_claim_is_retry_safe_and_result_is_idempotent(
         runtime = RemoteWorkerRuntime(
             client=client,
             capabilities=capabilities(),
-            executor=execute,
+            executor=execute_once,
             lease_renew_interval_seconds=60,
         )
         completed = await runtime.run_once()
-        assert completed == first
+        assert completed is not None
+        assert completed.attempt == 1
 
         destination = tmp_path / "downloaded.bin"
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()

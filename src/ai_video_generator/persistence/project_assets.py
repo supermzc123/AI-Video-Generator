@@ -28,6 +28,8 @@ from ai_video_generator.domain import (
     ProjectAssetSource,
     ProjectAssetState,
 )
+from ai_video_generator.persistence.execution_runtime import execution_guard
+from ai_video_generator.persistence.sqlite_connection import ClosingConnection
 
 MAX_PROJECT_ASSET_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 32_768
@@ -96,7 +98,9 @@ class ProjectAssetStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(
+            self.database_path, timeout=30, isolation_level=None, factory=ClosingConnection
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -258,6 +262,20 @@ class ProjectAssetStore:
         preview_content = self._make_preview(image)
         preview_sha256 = hashlib.sha256(preview_content).hexdigest()
         with self._transaction(immediate=True) as connection:
+            self._guard_generated_result(connection, source_task_id)
+            previous = connection.execute(
+                "SELECT payload_json FROM project_asset_revisions WHERE project_id=? "
+                "AND json_extract(payload_json,'$.source_task_id')=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (project_id, source_task_id),
+            ).fetchone()
+            if previous:
+                recorded = ProjectAsset.model_validate_json(previous["payload_json"])
+                if recorded.sha256 != blob_sha256:
+                    raise ProjectAssetStoreError("one task produced conflicting asset content")
+                self._write_blob_once(self.blob_path(blob_sha256), content)
+                self._write_blob_once(self.preview_path(preview_sha256), preview_content)
+                return recorded
             current = (
                 self._get_current(connection, project_id, replace_asset_id)
                 if replace_asset_id
@@ -265,9 +283,7 @@ class ProjectAssetStore:
             )
             asset_id = current.asset_id if current else str(uuid.uuid4())
             effective_shot_ids = (
-                shot_ids
-                or (current.shot_ids if current else ())
-                or ((shot_id,) if shot_id else ())
+                shot_ids or (current.shot_ids if current else ()) or ((shot_id,) if shot_id else ())
             )
             self._ensure_unique_name(
                 connection,
@@ -344,6 +360,17 @@ class ProjectAssetStore:
             created_at=datetime.now(UTC),
         )
         with self._transaction(immediate=True) as connection:
+            self._guard_generated_result(connection, source_task_id)
+            previous = connection.execute(
+                "SELECT payload_json FROM asset_generation_candidates WHERE project_id=? "
+                "AND asset_plan_id=? AND json_extract(payload_json,'$.source_task_id')=?",
+                (project_id, asset_plan_id, source_task_id),
+            ).fetchone()
+            if previous:
+                recorded = AssetGenerationCandidate.model_validate_json(previous["payload_json"])
+                if recorded.sha256 != blob_sha256:
+                    raise ProjectAssetStoreError("one task produced conflicting candidate content")
+                return recorded
             self._write_blob_once(self.blob_path(blob_sha256), content)
             if preview_sha256 is not None and preview_content is not None:
                 self._write_blob_once(self.preview_path(preview_sha256), preview_content)
@@ -384,8 +411,7 @@ class ProjectAssetStore:
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(
-            AssetGenerationCandidate.model_validate_json(row["payload_json"])
-            for row in rows
+            AssetGenerationCandidate.model_validate_json(row["payload_json"]) for row in rows
         )
 
     def generation_candidate_preview(self, candidate_id: str) -> Path:
@@ -464,10 +490,7 @@ class ProjectAssetStore:
                 else AssetGenerationCandidateState.DISCARDED
             )
             if current.state != AssetGenerationCandidateState.PENDING:
-                if (
-                    current.state == target_state
-                    and current.accepted_asset_id == accepted_asset_id
-                ):
+                if current.state == target_state and current.accepted_asset_id == accepted_asset_id:
                     return current
                 raise ValueError("asset candidate has already been resolved")
             updated = current.model_copy(
@@ -810,12 +833,17 @@ class ProjectAssetStore:
         header = content[:64]
         if header.startswith(b"\x1aE\xdf\xa3") and guessed in {"video/webm", "audio/webm"}:
             return guessed
-        if len(header) >= 12 and header[4:8] == b"ftyp" and guessed in {
-            "video/mp4",
-            "video/quicktime",
-            "audio/mp4",
-            "audio/x-m4a",
-        }:
+        if (
+            len(header) >= 12
+            and header[4:8] == b"ftyp"
+            and guessed
+            in {
+                "video/mp4",
+                "video/quicktime",
+                "audio/mp4",
+                "audio/x-m4a",
+            }
+        ):
             return guessed
         if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
             return "audio/wav"
@@ -841,13 +869,48 @@ class ProjectAssetStore:
         return target.getvalue()
 
     @staticmethod
+    def _guard_generated_result(connection: sqlite3.Connection, task_id: str) -> None:
+        guard = execution_guard.get()
+        if guard is None:
+            return
+        if guard[0] != task_id:
+            raise ProjectAssetStoreError("generated asset does not belong to the current attempt")
+        row = connection.execute(
+            "SELECT t.state,t.lease_expires_at,r.attempt_id,r.owner_id,d.expires_at "
+            "FROM tasks t JOIN task_runtime r ON r.task_id=t.task_id "
+            "LEFT JOIN dispatcher_lease d ON d.owner_id=r.owner_id AND d.lease_key='local' "
+            "WHERE t.task_id=?",
+            (task_id,),
+        ).fetchone()
+        now = datetime.now(UTC).timestamp()
+        if (
+            row is None
+            or row["attempt_id"] != guard[1]
+            or row["state"] != "running"
+            or not row["expires_at"]
+            or row["expires_at"] <= now
+            or not row["lease_expires_at"]
+            or row["lease_expires_at"] <= now
+        ):
+            raise ProjectAssetStoreError("execution no longer owns generated asset publication")
+
+    @staticmethod
     def _write_blob_once(path: Path, content: bytes) -> None:
         if path.is_file():
+            with path.open("rb") as stream:
+                if (
+                    hashlib.file_digest(stream, "sha256").digest()
+                    != hashlib.sha256(content).digest()
+                ):
+                    raise ProjectAssetStoreError("stored asset blob failed integrity validation")
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
-            temporary.write_bytes(content)
+            with temporary.open("wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
             try:
                 os.link(temporary, path)
             except FileExistsError:

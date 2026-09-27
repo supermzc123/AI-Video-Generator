@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { hydrateProject } from "./project-store";
 import type {
   ApiWorkflow,
   AgentProposal,
@@ -14,6 +15,10 @@ import type {
   ProjectMemoryEvent,
   ProjectRunState,
   TaskSpec,
+  TaskCommandRequest,
+  TaskCommandReceipt,
+  TaskEvent,
+  SchedulerHealth,
   WorkflowTemplateSummary,
   ArtifactDescriptor,
   ReviewDecision,
@@ -22,6 +27,8 @@ import type {
   AssetGenerationCandidate,
   SetupStatus,
 } from "./types";
+import { TaskCommandClient } from "./task-commands";
+import { withRequestTimeout } from "./request-timeout";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 let apiOrigin = "";
@@ -41,7 +48,8 @@ export class ApiError extends Error {
   }
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+async function requestJson<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
+  if (timeoutMs) return withRequestTimeout((signal) => requestJson<T>(path, { ...init, signal }), timeoutMs);
   const origin = await resolveApiOrigin();
   const response = await (isTauri ? tauriFetch : fetch)(`${origin}${path}`, {
     ...init,
@@ -555,11 +563,23 @@ export function getDesktopControlPlaneStatus(): Promise<DesktopControlPlaneStatu
 
 export function listTasks(projectId?: string): Promise<TaskSpec[]> {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-  return requestJson(`/api/v1/tasks${query}`);
+  return requestJson(`/api/v1/tasks${query}`, undefined, 10000);
 }
 
 export function getTask(taskId: string): Promise<TaskSpec> {
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}`);
+  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}`, undefined, 10000);
+}
+
+export const taskCommands = new TaskCommandClient((payload: TaskCommandRequest) => requestJson<TaskCommandReceipt>(
+  "/api/v1/task-commands", { method: "POST", body: JSON.stringify(payload) }, 30000,
+));
+
+export function getTaskEvents(taskId: string): Promise<TaskEvent[]> {
+  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/events`, undefined, 10000);
+}
+
+export function getSchedulerHealth(): Promise<SchedulerHealth> {
+  return requestJson("/api/v1/scheduler/health", undefined, 10000);
 }
 
 export function compileProjectTasks(projectId: string, restartH3 = false): Promise<{
@@ -635,11 +655,11 @@ export function confirmProjectReworks(projectId: string): Promise<GenerationBatc
 }
 
 export function cancelTask(taskId: string): Promise<TaskSpec> {
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }, 30000);
 }
 
 export function runTask(taskId: string): Promise<TaskSpec> {
-  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/run`, { method: "POST" });
+  return requestJson(`/api/v1/tasks/${encodeURIComponent(taskId)}/run`, { method: "POST" }, 30000);
 }
 
 export function listTaskArtifacts(taskId: string): Promise<ArtifactDescriptor[]> {
@@ -671,7 +691,7 @@ export async function getProjectWorkspace(projectId: string): Promise<ProjectDra
   const response = await requestJson<{ payload: ProjectDraft }>(
     `/api/v1/projects/${encodeURIComponent(projectId)}/workspace`,
   );
-  return response.payload;
+  return hydrateProject(response.payload);
 }
 
 export async function saveProjectToControlPlane(project: ProjectDraft): Promise<ProjectDraft> {
@@ -705,7 +725,7 @@ export async function saveProjectToControlPlane(project: ProjectDraft): Promise<
 }
 
 export function getProjectRunState(projectId: string): Promise<ProjectRunState> {
-  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/run-state`);
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/run-state`, undefined, 10000);
 }
 
 export function setProjectMode(
@@ -722,7 +742,7 @@ export function setProjectPaused(projectId: string, paused: boolean): Promise<Pr
   return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/pause`, {
     method: "POST",
     body: JSON.stringify({ paused }),
-  });
+  }, 30000);
 }
 
 export function setReviewMode(
@@ -824,7 +844,7 @@ function normalizeAgentStreamResult(
     output_sha256: typeof value.output_sha256 === "string" ? value.output_sha256 : "",
     committed_revision: typeof value.committed_revision === "number" ? value.committed_revision : null,
     committed_workspace: isRecord(value.committed_workspace)
-      ? value.committed_workspace as ProjectDraft
+      ? hydrateProject(value.committed_workspace as Partial<ProjectDraft>)
       : null,
     user_event_id: typeof value.user_event_id === "string" ? value.user_event_id : "",
     assistant_event_id: typeof value.assistant_event_id === "string" ? value.assistant_event_id : "",
@@ -873,17 +893,18 @@ export function listProjectMemory(
 }
 
 export function listBatches(): Promise<BatchRun[]> {
-  return requestJson("/api/v1/batches");
+  return requestJson("/api/v1/batches", undefined, 10000);
 }
 
 export function createBatch(batch: BatchRun): Promise<BatchRun> {
-  return requestJson("/api/v1/batches", { method: "POST", body: JSON.stringify(batch) });
+  return requestJson("/api/v1/batches", { method: "POST", body: JSON.stringify(batch) }, 30000);
 }
 
 export function transitionBatch(batchId: string, action: string): Promise<BatchRun> {
   return requestJson(
     `/api/v1/batches/${encodeURIComponent(batchId)}/${encodeURIComponent(action)}`,
     { method: "POST" },
+    30000,
   );
 }
 
@@ -891,7 +912,12 @@ export function cancelBatchProject(batchId: string, projectId: string): Promise<
   return requestJson(
     `/api/v1/batches/${encodeURIComponent(batchId)}/projects/${encodeURIComponent(projectId)}/cancel`,
     { method: "POST" },
+    30000,
   );
+}
+
+export function pauseBatchProject(batchId: string, projectId: string, paused: boolean): Promise<BatchRun> {
+  return requestJson(`/api/v1/batches/${encodeURIComponent(batchId)}/projects/${encodeURIComponent(projectId)}/${paused ? "pause" : "resume"}`, { method: "POST" }, 30000);
 }
 
 export function registerHarness(bundle: HarnessBundle): Promise<HarnessBundle> {

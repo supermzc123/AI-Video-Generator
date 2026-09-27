@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -51,6 +52,12 @@ from ai_video_generator.domain.workload import (
     WorkloadManifestRecord,
     canonical_workload_manifest_bytes,
 )
+from ai_video_generator.persistence.execution_runtime import (
+    GPU_KINDS,
+    ExecutionRuntimeMixin,
+    execution_guard,
+)
+from ai_video_generator.persistence.sqlite_connection import ClosingConnection
 from ai_video_generator.services.remote import (
     TaskResultReceipt,
     TaskResultReport,
@@ -82,7 +89,7 @@ class LeaseError(TaskStoreError):
     pass
 
 
-CONTROL_PLANE_SCHEMA_VERSION = "6"
+CONTROL_PLANE_SCHEMA_VERSION = "8"
 RUNTIME_CHAIN_VERSION = "h3-generation-v2"
 
 
@@ -136,18 +143,80 @@ _ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
 }
 
 
-class SQLiteTaskStore:
+_ALLOWED_TRANSITIONS.update(
+    {
+        TaskState.RECOVERING: frozenset(
+            {
+                TaskState.RUNNING,
+                TaskState.SUCCEEDED,
+                TaskState.RETRY_WAIT,
+                TaskState.NEEDS_ATTENTION,
+                TaskState.CANCELLING,
+                TaskState.CANCELLED,
+                TaskState.FAILED,
+            }
+        ),
+        TaskState.RETRY_WAIT: frozenset(
+            {TaskState.READY, TaskState.QUEUED, TaskState.CANCELLED, TaskState.STALE}
+        ),
+        TaskState.CANCELLING: frozenset({TaskState.CANCELLED, TaskState.NEEDS_ATTENTION}),
+        TaskState.NEEDS_ATTENTION: frozenset(
+            {
+                TaskState.RECOVERING,
+                TaskState.READY,
+                TaskState.CANCELLING,
+                TaskState.CANCELLED,
+                TaskState.FAILED,
+            }
+        ),
+    }
+)
+_ALLOWED_TRANSITIONS[TaskState.RUNNING] |= frozenset(
+    {
+        TaskState.RECOVERING,
+        TaskState.RETRY_WAIT,
+        TaskState.CANCELLING,
+        TaskState.NEEDS_ATTENTION,
+        TaskState.BLOCKED,
+    }
+)
+_ALLOWED_TRANSITIONS[TaskState.FAILED] |= frozenset({TaskState.RECOVERING})
+
+
+class SQLiteTaskStore(ExecutionRuntimeMixin):
     """Durable, local-first task store backed by one SQLite database file."""
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        llm_slots: int = 2,
+        local_lease_seconds: int = 120,
+        llm_operation_timeout_seconds: int = 300,
+        llm_timeout_seconds: int | None = None,
+    ) -> None:
+        timeout = (
+            llm_operation_timeout_seconds if llm_timeout_seconds is None else llm_timeout_seconds
+        )
+        if llm_slots < 1 or local_lease_seconds < 1 or timeout < 1:
+            raise ValueError("resource limits and lease duration must be positive")
+        self.llm_slots = llm_slots
+        self.local_lease_seconds = local_lease_seconds
+        self.llm_timeout_seconds = timeout
         self.database_path = Path(database_path)
         if str(database_path) == ":memory:":
             raise ValueError("SQLiteTaskStore requires a file-backed database")
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self._initializing = True
+        try:
+            self._initialize()
+        finally:
+            self._initializing = False
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(
+            self.database_path, timeout=30, isolation_level=None, factory=ClosingConnection
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -158,6 +227,9 @@ class SQLiteTaskStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            guard = execution_guard.get()
+            if guard and not self._initializing:
+                self.check_execution_guard(connection, self._require_task_row(connection, guard[0]))
             yield connection
             connection.commit()
         except BaseException:
@@ -167,23 +239,27 @@ class SQLiteTaskStore:
             connection.close()
 
     def _initialize(self) -> None:
-        # A control-plane database is intentionally disposable.  Never mutate an
-        # older test database in place: callers must create a clean data root.
         if self.database_path.exists() and self.database_path.stat().st_size:
             probe = sqlite3.connect(self.database_path)
             try:
                 table = probe.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_metadata'"
                 ).fetchone()
+                row = None
                 if table:
                     row = probe.execute(
                         "SELECT value FROM schema_metadata WHERE key='schema_version'"
                     ).fetchone()
-                    if row and str(row[0]) != CONTROL_PLANE_SCHEMA_VERSION:
+                    if row and str(row[0]) not in {"6", "7", "8", CONTROL_PLANE_SCHEMA_VERSION}:
                         raise TaskStoreError(
                             f"unsupported control-plane schema {row[0]}; "
-                            "create a clean database before starting"
+                            "preserve this database and use a supported migration"
                         )
+                if row and str(row[0]) in {"6", "7"}:
+                    backup_path = self.database_path.with_suffix(".pre-v8.bak")
+                    if not backup_path.exists():
+                        with sqlite3.connect(backup_path) as backup:
+                            probe.backup(backup)
             finally:
                 probe.close()
         with self._connect() as connection:
@@ -571,10 +647,7 @@ class SQLiteTaskStore:
                     ON rework_markers(project_id, state, created_at);
                 """
             )
-            connection.execute(
-                "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
-                (CONTROL_PLANE_SCHEMA_VERSION,),
-            )
+        self.initialize_execution_runtime()
 
     def put_generation_batch(self, batch: GenerationBatch) -> GenerationBatch:
         with self._transaction(immediate=True) as connection:
@@ -693,10 +766,18 @@ class SQLiteTaskStore:
         assert row is not None
         return str(row[0]).lower()
 
-    def add_task(self, task: TaskSpec) -> TaskSpec:
+    def add_task(self, task: TaskSpec, *, expected_workspace_sha256: str | None = None) -> TaskSpec:
         """Insert a task or return the existing logical task for its idempotency key."""
         now = _timestamp(_utc_now())
         with self._transaction(immediate=True) as connection:
+            if expected_workspace_sha256 is not None:
+                workspace = connection.execute(
+                    "SELECT payload_sha256 FROM project_workspace_revisions "
+                    "WHERE project_id=? ORDER BY revision DESC LIMIT 1",
+                    (task.project_id,),
+                ).fetchone()
+                if not workspace or workspace["payload_sha256"] != expected_workspace_sha256:
+                    raise StoreConflictError("project workspace changed before task registration")
             existing = connection.execute(
                 "SELECT * FROM tasks WHERE project_id = ? AND idempotency_key = ?",
                 (task.project_id, task.idempotency_key),
@@ -707,6 +788,7 @@ class SQLiteTaskStore:
                     raise IdempotencyConflictError(
                         "idempotency key is already associated with different task inputs"
                     )
+                self.attach_created_task_to_batch(connection, stored)
                 return stored
 
             same_id = connection.execute(
@@ -784,6 +866,7 @@ class SQLiteTaskStore:
                     """,
                     (task.task_id, task.comfyui_prompt_id, now),
                 )
+            self.attach_created_task_to_batch(connection, task)
             row = self._require_task_row(connection, task.task_id)
             return self._task_from_row(connection, row)
 
@@ -854,7 +937,9 @@ class SQLiteTaskStore:
         """Remove execution state while retaining project content and media."""
         with self._transaction(immediate=True) as connection:
             running = connection.execute(
-                "SELECT 1 FROM tasks WHERE project_id=? AND state IN ('queued','running') LIMIT 1",
+                "SELECT 1 FROM tasks WHERE project_id=? AND state IN "
+                "('queued','running','recovering','cancelling','needs_attention','retry_wait') "
+                "LIMIT 1",
                 (project_id,),
             ).fetchone()
             if running is not None:
@@ -1164,6 +1249,7 @@ class SQLiteTaskStore:
         changed_at = _ensure_utc(now or _utc_now())
         with self._transaction(immediate=True) as connection:
             row = self._require_task_row(connection, task_id)
+            self.check_execution_guard(connection, row)
             current = TaskState(row["state"])
             if state == current:
                 return self._task_from_row(connection, row)
@@ -1180,7 +1266,11 @@ class SQLiteTaskStore:
             if state == TaskState.RUNNING and int(row["attempt"]) >= int(row["max_attempts"]):
                 raise InvalidTaskTransitionError("task has exhausted its attempts")
 
-            clear_lease = state != TaskState.RUNNING
+            clear_lease = state not in {
+                TaskState.RUNNING,
+                TaskState.RECOVERING,
+                TaskState.CANCELLING,
+            }
             increment_attempt = int(state == TaskState.RUNNING)
             connection.execute(
                 """
@@ -1199,47 +1289,210 @@ class SQLiteTaskStore:
                     task_id,
                 ),
             )
+            self._execution_event(
+                connection,
+                task_id,
+                "state_changed",
+                {"from": current.value, "to": state.value},
+                _timestamp(changed_at),
+            )
             if state == TaskState.SUCCEEDED:
                 self._promote_ready_tasks(connection, changed_at)
             return self._task_from_row(connection, self._require_task_row(connection, task_id))
 
     def prepare_task_retry(self, task_id: str, *, now: datetime | None = None) -> TaskSpec:
-        """Reset a failed task, retaining a completed job when only collection failed."""
+        """Retry confirmed failure or resume collection without resetting execution budgets."""
         changed_at = _ensure_utc(now or _utc_now())
         with self._transaction(immediate=True) as connection:
             row = self._require_task_row(connection, task_id)
-            current = TaskState(row["state"])
-            if current not in {TaskState.FAILED, TaskState.STALE, TaskState.PAUSED}:
+            if row["state"] != "failed":
                 raise InvalidTaskTransitionError(f"task {task_id} is not at a retryable boundary")
-            if not self._dependencies_succeeded(connection, task_id):
-                raise InvalidTaskTransitionError("task dependencies have not succeeded")
-
-            # Collection is a resumable boundary: ComfyUI has already completed
-            # successfully, so retrying must read that job instead of running it again.
-            transport_timeout = str(row["error_message"] or "").strip() in {
-                "ReadTimeout",
-                "ConnectTimeout",
-                "PoolTimeout",
-                "WriteTimeout",
-            }
-            retain_comfyui_job = row["error_code"] == "local_output_collection_failed" or (
-                bool(row["comfyui_prompt_id"]) and transport_timeout
-            )
-            attempt = min(int(row["attempt"]), int(row["max_attempts"]) - 1)
-            if not retain_comfyui_job:
-                connection.execute("DELETE FROM comfyui_prompts WHERE task_id = ?", (task_id,))
+            runtime = connection.execute(
+                "SELECT * FROM task_runtime WHERE task_id=?", (task_id,)
+            ).fetchone()
+            # Collection retries observe the same external work, even after its generation
+            # budget expired. They cannot acquire permission to generate again.
+            collection = row["error_code"] == "local_output_collection_failed"
+            if collection and row["comfyui_prompt_id"]:
+                connection.execute(
+                    "UPDATE tasks SET state='recovering',lease_expires_at=NULL,updated_at=? "
+                    "WHERE task_id=?",
+                    (_timestamp(changed_at), task_id),
+                )
+                connection.execute(
+                    "INSERT INTO task_runtime(task_id,phase) VALUES(?,'reconciling') "
+                    "ON CONFLICT(task_id) DO UPDATE SET attempt_id=NULL,owner_id=NULL,"
+                    "phase='reconciling'",
+                    (task_id,),
+                )
+                self._execution_event(
+                    connection,
+                    task_id,
+                    "collection_retry",
+                    {
+                        "prompt_id": row["comfyui_prompt_id"],
+                    },
+                    _timestamp(changed_at),
+                )
+                return self._task_from_row(connection, self._require_task_row(connection, task_id))
+            if row["attempt"] >= row["max_attempts"]:
+                raise InvalidTaskTransitionError(
+                    "attempt budget exhausted; create a new generation"
+                )
+            if (
+                runtime
+                and runtime["deadline_at"]
+                and runtime["deadline_at"] <= _timestamp(changed_at)
+            ):
+                raise InvalidTaskTransitionError("task absolute deadline has expired")
+            if (row["comfyui_prompt_id"] or (runtime and runtime["submission_token"])) and (
+                not runtime or runtime["submission_state"] != "stopped"
+            ):
+                raise InvalidTaskTransitionError("external result must be reconciled before retry")
+            connection.execute("DELETE FROM comfyui_prompts WHERE task_id=?", (task_id,))
             connection.execute(
-                """
-                UPDATE tasks
-                SET state = 'ready', attempt = ?, lease_expires_at = NULL,
-                    comfyui_prompt_id = CASE WHEN ? THEN comfyui_prompt_id ELSE NULL END,
-                    error_code = NULL, error_message = NULL,
-                    updated_at = ?
-                WHERE task_id = ?
-                """,
-                (attempt, int(retain_comfyui_job), _timestamp(changed_at), task_id),
+                "UPDATE task_runtime SET attempt_id=NULL,owner_id=NULL,submission_token=NULL,"
+                "submission_state=NULL,retry_at=NULL,resume_pending=0 WHERE task_id=?",
+                (task_id,),
             )
+            state = "ready" if self._dependencies_succeeded(connection, task_id) else "blocked"
+            connection.execute(
+                "UPDATE tasks SET state=?,lease_expires_at=NULL,comfyui_prompt_id=NULL,"
+                "error_code=NULL,error_message=NULL,updated_at=? WHERE task_id=?",
+                (state, _timestamp(changed_at), task_id),
+            )
+            self._execution_event(connection, task_id, "explicit_retry", {}, _timestamp(changed_at))
             return self._task_from_row(connection, self._require_task_row(connection, task_id))
+
+    def restart_failed_orchestration(self, task_id: str) -> TaskSpec:
+        """Create a fresh bounded run after a confirmed local-only planning failure."""
+        import hashlib
+
+        changed_at = _utc_now()
+        ts = _timestamp(changed_at)
+        with self._transaction(immediate=True) as connection:
+            old = self._require_task_row(connection, task_id)
+            runtime = connection.execute(
+                "SELECT submission_token FROM task_runtime WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if (
+                old["state"] != "failed"
+                or old["kind"] != "llm_planning"
+                or old["error_code"] != "local_control_task_failed"
+                or old["comfyui_prompt_id"]
+                or (runtime and runtime["submission_token"])
+            ):
+                raise InvalidTaskTransitionError(
+                    "only confirmed local planning failure can be restarted"
+                )
+            rows = connection.execute("SELECT payload_json FROM batch_runs").fetchall()
+            matching = [
+                BatchRun.model_validate_json(row[0])
+                for row in rows
+                if any(
+                    task_id in item.task_ids for item in BatchRun.model_validate_json(row[0]).items
+                )
+            ]
+            if len(matching) != 1 or matching[0].state == BatchState.CANCELLED:
+                raise InvalidTaskTransitionError(
+                    "planning task has no unambiguous batch to restart"
+                )
+            batch = matching[0]
+            if connection.execute(
+                "SELECT 1 FROM task_dependencies WHERE dependency_task_id=?", (task_id,)
+            ).fetchone():
+                raise InvalidTaskTransitionError("planning task has downstream dependencies")
+            new_id = f"{task_id}:restart:{uuid.uuid4().hex[:12]}"
+            key = hashlib.sha256(new_id.encode()).hexdigest()
+            connection.execute(
+                "INSERT INTO tasks(task_id,project_id,kind,state,idempotency_key,input_fingerprint,"
+                "workload_manifest_sha256,execution_target,worker_id,affinity_key,priority,attempt,"
+                "max_attempts,lease_expires_at,comfyui_prompt_id,error_code,error_message,schema_version,"
+                "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    new_id,
+                    old["project_id"],
+                    old["kind"],
+                    "queued",
+                    key,
+                    old["input_fingerprint"],
+                    old["workload_manifest_sha256"],
+                    old["execution_target"],
+                    old["worker_id"],
+                    old["affinity_key"],
+                    old["priority"],
+                    0,
+                    old["max_attempts"],
+                    None,
+                    None,
+                    None,
+                    None,
+                    old["schema_version"],
+                    ts,
+                    ts,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_dependencies(task_id,dependency_task_id) "
+                "SELECT ?,dependency_task_id FROM task_dependencies WHERE task_id=?",
+                (new_id, task_id),
+            )
+            for row in connection.execute(
+                "SELECT payload_json FROM task_checkpoints WHERE task_id=? ORDER BY sequence",
+                (task_id,),
+            ).fetchall():
+                checkpoint = TaskCheckpoint.model_validate_json(row[0])
+                copied = checkpoint.model_copy(
+                    update={
+                        "task_id": new_id,
+                        "checkpoint_id": f"{new_id}:{checkpoint.sequence}",
+                    }
+                )
+                connection.execute(
+                    "INSERT INTO task_checkpoints VALUES(?,?,?,?,?)",
+                    (
+                        copied.checkpoint_id,
+                        new_id,
+                        copied.sequence,
+                        copied.model_dump_json(),
+                        _timestamp(copied.created_at),
+                    ),
+                )
+            items = tuple(
+                item.model_copy(
+                    update={
+                        "task_ids": tuple(
+                            new_id if value == task_id else value for value in item.task_ids
+                        )
+                    }
+                )
+                if task_id in item.task_ids
+                else item
+                for item in batch.items
+            )
+            updated = batch.model_copy(
+                update={
+                    "items": items,
+                    "state": (
+                        BatchState.PAUSED
+                        if batch.state == BatchState.PAUSED
+                        else BatchState.RUNNING
+                    ),
+                    "updated_at": changed_at,
+                }
+            )
+            connection.execute(
+                "UPDATE batch_runs SET state=?,payload_json=?,updated_at=? WHERE batch_id=?",
+                (updated.state.value, updated.model_dump_json(), ts, batch.batch_id),
+            )
+            self._execution_event(
+                connection,
+                new_id,
+                "restart_from_failed_orchestration",
+                {"previous_task_id": task_id},
+                ts,
+            )
+            return self._task_from_row(connection, self._require_task_row(connection, new_id))
 
     def claim_next(
         self,
@@ -1263,7 +1516,7 @@ class SQLiteTaskStore:
             if execution_target is not None:
                 params.append(execution_target.value)
             params.append(resident_affinity_key or "")
-            row = connection.execute(
+            candidates = connection.execute(
                 f"""
                 SELECT task.* FROM tasks AS task
                 LEFT JOIN project_run_states AS run ON run.project_id = task.project_id
@@ -1277,10 +1530,47 @@ class SQLiteTaskStore:
                           + MIN(100,
                             CAST((? - task.created_at) / 300 AS INTEGER))) DESC,
                          task.created_at, task.task_id
-                LIMIT 1
                 """,  # noqa: S608 - the optional clause is a constant selected above
                 (*params, _timestamp(claimed_at)),
-            ).fetchone()
+            ).fetchall()
+            occupied = connection.execute(
+                "SELECT * FROM tasks WHERE worker_id=? "
+                "AND state IN ('running','recovering','cancelling','needs_attention')",
+                (worker_id,),
+            ).fetchall()
+            # A polling Worker has one runtime loop. A second client with the same
+            # Worker ID must not receive another lease while prior work is uncertain.
+            if execution_target == ExecutionTarget.REMOTE and occupied:
+                return None
+            row = None
+            for candidate in candidates:
+                candidate_id = candidate["task_id"]
+                if not self._dependencies_succeeded(connection, candidate_id) or self._batch_paused(
+                    connection, candidate_id
+                ):
+                    continue
+                gpu = TaskKind(candidate["kind"]) in GPU_KINDS or (
+                    candidate["kind"] == "whisper" and candidate["workload_manifest_sha256"]
+                )
+                if gpu and any(
+                    TaskKind(other["kind"]) in GPU_KINDS
+                    or (other["kind"] == "whisper" and other["workload_manifest_sha256"])
+                    for other in occupied
+                ):
+                    continue
+                runtime = connection.execute(
+                    "SELECT * FROM task_runtime WHERE task_id=?", (candidate_id,)
+                ).fetchone()
+                deadline = runtime["deadline_at"] if runtime else None
+                if deadline and deadline <= _timestamp(claimed_at):
+                    connection.execute(
+                        "UPDATE tasks SET state='failed',error_code='deadline_exceeded',"
+                        "updated_at=? WHERE task_id=?",
+                        (_timestamp(claimed_at), candidate_id),
+                    )
+                    continue
+                row = candidate
+                break
             if row is None:
                 return None
             task_id = str(row["task_id"])
@@ -1302,6 +1592,28 @@ class SQLiteTaskStore:
             )
             if updated.rowcount != 1:
                 return None
+            attempt_id = str(uuid.uuid4())
+            deadline = deadline or _timestamp(claimed_at) + (
+                14400 if gpu else self.llm_timeout_seconds
+            )
+            connection.execute(
+                "INSERT INTO task_runtime(task_id,attempt_id,owner_id,deadline_at,phase,"
+                "last_activity_at) VALUES(?,?,?,?,'executing',?) "
+                "ON CONFLICT(task_id) DO UPDATE SET attempt_id=excluded.attempt_id,"
+                "owner_id=excluded.owner_id,deadline_at=excluded.deadline_at,"
+                "phase='executing',last_activity_at=excluded.last_activity_at",
+                (task_id, attempt_id, worker_id, deadline, _timestamp(claimed_at)),
+            )
+            self._execution_event(
+                connection,
+                task_id,
+                "remote_claimed",
+                {
+                    "attempt_id": attempt_id,
+                    "worker_id": worker_id,
+                },
+                _timestamp(claimed_at),
+            )
             return self._task_from_row(connection, self._require_task_row(connection, task_id))
 
     def renew_lease(
@@ -1310,6 +1622,7 @@ class SQLiteTaskStore:
         worker_id: str,
         *,
         lease_duration: timedelta,
+        attempt_id: str | None = None,
         now: datetime | None = None,
     ) -> TaskSpec:
         if lease_duration <= timedelta(0):
@@ -1317,8 +1630,19 @@ class SQLiteTaskStore:
         renewed_at = _ensure_utc(now or _utc_now())
         with self._transaction(immediate=True) as connection:
             row = self._require_task_row(connection, task_id)
-            if row["state"] != TaskState.RUNNING.value or row["worker_id"] != worker_id:
+            if row["state"] not in {"running", "cancelling"} or row["worker_id"] != worker_id:
                 raise LeaseError("only the worker holding a running task may renew its lease")
+            runtime = connection.execute(
+                "SELECT * FROM task_runtime WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if not attempt_id or not runtime or runtime["attempt_id"] != attempt_id:
+                raise LeaseError("lease renewal requires the current attempt identity")
+            if (
+                row["state"] != "cancelling"
+                and runtime["deadline_at"]
+                and runtime["deadline_at"] <= _timestamp(renewed_at)
+            ):
+                raise LeaseError("task absolute deadline has expired")
             lease_timestamp = row["lease_expires_at"]
             if lease_timestamp is None or float(lease_timestamp) <= _timestamp(renewed_at):
                 raise LeaseError("expired leases cannot be renewed")
@@ -1330,6 +1654,10 @@ class SQLiteTaskStore:
                     task_id,
                 ),
             )
+            connection.execute(
+                "UPDATE task_runtime SET last_activity_at=? WHERE task_id=?",
+                (_timestamp(renewed_at), task_id),
+            )
             return self._task_from_row(connection, self._require_task_row(connection, task_id))
 
     def active_lease_for_worker(
@@ -1340,7 +1668,7 @@ class SQLiteTaskStore:
             row = connection.execute(
                 """
                 SELECT * FROM tasks
-                WHERE worker_id = ? AND state = 'running'
+                WHERE worker_id = ? AND state IN ('running','cancelling')
                   AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
                 ORDER BY updated_at, task_id LIMIT 1
                 """,
@@ -1373,11 +1701,52 @@ class SQLiteTaskStore:
                 )
 
             row = self._require_task_row(connection, report.task_id)
-            if row["state"] != TaskState.RUNNING.value or row["worker_id"] != report.worker_id:
+            cancelling = row["state"] == TaskState.CANCELLING.value
+            if (
+                row["state"] not in {"running", "cancelling"}
+                or row["worker_id"] != report.worker_id
+            ):
                 raise LeaseError("only the Worker holding a running task may report its result")
+            if report.status == WorkerResultStatus.CANCELLED and not cancelling:
+                raise LeaseError("cancellation acknowledgement requires a cancelling task")
+            if cancelling:
+                if report.status == WorkerResultStatus.NEEDS_ATTENTION:
+                    target_state = TaskState.CANCELLING
+                elif report.status != WorkerResultStatus.CANCELLED:
+                    raise LeaseError("cancelled execution must report verified stop or uncertainty")
             if int(row["attempt"]) != report.attempt:
                 raise LeaseError("result attempt does not match the active lease")
-            if target_state not in _ALLOWED_TRANSITIONS[TaskState.RUNNING]:
+            runtime = connection.execute(
+                "SELECT * FROM task_runtime WHERE task_id=?", (report.task_id,)
+            ).fetchone()
+            if not report.attempt_id or not runtime or runtime["attempt_id"] != report.attempt_id:
+                raise LeaseError("result requires the current attempt identity")
+            if not row["lease_expires_at"] or row["lease_expires_at"] <= _timestamp(accepted_at):
+                raise LeaseError("expired leases cannot publish results")
+            if report.external_prompt_id:
+                if row["comfyui_prompt_id"] not in {None, report.external_prompt_id}:
+                    raise StoreConflictError("conflicting remote prompt identity")
+                connection.execute(
+                    "UPDATE tasks SET comfyui_prompt_id=? WHERE task_id=?",
+                    (report.external_prompt_id, report.task_id),
+                )
+            if report.submission_token:
+                if runtime["submission_token"] not in {None, report.submission_token}:
+                    raise StoreConflictError("conflicting remote submission identity")
+                connection.execute(
+                    "UPDATE task_runtime SET submission_token=? WHERE task_id=?",
+                    (report.submission_token, report.task_id),
+                )
+            if not cancelling and not self._dependencies_succeeded(connection, report.task_id):
+                raise LeaseError("task dependencies no longer authorize publication")
+            retry_at = None
+            if report.status == WorkerResultStatus.FAILED and report.retryable:
+                proposed = _timestamp(accepted_at) + min(60, 2 ** max(1, row["attempt"]))
+                if row["attempt"] < row["max_attempts"] and (
+                    not runtime["deadline_at"] or proposed < runtime["deadline_at"]
+                ):
+                    target_state, retry_at = TaskState.RETRY_WAIT, proposed
+            if not cancelling and target_state not in _ALLOWED_TRANSITIONS[TaskState.RUNNING]:
                 raise InvalidTaskTransitionError(
                     f"invalid remote result state: {target_state.value}"
                 )
@@ -1411,6 +1780,38 @@ class SQLiteTaskStore:
                     _timestamp(accepted_at),
                 ),
             )
+            connection.execute(
+                "UPDATE task_runtime SET owner_id=NULL,submission_state=?,last_activity_at=?,"
+                "retry_at=? "
+                "WHERE task_id=?",
+                (
+                    "stopped"
+                    if report.status in {WorkerResultStatus.FAILED, WorkerResultStatus.CANCELLED}
+                    else (
+                        "unknown"
+                        if target_state in {TaskState.NEEDS_ATTENTION, TaskState.CANCELLING}
+                        else "completed"
+                    ),
+                    _timestamp(accepted_at),
+                    retry_at,
+                    report.task_id,
+                ),
+            )
+            self._execution_event(
+                connection,
+                report.task_id,
+                "remote_result",
+                {
+                    "attempt_id": report.attempt_id,
+                    "status": report.status.value,
+                    "state": target_state.value,
+                    "retry_at": retry_at,
+                    "stop_evidence": report.stop_evidence,
+                    "submission_token": report.submission_token,
+                    "external_prompt_id": report.external_prompt_id,
+                },
+                _timestamp(accepted_at),
+            )
             if report.status == WorkerResultStatus.SUCCEEDED:
                 self._promote_ready_tasks(connection, accepted_at)
             return TaskResultReceipt(
@@ -1421,51 +1822,44 @@ class SQLiteTaskStore:
             )
 
     def recover_expired_leases(self, *, now: datetime | None = None) -> tuple[str, ...]:
-        """Recover expired work, preserving submitted Comfy prompts for reconciliation."""
+        """Lease expiry fences ownership; it is never proof that a Worker stopped."""
         recovered_at = _ensure_utc(now or _utc_now())
-        recovered: list[str] = []
+        recovered = list(self.recover_local_attempts(now=recovered_at))
+        ts = _timestamp(recovered_at)
         with self._transaction(immediate=True) as connection:
             rows = connection.execute(
-                """
-                SELECT * FROM tasks
-                WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
-                ORDER BY created_at, task_id
-                """,
-                (_timestamp(recovered_at),),
+                "SELECT * FROM tasks WHERE execution_target='remote' "
+                "AND state IN ('running','cancelling') "
+                "AND (lease_expires_at IS NULL OR lease_expires_at<=?) "
+                "AND NOT EXISTS (SELECT 1 FROM task_runtime r WHERE r.task_id=tasks.task_id "
+                "AND r.phase='remote_result_unknown') ORDER BY created_at,task_id",
+                (ts,),
             ).fetchall()
             for row in rows:
-                task_id = str(row["task_id"])
-                if row["comfyui_prompt_id"] is not None:
-                    connection.execute(
-                        """
-                        UPDATE tasks SET lease_expires_at = NULL, updated_at = ?
-                        WHERE task_id = ?
-                        """,
-                        (_timestamp(recovered_at), task_id),
-                    )
-                elif int(row["attempt"]) < int(row["max_attempts"]):
-                    connection.execute(
-                        """
-                        UPDATE tasks
-                        SET state = 'ready', lease_expires_at = NULL,
-                            error_code = 'lease_expired',
-                            error_message = 'worker lease expired before completion', updated_at = ?
-                        WHERE task_id = ?
-                        """,
-                        (_timestamp(recovered_at), task_id),
-                    )
-                else:
-                    connection.execute(
-                        """
-                        UPDATE tasks
-                        SET state = 'failed', lease_expires_at = NULL,
-                            error_code = 'lease_expired',
-                            error_message = 'worker lease expired on the final attempt',
-                            updated_at = ?
-                        WHERE task_id = ?
-                        """,
-                        (_timestamp(recovered_at), task_id),
-                    )
+                task_id = row["task_id"]
+                state = "cancelling" if row["state"] == "cancelling" else "needs_attention"
+                connection.execute(
+                    "UPDATE tasks SET state=?,lease_expires_at=NULL,error_code='lease_expired',"
+                    "error_message='Remote execution outcome is unknown; reconcile before retry',"
+                    "updated_at=? WHERE task_id=?",
+                    (state, ts, task_id),
+                )
+                connection.execute(
+                    "INSERT INTO task_runtime(task_id,phase) VALUES(?,'remote_result_unknown') "
+                    "ON CONFLICT(task_id) DO UPDATE SET attempt_id=NULL,owner_id=NULL,"
+                    "phase='remote_result_unknown'",
+                    (task_id,),
+                )
+                self._execution_event(
+                    connection,
+                    task_id,
+                    "remote_lease_expired",
+                    {
+                        "worker_id": row["worker_id"],
+                        "state": state,
+                    },
+                    ts,
+                )
                 recovered.append(task_id)
         return tuple(recovered)
 
@@ -1543,7 +1937,8 @@ class SQLiteTaskStore:
                 """
                 SELECT p.* FROM comfyui_prompts p
                 JOIN tasks t ON t.task_id = p.task_id
-                WHERE p.reconciled_at IS NULL AND t.state = 'running'
+                WHERE p.reconciled_at IS NULL
+                AND t.state IN ('running','recovering','cancelling','needs_attention')
                 ORDER BY p.submitted_at, p.task_id
                 """
             ).fetchall()
@@ -1806,9 +2201,7 @@ class SQLiteTaskStore:
                     connection.execute(
                         "DELETE FROM harness_bundles WHERE harness_id=?", (harness_id,)
                     )
-            connection.execute(
-                "DELETE FROM workflow_revisions WHERE template_id=?", (template_id,)
-            )
+            connection.execute("DELETE FROM workflow_revisions WHERE template_id=?", (template_id,))
             return len(rows)
 
     def put_h3_workflow_profile_revision(
@@ -2066,9 +2459,7 @@ class SQLiteTaskStore:
         if isinstance(approvals, dict):
             update["outline_approved"] = "outline" in approvals
         if isinstance(active_stage, str) and active_stage:
-            update["current_stage"] = (
-                "generation" if active_stage == "review" else active_stage
-            )
+            update["current_stage"] = "generation" if active_stage == "review" else active_stage
         return state.model_copy(update=update) if update else state
 
     def request_project_mode(
@@ -2301,7 +2692,7 @@ class SQLiteTaskStore:
             BatchState.DRAFT: {BatchState.RUNNING, BatchState.CANCELLED},
             BatchState.RUNNING: {BatchState.PAUSED, BatchState.COMPLETED, BatchState.CANCELLED},
             BatchState.PAUSED: {BatchState.RUNNING, BatchState.CANCELLED},
-            BatchState.COMPLETED: set(),
+            BatchState.COMPLETED: {BatchState.RUNNING},
             BatchState.CANCELLED: set(),
         }
         with self._transaction(immediate=True) as connection:
@@ -2314,7 +2705,13 @@ class SQLiteTaskStore:
                     raise StoreConflictError(
                         f"cannot transition batch from {stored.state.value} to {batch.state.value}"
                     )
-                if batch.created_at != stored.created_at or batch.items != stored.items:
+
+                def immutable_items(items):
+                    return tuple(item.model_dump(exclude={"paused"}) for item in items)
+
+                if batch.created_at != stored.created_at or (
+                    immutable_items(batch.items) != immutable_items(stored.items)
+                ):
                     raise StoreConflictError("batch membership is immutable after creation")
                 connection.execute(
                     "UPDATE batch_runs SET state = ?, payload_json = ?, updated_at = ? "
@@ -2366,12 +2763,12 @@ class SQLiteTaskStore:
             if row is None:
                 raise StoreConflictError(f"batch {batch_id} does not exist")
             batch = BatchRun.model_validate_json(row["payload_json"])
-            if batch.state != BatchState.RUNNING:
-                raise StoreConflictError("only a running batch can expand compiled tasks")
+            if batch.state not in {BatchState.RUNNING, BatchState.PAUSED}:
+                raise StoreConflictError("only an active batch can expand compiled tasks")
             item = next((value for value in batch.items if value.project_id == project_id), None)
             if item is None or orchestration_task_id not in item.task_ids:
                 raise StoreConflictError("batch project does not contain the orchestration task")
-            expanded_ids = tuple(dict.fromkeys((orchestration_task_id, *task_ids)))
+            expanded_ids = tuple(dict.fromkeys((*item.task_ids, orchestration_task_id, *task_ids)))
             if expanded_ids:
                 placeholders = ",".join("?" for _ in expanded_ids)
                 rows = connection.execute(
@@ -2534,9 +2931,50 @@ class SQLiteTaskStore:
             ).fetchone()
             if existing is not None:
                 stored = TaskCheckpoint.model_validate_json(existing["payload_json"])
-                if stored != checkpoint:
+                if stored.model_dump(exclude={"created_at"}) != checkpoint.model_dump(
+                    exclude={"created_at"}
+                ):
                     raise StoreConflictError("checkpoint ID is immutable")
                 return stored
+            connection.execute(
+                "INSERT INTO task_checkpoints("
+                "checkpoint_id, task_id, sequence, payload_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    checkpoint.checkpoint_id,
+                    checkpoint.task_id,
+                    checkpoint.sequence,
+                    checkpoint.model_dump_json(),
+                    _timestamp(checkpoint.created_at),
+                ),
+            )
+        return checkpoint
+
+    def append_task_checkpoint(
+        self,
+        task_id: str,
+        phase: str,
+        payload: dict[str, object] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> TaskCheckpoint:
+        created_at = _ensure_utc(now or _utc_now())
+        with self._transaction(immediate=True) as connection:
+            self._require_task_row(connection, task_id)
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+                "FROM task_checkpoints WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            sequence = int(row["next_sequence"])
+            checkpoint = TaskCheckpoint(
+                checkpoint_id=f"{task_id}:{sequence}:{phase}",
+                task_id=task_id,
+                sequence=sequence,
+                phase=phase,
+                payload=payload or {},
+                created_at=created_at,
+            )
             connection.execute(
                 "INSERT INTO task_checkpoints("
                 "checkpoint_id, task_id, sequence, payload_json, created_at"
@@ -3172,6 +3610,7 @@ class SQLiteTaskStore:
             comfyui_prompt_id=row["comfyui_prompt_id"],
             error_code=row["error_code"],
             error_message=row["error_message"],
+            **self.execution_metadata(connection, row),
         )
 
     def _dependencies_succeeded(self, connection: sqlite3.Connection, task_id: str) -> bool:
@@ -3188,7 +3627,12 @@ class SQLiteTaskStore:
         return int(row["incomplete"]) == 0
 
     def _assert_can_be_ready(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
-        if int(row["attempt"]) >= int(row["max_attempts"]):
+        runtime = connection.execute(
+            "SELECT resume_pending FROM task_runtime WHERE task_id=?", (row["task_id"],)
+        ).fetchone()
+        if int(row["attempt"]) >= int(row["max_attempts"]) and not (
+            runtime and runtime["resume_pending"]
+        ):
             raise InvalidTaskTransitionError("task has exhausted its attempts")
         if not self._dependencies_succeeded(connection, str(row["task_id"])):
             raise InvalidTaskTransitionError("task dependencies have not succeeded")
@@ -3201,7 +3645,9 @@ class SQLiteTaskStore:
             SELECT task.task_id
             FROM tasks task
             WHERE task.state = 'blocked'
-              AND task.attempt < task.max_attempts
+              AND (task.attempt < task.max_attempts OR EXISTS (
+                  SELECT 1 FROM task_runtime r WHERE r.task_id=task.task_id AND r.resume_pending=1
+              ))
               AND NOT EXISTS (
                   SELECT 1
                   FROM task_dependencies d

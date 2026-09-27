@@ -392,6 +392,54 @@ class ComfyUIAdapter:
             raise ValueError("ComfyUI returned an empty image output")
         return response.content
 
+    async def queued_prompt_ids(self) -> set[str]:
+        async with self._client() as client:
+            response = await client.get("/queue")
+            response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("ComfyUI queue response must be an object")
+        return _queue_prompt_ids(payload.get("queue_running")) | _queue_prompt_ids(
+            payload.get("queue_pending")
+        )
+
+    async def find_submission(self, token: str) -> str | None:
+        """Recover an accepted submission whose HTTP response was lost."""
+        async with self._client() as client:
+            queue = await client.get("/queue")
+            queue.raise_for_status()
+            history = await client.get("/history", params={"max_items": 1000})
+            history.raise_for_status()
+        queued = queue.json()
+        completed = history.json()
+        if not isinstance(queued, dict) or not isinstance(completed, dict):
+            raise ValueError("invalid ComfyUI reconciliation response")
+        entries = []
+        for key in ("queue_running", "queue_pending"):
+            values = queued.get(key)
+            if not isinstance(values, list):
+                raise ValueError(f"ComfyUI {key} response must be a list")
+            entries.extend(values)
+        for value in completed.values():
+            if not isinstance(value, dict):
+                raise ValueError("ComfyUI history entries must be objects")
+            prompt = value.get("prompt")
+            if prompt is not None:
+                entries.append(prompt)
+        matches: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) <= 3:
+                raise ValueError("malformed ComfyUI queue/history prompt entry")
+            prompt_id = entry[1]
+            metadata = entry[3]
+            if not isinstance(prompt_id, (str, int)) or not isinstance(metadata, dict):
+                raise ValueError("malformed ComfyUI submission identity")
+            if metadata.get("avg_submission_token") == token:
+                matches.add(str(prompt_id))
+        if len(matches) > 1:
+            raise ValueError("multiple ComfyUI jobs match one submission intent")
+        return next(iter(matches), None)
+
     async def free_models(self, *, unload_models: bool = True) -> None:
         """Ask ComfyUI to release resident models between encoding and diffusion phases."""
         async with self._client() as client:

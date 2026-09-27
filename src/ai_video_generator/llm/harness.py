@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import copy
 import json
+import uuid
 from collections.abc import Callable, Sequence
 from typing import Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from .client import ChatMessage, ImageURL, ImageURLContentPart, TextContentPart
+from .budget import claim_business_repair, llm_operation
+from .client import (
+    ChatMessage,
+    ImageURL,
+    ImageURLContentPart,
+    TextContentPart,
+    validate_message_limits,
+    validate_output_limit,
+)
+from .context import structured_source_context
 from .harness_files import load_harness
 from .models import (
     StructuredOperationRequest,
@@ -17,7 +28,7 @@ from .models import (
     validate_workflow_mapping,
 )
 
-MAX_REPAIR_ATTEMPTS = 3
+MAX_REPAIR_ATTEMPTS = 1
 
 WORKSPACE_VALUE_CONTRACTS: dict[str, object] = {
     "idea": {
@@ -69,8 +80,7 @@ WORKSPACE_VALUE_CONTRACTS: dict[str, object] = {
                     "properties": {
                         "id": "string",
                         "durationSeconds": (
-                            "4-15 seconds for first segment, "
-                            "4-12 seconds thereafter"
+                            "4-15 seconds for first segment, 4-12 seconds thereafter"
                         ),
                         "summary": "string including this segment's action and inherited end state",
                     },
@@ -210,13 +220,34 @@ def build_structured_operation_messages(
     system = _system_with_highest_instruction(
         load_harness("project-lead.md"), request.highest_instruction
     )
+    request_context = request.model_dump(mode="json")
+    request_context["source_document"] = structured_source_context(
+        request.source_document, request.allowed_paths, request.operation
+    )
+    contracts = copy.deepcopy(WORKSPACE_VALUE_CONTRACTS)
+    server_fields = {
+        "outline_item": {"id"},
+        "shot_item": {"id", "seed", "locked"},
+        "asset_plan_item": {"id", "fulfilledByAssetId", "state", "resolutionSource"},
+        "image_prompt_item": {"id", "revision", "locked", "harnessRevision", "workflowTemplateId"},
+    }
+    for name, fields in server_fields.items():
+        contracts[name]["required"] = [
+            field for field in contracts[name]["required"] if field not in fields
+        ]
+        contracts[name]["serverManagedFields"] = sorted(fields)
     payload = {
         "task": request.operation,
         "contract": {
             "allowed_paths": request.allowed_paths,
             "locked_paths": request.locked_paths,
             "response_schema": StructuredOperationResponse.model_json_schema(),
-            "workspace_value_contracts": WORKSPACE_VALUE_CONTRACTS,
+            "workspace_value_contracts": contracts,
+            "server_field_policy": (
+                "Omit IDs, seeds, lock flags, versions, fulfillment and execution state for new "
+                "items: the server supplies them. Preserve the ID when editing an existing item. "
+                "Never invent asset references or modify a locked item. Return only changed paths."
+            ),
             "motion_context_contract": {
                 "required_when": [
                     "shot duration exceeds the single-segment limit",
@@ -257,11 +288,9 @@ def build_structured_operation_messages(
                 "When replacing an array, every item must be complete and match its item contract."
             ),
         },
-        "context": request.model_dump(mode="json"),
+        "context": request_context,
     }
-    user_content: str | tuple[TextContentPart | ImageURLContentPart, ...] = _canonical_json(
-        payload
-    )
+    user_content: str | tuple[TextContentPart | ImageURLContentPart, ...] = _canonical_json(payload)
     if asset_image_urls:
         user_content = (
             TextContentPart(text=user_content),
@@ -304,12 +333,106 @@ def parse_structured_operation(
     request: StructuredOperationRequest,
 ) -> StructuredOperationResponse:
     try:
-        response = StructuredOperationResponse.model_validate(_decode_json_object(content))
-        enforce_patch_scope(request, response)
+        response = StructuredOperationResponse.model_validate(
+            _fill_server_fields(_decode_json_object(content), request)
+        )
+        candidate = enforce_patch_scope(request, response)
         _validate_workspace_patch_values(response)
+        for root in ("/outline", "/shots", "/assetPlans", "/prompts/imagePrompts"):
+            if not any(
+                patch.path == root or patch.path.startswith(root + "/")
+                for patch in response.patches
+            ):
+                continue
+            value = candidate
+            for key in root.strip("/").split("/"):
+                value = value.get(key) if isinstance(value, dict) else None
+            if value is not None:
+                _validate_workspace_patch_values(
+                    StructuredOperationResponse.model_validate(
+                        {
+                            "operation_id": request.operation_id,
+                            "rationale": "Validate the resulting edited collection",
+                            "patches": [{"op": "replace", "path": root, "value": value}],
+                        }
+                    )
+                )
     except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
         raise HarnessValidationError("invalid structured operation", (str(exc),)) from exc
     return response
+
+
+def _fill_server_fields(data: object, request: StructuredOperationRequest) -> object:
+    if not isinstance(data, dict):
+        return data
+    data = copy.deepcopy(data)
+    data.setdefault("operation_id", request.operation_id)
+    source = request.source_document
+    prompts = source.get("prompts") if isinstance(source.get("prompts"), dict) else {}
+    collections = {
+        "/outline": source.get("outline", []),
+        "/shots": source.get("shots", []),
+        "/assetPlans": source.get("assetPlans", []),
+        "/prompts/imagePrompts": prompts.get("imagePrompts", []),
+    }
+    for patch_index, patch in enumerate(data.get("patches", [])):
+        if not isinstance(patch, dict) or patch.get("op") == "remove":
+            continue
+        path = patch.get("path", "")
+        if not isinstance(path, str):
+            continue
+        for root, old_items in collections.items():
+            if path == root and isinstance(patch.get("value"), list):
+                items = patch["value"]
+            elif (
+                path.startswith(root + "/")
+                and "/" not in path[len(root) + 1 :]
+                and isinstance(patch.get("value"), dict)
+            ):
+                items = [patch["value"]]
+            else:
+                continue
+            known = {str(item.get("id")): item for item in old_items if isinstance(item, dict)}
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                item.setdefault(
+                    "id",
+                    str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"{request.operation_id}:{path}:{patch_index}:{index}",
+                        )
+                    ),
+                )
+                old = known.get(str(item["id"]), {})
+                if root == "/shots":
+                    item.setdefault(
+                        "seed",
+                        old.get(
+                            "seed", int(uuid.uuid5(uuid.NAMESPACE_URL, item["id"]).hex[:8], 16)
+                        ),
+                    )
+                    item.setdefault("locked", old.get("locked", False))
+                    for segment_index, segment in enumerate(item.get("motionSegments") or []):
+                        if isinstance(segment, dict):
+                            segment.setdefault("id", f"{item['id']}.C{segment_index + 1:02d}")
+                elif root == "/assetPlans":
+                    for field, default in (
+                        ("fulfilledByAssetId", None),
+                        ("state", "draft"),
+                        ("resolutionSource", "default"),
+                    ):
+                        item.setdefault(field, old.get(field, default))
+                elif root == "/prompts/imagePrompts":
+                    for field, default in (
+                        ("revision", 1),
+                        ("locked", False),
+                        ("harnessRevision", None),
+                        ("workflowTemplateId", None),
+                    ):
+                        item.setdefault(field, old.get(field, default))
+    return data
 
 
 def _require_complete_object(
@@ -373,7 +496,11 @@ def _validate_workspace_patch_values(response: StructuredOperationResponse) -> N
             "revision",
         },
     }
-    optional_fields = {"/shots": {"motionSegments"}, "/assetPlans": {"shotIds"}}
+    optional_fields = {
+        "/shots": {"motionSegments"},
+        "/assetPlans": {"shotIds"},
+        "/prompts/imagePrompts": {"inputFingerprint"},
+    }
     for patch in response.patches:
         if patch.op.value == "remove":
             continue
@@ -401,9 +528,7 @@ def _validate_workspace_patch_values(response: StructuredOperationResponse) -> N
                     _validate_workspace_item_types(root, item, patch.path)
 
 
-def _validate_workspace_item_types(
-    root: str, item: dict[str, object], label: str
-) -> None:
+def _validate_workspace_item_types(root: str, item: dict[str, object], label: str) -> None:
     def is_number(value: object) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -461,9 +586,7 @@ def _validate_workspace_item_types(
                 raise ValueError(f"{label}.motionSegments[{index}].summary must be non-empty")
             total += float(duration)
         if abs(total - float(item["durationSeconds"])) > 0.01:
-            raise ValueError(
-                f"{label}.motionSegments durations must sum to durationSeconds"
-            )
+            raise ValueError(f"{label}.motionSegments durations must sum to durationSeconds")
     if root == "/assetPlans":
         if item["kind"] not in {"character", "scene", "prop", "style"}:
             raise ValueError(f"{label}.kind is invalid")
@@ -501,8 +624,7 @@ def _validate_workspace_item_types(
         ):
             raise ValueError(f"{label}.workflowTemplateId must be a string or null")
         if item["harnessRevision"] is not None and (
-            not isinstance(item["harnessRevision"], int)
-            or item["harnessRevision"] < 1
+            not isinstance(item["harnessRevision"], int) or item["harnessRevision"] < 1
         ):
             raise ValueError(f"{label}.harnessRevision must be a positive integer or null")
         references = item["referenceAssetIds"]
@@ -558,9 +680,7 @@ class LLMHarness:
         asset_image_urls: tuple[str, ...] = (),
     ) -> StructuredOperationResponse:
         return await self._run_with_repairs(
-            build_structured_operation_messages(
-                request, asset_image_urls=asset_image_urls
-            ),
+            build_structured_operation_messages(request, asset_image_urls=asset_image_urls),
             lambda content: parse_structured_operation(content, request),
         )
 
@@ -569,15 +689,22 @@ class LLMHarness:
         base_messages: tuple[ChatMessage, ...],
         parser: Callable[[str], T],
     ) -> T:
+        async with llm_operation():
+            return await self._run_bounded(base_messages, parser)
+
+    async def _run_bounded(
+        self, base_messages: tuple[ChatMessage, ...], parser: Callable[[str], T]
+    ) -> T:
         messages = base_messages
         failures: list[str] = []
         for attempt in range(self._max_repair_attempts + 1):
-            content = await self._client.complete_json(messages)
+            validate_message_limits(messages)
+            content = validate_output_limit(await self._client.complete_json(messages))
             try:
                 return parser(content)
             except HarnessValidationError as exc:
                 failures.extend(exc.errors)
-                if attempt == self._max_repair_attempts:
+                if attempt == self._max_repair_attempts or not claim_business_repair():
                     raise HarnessValidationError(
                         "LLM response remained invalid after repair attempts",
                         tuple(failures),

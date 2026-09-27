@@ -10,11 +10,21 @@ from typing import Annotated, Any, Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from .budget import (
+    DEFAULT_OPERATION_SECONDS,
+    MAX_CONTEXT_CHARACTERS,
+    MAX_MEDIA_CHARACTERS,
+    MAX_MEDIA_PARTS,
+    MAX_OUTPUT_CHARACTERS,
+    MAX_OUTPUT_TOKENS,
+    llm_operation,
+    provider_request,
+)
+from .errors import LLMClientError
 
-class LLMClientError(RuntimeError):
-    def __init__(self, message: str, *, response_started: bool = False) -> None:
-        super().__init__(message)
-        self.response_started = response_started
+
+class _StreamingUnsupported(LLMClientError):
+    pass
 
 
 llm_delta_callback: ContextVar[Callable[[str], None] | None] = ContextVar(
@@ -91,11 +101,17 @@ class OpenAICompatibleClient:
         stream_idle_timeout_seconds: float = 600,
         proxy: str | None = None,
         http_client: httpx.AsyncClient | None = None,
+        operation_timeout_seconds: float = DEFAULT_OPERATION_SECONDS,
+        concurrency: int = 2,
+        max_output_tokens: int = MAX_OUTPUT_TOKENS,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._owns_client = http_client is None
         self._api_key = api_key
+        self._operation_timeout_seconds = operation_timeout_seconds
+        self._concurrency = concurrency
+        self._max_output_tokens = max_output_tokens
         self._first_token_timeout_seconds = (
             first_token_timeout_seconds
             if first_token_timeout_seconds is not None
@@ -112,41 +128,44 @@ class OpenAICompatibleClient:
         )
 
     async def complete_json(self, messages: Sequence[ChatMessage]) -> str:
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": [message.model_dump() for message in messages],
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        }
-        callback = llm_delta_callback.get()
-        for attempt in range(2):
-            try:
-                if callback is not None:
-                    return await self._complete_json_stream(payload, callback)
-                return await self._complete_json_nonstream(payload)
-            except LLMClientError as exc:
-                if attempt == 0 and not exc.response_started and is_retryable_llm_error(exc):
-                    # Gateways behind a local proxy occasionally reset an
-                    # otherwise healthy connection. A single short retry
-                    # avoids surfacing these transient failures to the harness.
-                    await asyncio.sleep(0.2)
-                    continue
-                raise
-        raise AssertionError("LLM completion retry loop must return or raise")
+        return await self._complete(messages, json_mode=True)
 
     async def complete_text(self, messages: Sequence[ChatMessage]) -> str:
-        """Complete a plain-text task without JSON/schema retry overhead."""
+        """Complete a semantic text task within the same bounded transport policy."""
+        return await self._complete(messages, json_mode=False)
+
+    async def _complete(self, messages: Sequence[ChatMessage], *, json_mode: bool) -> str:
+        validate_message_limits(messages)
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [message.model_dump() for message in messages],
             "temperature": 0,
+            "max_tokens": self._max_output_tokens,
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         callback = llm_delta_callback.get()
-        if callback is not None:
-            return await self._complete_json_stream(payload, callback)
-        return await self._complete_json_nonstream(payload)
+        async with llm_operation(timeout_seconds=self._operation_timeout_seconds):
+            for attempt in range(2):
+                try:
+                    if callback is not None:
+                        try:
+                            return await self._complete_json_stream(payload, callback)
+                        except _StreamingUnsupported:
+                            callback = None
+                    return await self._complete_json_nonstream(payload)
+                except LLMClientError as exc:
+                    if attempt == 0 and not exc.response_started and is_retryable_llm_error(exc):
+                        await asyncio.sleep(0.2)
+                        continue
+                    raise
+        raise AssertionError("LLM completion retry loop must return or raise")
 
     async def _complete_json_nonstream(self, payload: dict[str, Any]) -> str:
+        async with provider_request(self._base_url, self._concurrency):
+            return await self._complete_nonstream_request(payload)
+
+    async def _complete_nonstream_request(self, payload: dict[str, Any]) -> str:
         try:
             response = await self._http.post(
                 f"{self._base_url}/chat/completions",
@@ -173,18 +192,30 @@ class OpenAICompatibleClient:
             content = _message_text(choice["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMClientError("response does not contain choices[0].message.content") from exc
+        if choice.get("finish_reason") == "length":
+            raise LLMClientError(
+                "LLM output exceeded the configured token limit (finish_reason=length)",
+                response_started=True,
+            )
         if not content.strip():
             finish_reason = choice.get("finish_reason")
             suffix = f" (finish_reason={finish_reason})" if finish_reason else ""
             raise LLMClientError(f"response message content was empty{suffix}")
-        return content
+        return validate_output_limit(content)
 
     async def _complete_json_stream(
         self,
         payload: dict[str, Any],
         on_delta: Callable[[str], None],
     ) -> str:
+        async with provider_request(self._base_url, self._concurrency):
+            return await self._complete_stream_request(payload, on_delta)
+
+    async def _complete_stream_request(
+        self, payload: dict[str, Any], on_delta: Callable[[str], None]
+    ) -> str:
         chunks: list[str] = []
+        character_count = 0
         first_token_received = False
         stream_finished = False
         try:
@@ -197,8 +228,24 @@ class OpenAICompatibleClient:
                 if response.is_error:
                     await response.aread()
                     if response.status_code in {400, 404, 422}:
-                        return await self._complete_json_nonstream(payload)
+                        raise _StreamingUnsupported(self._format_provider_error(response))
                     raise LLMClientError(self._format_provider_error(response))
+                if "application/json" in getattr(response, "headers", {}).get("content-type", ""):
+                    await response.aread()
+                    try:
+                        choice = response.json()["choices"][0]
+                        content = _message_text(choice["message"]["content"])
+                    except (ValueError, KeyError, TypeError, IndexError) as exc:
+                        raise LLMClientError(
+                            "stream gateway returned an invalid JSON envelope"
+                        ) from exc
+                    if choice.get("finish_reason") == "length" or not content.strip():
+                        raise LLMClientError(
+                            "stream gateway returned incomplete content",
+                            response_started=bool(content),
+                        )
+                    on_delta(validate_output_limit(content))
+                    return content
                 line_iterator = response.aiter_lines().__aiter__()
                 first_token_deadline = time.monotonic() + self._first_token_timeout_seconds
                 content_idle_deadline: float | None = None
@@ -246,11 +293,18 @@ class OpenAICompatibleClient:
                     except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                         continue
                     if text:
+                        character_count += len(text)
+                        if character_count > MAX_OUTPUT_CHARACTERS:
+                            raise LLMClientError(
+                                "LLM output exceeds character limit", response_started=True
+                            )
                         chunks.append(text)
                         on_delta(text)
                         first_token_received = True
-                        content_idle_deadline = (
-                            time.monotonic() + self._stream_idle_timeout_seconds
+                        content_idle_deadline = time.monotonic() + self._stream_idle_timeout_seconds
+                    if choice.get("finish_reason") == "length":
+                        raise LLMClientError(
+                            "LLM output exceeded the configured token limit", response_started=True
                         )
                     if choice.get("finish_reason") is not None:
                         stream_finished = True
@@ -284,11 +338,7 @@ class OpenAICompatibleClient:
             ) from exc
         result = "".join(chunks)
         if not result.strip():
-            # Some OpenAI-compatible gateways accept `stream: true` but return
-            # a regular JSON response. Retry once without streaming so those
-            # providers remain usable; the UI already received an activity
-            # state and will display the validated final result.
-            return await self._complete_json_nonstream(payload)
+            raise LLMClientError("LLM stream returned no content; execution result is unknown")
         if _is_complete_json_object(result):
             return result
         if not stream_finished:
@@ -381,3 +431,31 @@ def _is_complete_json_object(content: str) -> bool:
         return isinstance(json.loads(content), dict)
     except json.JSONDecodeError:
         return False
+
+
+def validate_output_limit(content: str) -> str:
+    if len(content) > MAX_OUTPUT_CHARACTERS:
+        raise LLMClientError("LLM output exceeds character limit", response_started=True)
+    return content
+
+
+def validate_message_limits(messages: Sequence[ChatMessage]) -> None:
+    text_characters = media_characters = media_count = 0
+    for message in messages:
+        if isinstance(message.content, str):
+            text_characters += len(message.content)
+            continue
+        for part in message.content:
+            if isinstance(part, TextContentPart):
+                text_characters += len(part.text)
+            else:
+                media_count += 1
+                media_characters += len(
+                    part.image_url.url
+                    if isinstance(part, ImageURLContentPart)
+                    else part.video_url.url
+                )
+    if text_characters > MAX_CONTEXT_CHARACTERS:
+        raise LLMClientError("LLM context exceeds character limit; narrow the operation scope")
+    if media_count > MAX_MEDIA_PARTS or media_characters > MAX_MEDIA_CHARACTERS:
+        raise LLMClientError("LLM media context exceeds limit; narrow the reference selection")

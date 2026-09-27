@@ -59,9 +59,43 @@ def test_database_uses_wal_and_duplicate_submit_returns_original_task(
     duplicate = original.model_copy(update={"task_id": "another-request-id"})
 
     assert store.journal_mode() == "wal"
-    assert store.add_task(original) == original
-    assert store.add_task(duplicate) == original
+    persisted = store.add_task(original)
+    assert persisted.task_id == original.task_id
+    assert persisted.created_at is not None
+    assert persisted.updated_at is not None
+    assert store.add_task(original) == persisted
+    runtime_fields = {
+        "created_at",
+        "updated_at",
+        "last_activity_at",
+        "current_phase",
+        "blocked_reason",
+        "available_actions",
+    }
+    for field_name in type(original).model_fields:
+        if field_name not in runtime_fields:
+            assert getattr(persisted, field_name) == getattr(original, field_name)
+    assert store.add_task(duplicate) == persisted
     assert len(store.list_tasks()) == 1
+
+
+def test_task_checkpoints_append_across_retries(store: SQLiteTaskStore) -> None:
+    task = store.add_task(make_task("planning", state=TaskState.RUNNING))
+    first = store.append_task_checkpoint(
+        task.task_id,
+        "batch_orchestration_started",
+        {"attempt": 1},
+    )
+    second = store.append_task_checkpoint(
+        task.task_id,
+        "batch_orchestration_started",
+        {"attempt": 2},
+    )
+
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert first.checkpoint_id != second.checkpoint_id
+    assert store.list_task_checkpoints(task.task_id) == (first, second)
 
 
 def test_idempotency_key_rejects_different_inputs(store: SQLiteTaskStore) -> None:
@@ -86,7 +120,9 @@ def test_claim_renew_and_recover_expired_lease(store: SQLiteTaskStore) -> None:
     store.add_task(make_task("segment-1", state=TaskState.READY))
     store.transition_task("segment-1", TaskState.QUEUED)
 
-    claimed = store.claim_next("local-gpu-0", lease_duration=timedelta(seconds=30), now=start)
+    store.local_lease_seconds = 30
+    assert store.acquire_dispatcher("local-gpu-0", now=start)
+    claimed = store.claim_local_task("segment-1", "local-gpu-0", now=start)
     assert claimed is not None
     assert claimed.state == TaskState.RUNNING
     assert claimed.attempt == 1
@@ -95,17 +131,19 @@ def test_claim_renew_and_recover_expired_lease(store: SQLiteTaskStore) -> None:
     renewed = store.renew_lease(
         claimed.task_id,
         "local-gpu-0",
+        attempt_id=claimed.attempt_id,
         lease_duration=timedelta(minutes=1),
         now=start + timedelta(seconds=10),
     )
     assert renewed.lease_expires_at == start + timedelta(seconds=70)
+    assert store.acquire_dispatcher("local-gpu-0", now=start + timedelta(seconds=50))
     assert store.recover_expired_leases(now=start + timedelta(seconds=69)) == ()
     assert store.recover_expired_leases(now=start + timedelta(seconds=71)) == ("segment-1",)
 
     recovered = store.get_task("segment-1")
-    assert recovered.state == TaskState.READY
+    assert recovered.state == TaskState.NEEDS_ATTENTION
     assert recovered.lease_expires_at is None
-    assert recovered.error_code == "lease_expired"
+    assert recovered.error_code == "process_interrupted"
 
     with pytest.raises(LeaseError):
         store.renew_lease(
@@ -134,7 +172,7 @@ def test_submitted_comfy_prompt_is_reconciled_instead_of_resubmitted(
 
     store.recover_expired_leases(now=start + timedelta(seconds=11))
     recovered = store.get_task(claimed.task_id)
-    assert recovered.state == TaskState.RUNNING
+    assert recovered.state == TaskState.RECOVERING
     assert recovered.lease_expires_at is None
     assert store.claim_next("local-gpu-0", lease_duration=timedelta(seconds=10)) is None
     assert store.list_unreconciled_comfyui_prompts() == (prompt,)
@@ -152,11 +190,12 @@ def test_failed_comfy_task_retry_clears_old_prompt_and_starts_new_attempt(
     running = store.transition_task("retry-comfy", TaskState.RUNNING)
     assert running.attempt == 1
     store.record_comfyui_prompt("retry-comfy", "failed-prompt")
-    store.transition_task(
+    identity = store.inspect_submission("retry-comfy")
+    store.confirm_task_stopped(
         "retry-comfy",
-        TaskState.FAILED,
-        error_code="comfy_failed",
-        error_message="old failure",
+        expected_attempt_id=identity.get("attempt_id"),
+        expected_submission_token=identity.get("submission_token"),
+        evidence="mock Comfy history confirms failure",
     )
 
     ready = store.prepare_task_retry("retry-comfy")
@@ -172,16 +211,16 @@ def test_failed_comfy_task_retry_clears_old_prompt_and_starts_new_attempt(
     assert store.record_comfyui_prompt("retry-comfy", "new-prompt").prompt_id == "new-prompt"
 
 
-def test_manual_retry_reopens_exhausted_attempt_budget(store: SQLiteTaskStore) -> None:
+def test_manual_retry_preserves_exhausted_attempt_budget(store: SQLiteTaskStore) -> None:
     store.add_task(make_task("retry-exhausted", state=TaskState.READY, max_attempts=1))
     store.transition_task("retry-exhausted", TaskState.QUEUED)
     store.transition_task("retry-exhausted", TaskState.RUNNING)
     store.transition_task("retry-exhausted", TaskState.FAILED)
 
-    ready = store.prepare_task_retry("retry-exhausted")
-    assert ready.attempt == 0
-    store.transition_task("retry-exhausted", TaskState.QUEUED)
-    assert store.transition_task("retry-exhausted", TaskState.RUNNING).attempt == 1
+    with pytest.raises(InvalidTaskTransitionError, match="budget exhausted"):
+        store.prepare_task_retry("retry-exhausted")
+    assert store.get_task("retry-exhausted").attempt == 1
+    assert store.get_task("retry-exhausted").state == TaskState.FAILED
 
 
 def test_success_promotes_dependant_and_stale_propagates(store: SQLiteTaskStore) -> None:
@@ -263,9 +302,7 @@ def test_running_batch_can_atomically_attach_its_compiled_dag(
         batch_id="batch-expand",
         name="Expansion",
         state=BatchState.RUNNING,
-        items=(
-            BatchRunItem(project_id="project-1", task_ids=(planning.task_id,)),
-        ),
+        items=(BatchRunItem(project_id="project-1", task_ids=(planning.task_id,)),),
         created_at=now,
         updated_at=now,
     )
@@ -319,10 +356,7 @@ def test_h3_translation_cache_is_scoped_by_prompt_hash(store: SQLiteTaskStore) -
     assert first == "中文对照"
     assert store.get_h3_prompt_translation("prompt-1", "a" * 64) == "中文对照"
     assert store.get_h3_prompt_translation("prompt-1", "b" * 64) is None
-    assert (
-        store.put_h3_prompt_translation("prompt-1", "a" * 64, "不会覆盖")
-        == "中文对照"
-    )
+    assert store.put_h3_prompt_translation("prompt-1", "a" * 64, "不会覆盖") == "中文对照"
 
 
 def test_project_revisions_are_immutable_and_latest_is_selected(

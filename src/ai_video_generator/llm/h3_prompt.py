@@ -34,6 +34,7 @@ from ai_video_generator.domain.orchestration import (
 )
 from ai_video_generator.services.harness_sources import validate_h3_harness_source
 
+from .budget import claim_business_repair, llm_operation
 from .client import (
     ChatMessage,
     ImageURL,
@@ -46,7 +47,7 @@ from .client import (
 from .harness_files import load_harness
 
 MAX_H3_REPAIR_PASSES = 1
-MAX_H3_SCHEMA_REPAIRS = 2
+MAX_H3_SCHEMA_REPAIRS = 1
 MIN_BASE_DESCRIPTION_WORDS = 60
 MIN_REF_DESCRIPTION_WORDS = 300
 
@@ -61,6 +62,7 @@ _MULTISHOT_MARKERS = (
     "match cut",
     "montage",
 )
+
 
 class H3PromptHarnessError(RuntimeError):
     def __init__(self, message: str, errors: tuple[str, ...] = ()) -> None:
@@ -166,9 +168,7 @@ class H3HarnessLibrary:
             community_director=_read(
                 community_skills / "minimax-h3-creative-director" / "SKILL.md"
             ),
-            community_planner=_read(
-                community_skills / "minimax-h3-multishot-planner" / "SKILL.md"
-            ),
+            community_planner=_read(community_skills / "minimax-h3-multishot-planner" / "SKILL.md"),
             community_text_writer=_read(
                 community_skills / "minimax-h3-text-video-prompt" / "SKILL.md"
             ),
@@ -178,9 +178,7 @@ class H3HarnessLibrary:
             community_reference_writer=_read(
                 community_skills / "minimax-h3-reference-video-prompt" / "SKILL.md"
             ),
-            community_reviewer=_read(
-                community_skills / "minimax-h3-prompt-reviewer" / "SKILL.md"
-            ),
+            community_reviewer=_read(community_skills / "minimax-h3-prompt-reviewer" / "SKILL.md"),
             community_review_checklist=_read(
                 community_skills
                 / "minimax-h3-prompt-reviewer"
@@ -272,6 +270,18 @@ class H3PromptHarness:
         self._manifest_sha256 = manifest_sha256
 
     async def generate(
+        self,
+        request: H3PromptRequest,
+        *,
+        asset_image_urls: tuple[str, ...] = (),
+        asset_media_urls: tuple[str | None, ...] | None = None,
+    ) -> H3PromptResult:
+        async with llm_operation():
+            return await self._generate_bounded(
+                request, asset_image_urls=asset_image_urls, asset_media_urls=asset_media_urls
+            )
+
+    async def _generate_bounded(
         self,
         request: H3PromptRequest,
         *,
@@ -374,7 +384,7 @@ class H3PromptHarness:
                     stage_trace=tuple(trace),
                     harness_manifest_sha256=self._manifest_sha256,
                 )
-            if repair_pass == MAX_H3_REPAIR_PASSES:
+            if repair_pass == MAX_H3_REPAIR_PASSES or not claim_business_repair():
                 break
             candidate = await self._write(
                 request,
@@ -419,10 +429,10 @@ class H3PromptHarness:
                 "repair_writer" if repair_context else "mode_writer",
                 skill,
                 {
-                # Project memory is already compiled into the structured brief
-                # and continuity fields. Avoid resending the full transcript on
-                # every writer/repair call.
-                "request": _request_without_memory(request),
+                    # Project memory is already compiled into the structured brief
+                    # and continuity fields. Avoid resending the full transcript on
+                    # every writer/repair call.
+                    "request": _request_without_memory(request),
                     "director": director,
                     "multishot_plan": plan,
                     "repair_context": repair_context,
@@ -485,10 +495,10 @@ class H3PromptHarness:
                     error_type=type(exc).__name__,
                 )
                 failures.append(str(exc))
-                if attempt == MAX_H3_SCHEMA_REPAIRS:
+                if attempt == MAX_H3_SCHEMA_REPAIRS or not claim_business_repair():
                     raise H3PromptHarnessError(
                         f"H3 {model.__name__} response did not match its schema "
-                        "after two schema repairs",
+                        "within the shared one-repair budget",
                         tuple(failures),
                     ) from exc
                 repair = json.dumps(
@@ -622,9 +632,7 @@ def deterministic_director_decision(request: H3PromptRequest) -> H3DirectorDecis
     use_multishot = _requires_multishot_plan(request)
     assumptions: tuple[str, ...] = ()
     if request.shot_strategy == H3ShotStrategy.AUTO:
-        assumptions = (
-            "AUTO 仅在创作说明明确包含剪切、蒙太奇或多个镜头标记时启用多镜头规划。",
-        )
+        assumptions = ("AUTO 仅在创作说明明确包含剪切、蒙太奇或多个镜头标记时启用多镜头规划。",)
     return H3DirectorDecision(
         operation_id=request.operation_id,
         mode=mode,
@@ -694,9 +702,7 @@ def _review_request_context(request: H3PromptRequest) -> dict[str, object]:
     }
 
 
-def validate_timeline(
-    request: H3PromptRequest, shots: tuple[H3ShotBeat, ...]
-) -> tuple[str, ...]:
+def validate_timeline(request: H3PromptRequest, shots: tuple[H3ShotBeat, ...]) -> tuple[str, ...]:
     errors: list[str] = []
     if [shot.shot_number for shot in shots] != list(range(1, len(shots) + 1)):
         errors.append("shot numbers must be consecutive and ordered")
@@ -769,9 +775,8 @@ def validate_h3_candidate(
         errors.append("overall_soundscape must describe the native audio plan")
     elif not _uses_official_english(candidate.overall_soundscape):
         errors.append("overall_soundscape must use English descriptive content")
-    if (
-        candidate.non_diegetic_music.strip().upper() != "N/A"
-        and not _uses_official_english(candidate.non_diegetic_music)
+    if candidate.non_diegetic_music.strip().upper() != "N/A" and not _uses_official_english(
+        candidate.non_diegetic_music
     ):
         errors.append("non_diegetic_music must use English descriptive content or N/A")
 
@@ -783,9 +788,7 @@ def validate_h3_candidate(
         if asset.label not in rendered:
             errors.append(f"prompt does not assign a role to {asset.label}")
         if asset.companion_audio_label and asset.companion_audio_label not in rendered:
-            errors.append(
-                f"prompt does not assign a role to {asset.companion_audio_label}"
-            )
+            errors.append(f"prompt does not assign a role to {asset.companion_audio_label}")
         if asset.forbidden_propagation_targets and not any(
             target.casefold() in rendered.casefold()
             for target in asset.forbidden_propagation_targets
@@ -801,8 +804,7 @@ def validate_h3_candidate(
     ):
         errors.append("prompt requests music while non_diegetic_music is N/A")
     dialogue_words = sum(
-        _english_word_count(match.group(0))
-        for match in _DIALOGUE_PATTERN.finditer(rendered)
+        _english_word_count(match.group(0)) for match in _DIALOGUE_PATTERN.finditer(rendered)
     )
     if dialogue_words > request.duration_seconds * 3.5:
         errors.append("dialogue density exceeds the available segment duration")
@@ -854,8 +856,7 @@ def _message_character_count(message: ChatMessage) -> int:
     if isinstance(message.content, str):
         return len(message.content)
     return sum(
-        len(part.text) if isinstance(part, TextContentPart) else 0
-        for part in message.content
+        len(part.text) if isinstance(part, TextContentPart) else 0 for part in message.content
     )
 
 

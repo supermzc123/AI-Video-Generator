@@ -261,6 +261,7 @@ class BatchRunItem(FrozenModel):
     start_boundary: str = Field(default="next_ready", min_length=1, max_length=100)
     priority: int = Field(default=0, ge=-100, le=100)
     settings: dict[str, Any] = Field(default_factory=dict)
+    paused: bool = False
 
 
 class BatchRun(FrozenModel):
@@ -272,6 +273,9 @@ class BatchRun(FrozenModel):
     created_at: datetime
     updated_at: datetime
     settings: dict[str, Any] = Field(default_factory=dict)
+    task_counts: dict[str, int] = Field(default_factory=dict)
+    all_tasks_ended: bool = False
+    all_tasks_succeeded: bool = False
 
     @model_validator(mode="after")
     def validate_members(self) -> BatchRun:

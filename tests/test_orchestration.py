@@ -83,9 +83,7 @@ def test_review_timeout_switches_whole_project_to_ai_only(tmp_path) -> None:
     store = SQLiteTaskStore(tmp_path / "review.db")
     opened = datetime(2026, 8, 15, tzinfo=UTC)
     store.put_project_run_state(ProjectRunState(project_id="project-1", updated_at=opened))
-    store.add_task(
-        task("review", state=TaskState.NEEDS_REVIEW, kind=TaskKind.AI_REVIEW)
-    )
+    store.add_task(task("review", state=TaskState.NEEDS_REVIEW, kind=TaskKind.AI_REVIEW))
     store.put_review_deadline(
         ReviewDeadline(
             project_id="project-1",
@@ -106,9 +104,7 @@ def test_human_review_resolves_deadline_before_timeout(tmp_path, accepted: bool)
     store = SQLiteTaskStore(tmp_path / f"resolved-{accepted}.db")
     opened = datetime(2026, 8, 15, tzinfo=UTC)
     store.put_project_run_state(ProjectRunState(project_id="project-1", updated_at=opened))
-    store.add_task(
-        task("review", state=TaskState.NEEDS_REVIEW, kind=TaskKind.AI_REVIEW)
-    )
+    store.add_task(task("review", state=TaskState.NEEDS_REVIEW, kind=TaskKind.AI_REVIEW))
     store.put_review_deadline(
         ReviewDeadline(
             project_id="project-1",
@@ -127,8 +123,7 @@ def test_human_review_resolves_deadline_before_timeout(tmp_path, accepted: bool)
 
     assert store.apply_expired_review_deadlines(now=opened + timedelta(seconds=31)) == ()
     assert (
-        store.get_project_run_state("project-1").review_policy.effective_mode
-        == ReviewMode.HUMAN_AI
+        store.get_project_run_state("project-1").review_policy.effective_mode == ReviewMode.HUMAN_AI
     )
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM review_deadlines").fetchone()[0] == 0
@@ -152,8 +147,7 @@ def test_expired_deadlines_ignore_terminal_and_non_review_tasks(tmp_path) -> Non
 
     assert store.apply_expired_review_deadlines(now=opened + timedelta(seconds=31)) == ()
     assert (
-        store.get_project_run_state("project-1").review_policy.effective_mode
-        == ReviewMode.HUMAN_AI
+        store.get_project_run_state("project-1").review_policy.effective_mode == ReviewMode.HUMAN_AI
     )
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM review_deadlines").fetchone()[0] == 0
@@ -218,12 +212,10 @@ def test_affinity_bonus_does_not_prevent_aging(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_batch_pause_freezes_dispatch_and_pauses_queued_tasks(tmp_path) -> None:
+async def test_batch_pause_freezes_only_member_admission(tmp_path) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))
     now = datetime(2026, 8, 15, tzinfo=UTC)
-    project = ProjectSpec(
-        project_id="project-1", name="Film", target_duration_seconds=30
-    )
+    project = ProjectSpec(project_id="project-1", name="Film", target_duration_seconds=30)
     queued = task("queued", state=TaskState.QUEUED)
     batch = BatchRun(
         batch_id="batch-1",
@@ -239,12 +231,8 @@ async def test_batch_pause_freezes_dispatch_and_pauses_queued_tasks(tmp_path) ->
         created_project = await client.post(
             "/api/v1/projects", json=project.model_dump(mode="json")
         )
-        created_task = await client.post(
-            "/api/v1/tasks", json=queued.model_dump(mode="json")
-        )
-        created_batch = await client.post(
-            "/api/v1/batches", json=batch.model_dump(mode="json")
-        )
+        created_task = await client.post("/api/v1/tasks", json=queued.model_dump(mode="json"))
+        created_batch = await client.post("/api/v1/batches", json=batch.model_dump(mode="json"))
         assert created_project.status_code == 201
         assert created_task.status_code == 201
         assert created_batch.status_code == 201
@@ -255,8 +243,11 @@ async def test_batch_pause_freezes_dispatch_and_pauses_queued_tasks(tmp_path) ->
 
     assert paused.status_code == 200
     assert paused.json()["state"] == "paused"
-    assert stored_task.json()["state"] == "paused"
-    assert run_state.json()["paused"] is True
+    assert stored_task.json()["state"] == "queued"
+    assert run_state.json()["paused"] is False
+    store = SQLiteTaskStore(tmp_path / "control-plane.db")
+    assert store.acquire_dispatcher("test")
+    assert store.claim_local_task("queued", "test") is None
 
 
 @pytest.mark.asyncio
@@ -265,9 +256,7 @@ async def test_batch_cancel_cancels_selected_queue_and_returns_project_to_guided
 ) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))
     now = datetime(2026, 8, 15, tzinfo=UTC)
-    project = ProjectSpec(
-        project_id="project-1", name="Film", target_duration_seconds=30
-    )
+    project = ProjectSpec(project_id="project-1", name="Film", target_duration_seconds=30)
     queued = task("queued", state=TaskState.QUEUED)
     batch = BatchRun(
         batch_id="batch-1",
@@ -296,17 +285,23 @@ async def test_batch_cancel_cancels_selected_queue_and_returns_project_to_guided
 
 
 @pytest.mark.asyncio
-async def test_running_local_task_cancels_comfyui_before_database_transition(tmp_path) -> None:
+async def test_running_local_task_cancels_comfyui_and_database_task(tmp_path) -> None:
     requests: list[tuple[str, str]] = []
+    interrupted = False
 
     def comfy_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal interrupted
         requests.append((request.method, request.url.path))
         if request.method == "GET" and request.url.path == "/queue":
             return httpx.Response(
                 200,
-                json={"queue_running": [[1, "prompt-1", {}, {}, []]], "queue_pending": []},
+                json={
+                    "queue_running": [] if interrupted else [[1, "prompt-1", {}, {}, []]],
+                    "queue_pending": [],
+                },
             )
         if request.method == "POST" and request.url.path == "/interrupt":
+            interrupted = True
             return httpx.Response(200, json={})
         return httpx.Response(404)
 
@@ -323,15 +318,44 @@ async def test_running_local_task_cancels_comfyui_before_database_transition(tmp
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        created = await client.post(
-            "/api/v1/tasks", json=running.model_dump(mode="json")
-        )
+        created = await client.post("/api/v1/tasks", json=running.model_dump(mode="json"))
         assert created.status_code == 201
         cancelled = await client.post("/api/v1/tasks/running/cancel")
 
     assert cancelled.status_code == 200
     assert cancelled.json()["state"] == "cancelled"
-    assert requests == [("GET", "/queue"), ("POST", "/interrupt")]
+    assert requests == [("GET", "/queue"), ("POST", "/interrupt"), ("GET", "/queue")]
+
+
+@pytest.mark.asyncio
+async def test_running_local_task_stays_cancelling_when_comfyui_is_offline(tmp_path) -> None:
+    def comfy_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("ComfyUI is offline", request=request)
+
+    app = create_app(
+        Settings(_env_file=None, data_root=tmp_path, comfyui_base_url="http://comfy"),
+        comfyui_transport=httpx.MockTransport(comfy_handler),
+    )
+    running = task("running-offline", state=TaskState.RUNNING).model_copy(
+        update={
+            "execution_target": ExecutionTarget.LOCAL,
+            "comfyui_prompt_id": "prompt-offline",
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (
+            await client.post("/api/v1/tasks", json=running.model_dump(mode="json"))
+        ).status_code == 201
+        cancelled = await client.post("/api/v1/tasks/running-offline/cancel")
+        stored = await client.get("/api/v1/tasks/running-offline")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "cancelling"
+    assert stored.json()["state"] == "cancelling"
+
+    assert stored.json()["comfyui_prompt_id"] == "prompt-offline"
 
 
 def test_harness_revisions_are_versioned_and_immutable(tmp_path) -> None:
@@ -407,7 +431,7 @@ async def test_workspace_and_guided_task_control_api(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_endpoint_resets_failed_comfyui_execution_before_retry(tmp_path) -> None:
+async def test_run_endpoint_rejects_exhausted_comfyui_execution_retry(tmp_path) -> None:
     app = create_app(Settings(_env_file=None, data_root=tmp_path))
     failed = task("failed-comfy", state=TaskState.FAILED).model_copy(
         update={
@@ -424,12 +448,11 @@ async def test_run_endpoint_resets_failed_comfyui_execution_before_retry(tmp_pat
         retried = await client.post("/api/v1/tasks/failed-comfy/run")
 
     assert created.status_code == 201
-    assert retried.status_code == 200
-    assert retried.json()["state"] == "queued"
-    assert retried.json()["comfyui_prompt_id"] is None
-    assert retried.json()["error_code"] is None
-    assert retried.json()["error_message"] is None
-    assert retried.json()["attempt"] == 2
+    assert retried.status_code == 409
+    preserved = SQLiteTaskStore(tmp_path / "control-plane.db").get_task("failed-comfy")
+    assert preserved.state == TaskState.FAILED
+    assert preserved.attempt == 3
+    assert preserved.comfyui_prompt_id == "old-failed-prompt"
 
 
 @pytest.mark.asyncio
@@ -453,11 +476,9 @@ async def test_run_endpoint_reuses_completed_comfyui_job_when_output_collection_
 
     assert created.status_code == 201
     assert retried.status_code == 200
-    assert retried.json()["state"] == "queued"
+    assert retried.json()["state"] == "recovering"
     assert retried.json()["comfyui_prompt_id"] == "completed-prompt"
-    assert retried.json()["error_code"] is None
-    assert retried.json()["error_message"] is None
-    assert retried.json()["attempt"] == 2
+    assert retried.json()["attempt"] == 3
 
 
 def test_project_agent_patches_are_applied_without_touching_locked_siblings() -> None:

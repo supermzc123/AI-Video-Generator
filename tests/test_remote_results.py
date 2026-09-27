@@ -30,6 +30,7 @@ def test_result_report_is_durable_idempotent_and_attempt_scoped(tmp_path) -> Non
         task_id=claimed.task_id,
         worker_id="ubuntu-1",
         attempt=claimed.attempt,
+        attempt_id=claimed.attempt_id,
         status=WorkerResultStatus.SUCCEEDED,
     )
 

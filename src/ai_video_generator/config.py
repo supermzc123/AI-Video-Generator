@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_api_key: SecretStr | None = None
     llm_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    llm_operation_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    llm_concurrency: int = Field(default=2, ge=1, le=16)
     llm_first_token_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     llm_stream_idle_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
     llm_video_capable: bool = False
@@ -100,6 +102,8 @@ RUNTIME_SETTING_FIELDS = (
     "llm_model",
     "llm_api_key",
     "llm_timeout_seconds",
+    "llm_operation_timeout_seconds",
+    "llm_concurrency",
     "llm_first_token_timeout_seconds",
     "llm_stream_idle_timeout_seconds",
     "llm_video_capable",

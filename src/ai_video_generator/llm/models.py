@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 from enum import StrEnum
 from typing import Any
@@ -85,6 +86,7 @@ class StructuredOperationRequest(HarnessModel):
     allowed_paths: tuple[str, ...] = Field(min_length=1)
     locked_paths: tuple[str, ...] = ()
     highest_instruction: str = ""
+    reference_asset_ids: tuple[str, ...] | None = None
 
     @model_validator(mode="after")
     def validate_scope(self) -> StructuredOperationRequest:
@@ -113,7 +115,7 @@ def pointer_contains(parent: str, child: str) -> bool:
 def enforce_patch_scope(
     request: StructuredOperationRequest,
     response: StructuredOperationResponse,
-) -> None:
+) -> dict[str, Any]:
     if response.operation_id != request.operation_id:
         raise ValueError("response operation_id does not match request")
 
@@ -125,6 +127,110 @@ def enforce_patch_scope(
             for locked in request.locked_paths
         ):
             raise ValueError(f"patch path overlaps a locked path: {patch.path}")
+    candidate = _apply_validation_patches(request.source_document, response)
+    for root in ("shots", "assetPlans"):
+        _preserve_locked_items(request.source_document.get(root), candidate.get(root))
+    source_prompts = request.source_document.get("prompts", {})
+    candidate_prompts = candidate.get("prompts", {})
+    if isinstance(source_prompts, dict) and isinstance(candidate_prompts, dict):
+        for key in ("imagePrompts", "h3Prompts"):
+            _preserve_locked_items(source_prompts.get(key), candidate_prompts.get(key))
+    _validate_references(request, candidate)
+    return candidate
+
+
+def _preserve_locked_items(original: object, candidate: object) -> None:
+    if not isinstance(original, list):
+        return
+    values = candidate if isinstance(candidate, list) else []
+    for item in original:
+        if not isinstance(item, dict) or item.get("locked") is not True:
+            continue
+        identity = item.get("id") or item.get("segmentId") or item.get("assetPlanId")
+        if not any(value == item for value in values):
+            raise ValueError(f"patch changes or removes locked item: {identity}")
+
+
+def _apply_validation_patches(
+    source: dict[str, Any], response: StructuredOperationResponse
+) -> dict[str, Any]:
+    document = copy.deepcopy(source)
+    for patch in response.patches:
+        if not patch.path:
+            raise ValueError("root document patches are not allowed")
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in patch.path[1:].split("/")]
+        parent: Any = document
+        for part in parts[:-1]:
+            if isinstance(parent, dict) and part in parent:
+                parent = parent[part]
+            elif isinstance(parent, list) and part.isdigit() and int(part) < len(parent):
+                parent = parent[int(part)]
+            else:
+                raise ValueError(f"patch parent does not exist: {patch.path}")
+        key = parts[-1]
+        if isinstance(parent, dict):
+            if patch.op != JsonPatchOp.ADD and key not in parent:
+                raise ValueError(f"patch target does not exist: {patch.path}")
+            if patch.op == JsonPatchOp.REMOVE:
+                del parent[key]
+            else:
+                parent[key] = patch.value
+        elif isinstance(parent, list):
+            if patch.op == JsonPatchOp.ADD and key == "-":
+                parent.append(patch.value)
+                continue
+            if not key.isdigit() or int(key) >= len(parent):
+                raise ValueError(f"invalid array patch target: {patch.path}")
+            index = int(key)
+            if patch.op == JsonPatchOp.REMOVE:
+                parent.pop(index)
+            elif patch.op == JsonPatchOp.ADD:
+                parent.insert(index, patch.value)
+            else:
+                parent[index] = patch.value
+        else:
+            raise ValueError(f"patch target is scalar: {patch.path}")
+    return document
+
+
+def _validate_references(request: StructuredOperationRequest, candidate: dict[str, Any]) -> None:
+    shots = {str(item.get("id")) for item in candidate.get("shots", []) if isinstance(item, dict)}
+    original_plans = {
+        str(item.get("id")): item
+        for item in request.source_document.get("assetPlans", [])
+        if isinstance(item, dict)
+    }
+    for plan in candidate.get("assetPlans", []):
+        if not isinstance(plan, dict):
+            continue
+        if plan == original_plans.get(str(plan.get("id"))):
+            continue
+        old = original_plans.get(str(plan.get("id")), {})
+        if old.get("resolutionSource") == "manual" and any(
+            plan.get(field) != old.get(field) for field in ("width", "height", "resolutionSource")
+        ):
+            raise ValueError("asset plan changes manually locked resolution")
+        if old and plan.get("fulfilledByAssetId") != old.get("fulfilledByAssetId"):
+            raise ValueError("asset binding is managed by the application")
+        used = list(plan.get("shotIds") or [])
+        if plan.get("shotId"):
+            used.append(plan["shotId"])
+        if any(shot not in shots for shot in used):
+            raise ValueError("asset plan references an unknown shot")
+        if (
+            plan.get("fulfilledByAssetId")
+            and request.reference_asset_ids is not None
+            and plan["fulfilledByAssetId"] not in request.reference_asset_ids
+        ):
+            raise ValueError("asset plan references an unknown project asset")
+    prompts = candidate.get("prompts", {})
+    if request.reference_asset_ids is not None and isinstance(prompts, dict):
+        for prompt in prompts.get("imagePrompts", []):
+            if isinstance(prompt, dict) and any(
+                value not in request.reference_asset_ids
+                for value in prompt.get("referenceAssetIds", [])
+            ):
+                raise ValueError("image prompt references an unknown project asset")
 
 
 def validate_workflow_mapping(
@@ -177,8 +283,7 @@ def validate_workflow_mapping(
             reference_key = (binding.semantic, binding.reference_index)
             if reference_key in reference_indexes:
                 raise ValueError(
-                    f"duplicate {binding.semantic.value} reference_index: "
-                    f"{binding.reference_index}"
+                    f"duplicate {binding.semantic.value} reference_index: {binding.reference_index}"
                 )
             reference_indexes.add(reference_key)
 

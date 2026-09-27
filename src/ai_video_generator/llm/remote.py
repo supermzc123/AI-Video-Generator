@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from ai_video_generator.config import Settings
 
+from .budget import DEFAULT_OPERATION_SECONDS, llm_operation
 from .client import ChatMessage, OpenAICompatibleClient
 
 
@@ -20,6 +21,8 @@ class LLMRemoteConfig:
     first_token_timeout_seconds: float | None = None
     stream_idle_timeout_seconds: float = 600.0
     proxy: str | None = None
+    operation_timeout_seconds: float = DEFAULT_OPERATION_SECONDS
+    concurrency: int = 2
 
 
 def remote_config(settings: Settings, *, model: str | None = None) -> LLMRemoteConfig:
@@ -31,6 +34,8 @@ def remote_config(settings: Settings, *, model: str | None = None) -> LLMRemoteC
         first_token_timeout_seconds=settings.llm_first_token_timeout_seconds,
         stream_idle_timeout_seconds=settings.llm_stream_idle_timeout_seconds,
         proxy=settings.network_proxy,
+        operation_timeout_seconds=settings.llm_operation_timeout_seconds,
+        concurrency=settings.llm_concurrency,
     )
 
 
@@ -62,22 +67,27 @@ def _client(config: LLMRemoteConfig) -> OpenAICompatibleClient:
         first_token_timeout_seconds=config.first_token_timeout_seconds,
         stream_idle_timeout_seconds=config.stream_idle_timeout_seconds,
         proxy=config.proxy,
+        operation_timeout_seconds=config.operation_timeout_seconds,
+        concurrency=config.concurrency,
     )
 
 
 @asynccontextmanager
 async def open_client(config: LLMRemoteConfig):
-    async with _client(config) as client:
+    async with (
+        llm_operation(timeout_seconds=config.operation_timeout_seconds),
+        _client(config) as client,
+    ):
         yield client
 
 
 async def complete_text(config: LLMRemoteConfig, messages: Sequence[ChatMessage]) -> str:
-    async with _client(config) as client:
+    async with open_client(config) as client:
         return await client.complete_text(messages)
 
 
 async def complete_json(config: LLMRemoteConfig, messages: Sequence[ChatMessage]) -> str:
-    async with _client(config) as client:
+    async with open_client(config) as client:
         return await client.complete_json(messages)
 
 
